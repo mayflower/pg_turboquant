@@ -24,6 +24,7 @@ It is designed around PostgreSQL's storage and executor constraints rather than 
   - `tq_approx_candidates(...)`
   - `tq_recommended_query_knobs(...)`
   - `tq_index_metadata(...)`
+  - `tq_last_scan_stats()`
 
 ## Quick start
 
@@ -132,3 +133,5 @@ make tapcheck
 ```
 
 The benchmark harness lives in `scripts/benchmark_suite.py`. The RAG evaluation harness lives under `benchmarks/rag/`.
+
+For scan observability, `tq_last_scan_stats()` exposes backend-local JSON for the most recent TurboQuant scan, and the benchmark/RAG harnesses persist scan-work counters such as visited lists, pages, codes, and score mode.

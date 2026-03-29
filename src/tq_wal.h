@@ -52,6 +52,11 @@ extern bool tq_wal_set_batch_next_block(Relation relation,
 										uint32_t next_block,
 										char *errmsg,
 										size_t errmsg_len);
+extern bool tq_wal_set_batch_summary(Relation relation,
+									 Buffer buffer,
+									 const TqBatchPageSummary *summary,
+									 char *errmsg,
+									 size_t errmsg_len);
 extern bool tq_wal_append_batch_code(Relation relation,
 									 Buffer buffer,
 									 const TqTid *tid,

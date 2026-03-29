@@ -35,23 +35,89 @@ class RagCampaignReportContractTest(unittest.TestCase):
 
     def test_tiny_campaign_smoke_emits_expected_artifacts_and_report_schema(self):
         plan = build_comparative_campaign_plan(
-            dataset_ids=["kilt_nq"],
+            dataset_ids=["kilt_hotpotqa"],
             generator_id="fixed-debug-generator",
         )
+        plan["regression_gate"] = {
+            "kilt_hotpotqa": {
+                "dataset_id": "kilt_hotpotqa",
+                "method_id": "pg_turboquant_approx",
+                "recall_at_10_floor": 0.90,
+                "max_visited_code_fraction": 0.85,
+                "max_visited_page_fraction": 0.60,
+                "expected_score_mode": "code_domain",
+                "max_effective_probe_count": 8,
+            }
+        }
 
         def fake_retrieval_runner(scenario):
             rank = COMPARATIVE_METHOD_VARIANTS.index(scenario["method_id"]) + 1
+            is_turboquant = scenario["method_id"].startswith("pg_turboquant_")
             return {
                 "run_metadata": {
                     "dataset_id": scenario["dataset_id"],
                     "method_id": scenario["method_id"],
                     "result_kind": "retrieval_only",
-                    "footprint_bytes": 1000 * rank,
+                    "footprint_bytes": 8192 * (10 + rank),
+                    "index_metadata": {
+                        "live_count": 200,
+                        "router": {
+                            "restart_count": 3,
+                            "balance_penalty": round(0.05 * rank, 4),
+                        },
+                        "list_distribution": {
+                            "max_list_size": 10 + rank,
+                            "coeff_var": round(0.1 * rank, 4),
+                        },
+                    },
                 },
                 "metrics": {
-                    "recall@10": 0.9 - (rank * 0.01),
+                    "recall@10": 0.92 - (rank * 0.01),
                     "latency_p95_ms": 12.0 + rank,
                     "latency_p50_ms": 10.0 + rank,
+                },
+                "operational_summary": {
+                    "scan_stats": {
+                        "score_mode": {
+                            "uniform": "code_domain" if is_turboquant else "none",
+                            "values": ["code_domain" if is_turboquant else "none"],
+                            "count": 1,
+                        },
+                        "selected_list_count": {
+                            "avg": 2.0 + rank,
+                            "p50": 2.0 + rank,
+                            "p95": 3.0 + rank,
+                        },
+                        "selected_live_count": {
+                            "avg": 40.0 + rank,
+                            "p50": 40.0 + rank,
+                            "p95": 44.0 + rank,
+                        },
+                        "visited_page_count": {
+                            "avg": 1.0 + (rank / 10.0),
+                            "p50": 1.0 + (rank / 10.0),
+                            "p95": 2.0 + (rank / 10.0),
+                        },
+                        "page_prune_count": {
+                            "avg": float(rank),
+                            "p50": float(rank),
+                            "p95": float(rank + 1),
+                        },
+                        "early_stop_count": {
+                            "p50": float(rank) / 2.0,
+                            "p95": float(rank),
+                        },
+                        "effective_probe_count": {
+                            "avg": float(rank),
+                            "p50": float(rank),
+                            "p95": float(rank + 1),
+                        },
+                        "visited_code_count": {
+                            "avg": float(10 + rank),
+                            "p50": float(100 - rank),
+                            "p95": float(120 - rank),
+                        },
+                    }
                 },
             }
 
@@ -108,16 +174,39 @@ class RagCampaignReportContractTest(unittest.TestCase):
             end_to_end_rows = payload["tables"]["end_to_end"]
             self.assertEqual(len(retrieval_rows), len(COMPARATIVE_METHOD_VARIANTS))
             self.assertEqual(len(end_to_end_rows), len(COMPARATIVE_METHOD_VARIANTS))
-            self.assertEqual(retrieval_rows[0]["dataset_id"], "kilt_nq")
+            self.assertEqual(retrieval_rows[0]["dataset_id"], "kilt_hotpotqa")
             self.assertIn("recall@10", retrieval_rows[0])
+            self.assertIn("avg_selected_list_count", retrieval_rows[0])
+            self.assertIn("avg_selected_live_count", retrieval_rows[0])
+            self.assertIn("avg_visited_page_count", retrieval_rows[0])
+            self.assertIn("avg_visited_code_count", retrieval_rows[0])
+            self.assertIn("avg_effective_probe_count", retrieval_rows[0])
+            self.assertIn("avg_page_prune_count", retrieval_rows[0])
+            self.assertIn("visited_code_fraction", retrieval_rows[0])
+            self.assertIn("visited_page_fraction", retrieval_rows[0])
+            self.assertIn("score_mode", retrieval_rows[0])
+            self.assertIn("router_restarts", retrieval_rows[0])
+            self.assertIn("router_balance_penalty", retrieval_rows[0])
+            self.assertIn("max_list_size", retrieval_rows[0])
+            self.assertIn("list_coeff_var", retrieval_rows[0])
             self.assertIn("answer_exact_match", end_to_end_rows[0])
             self.assertIn("total_latency_p95_ms", end_to_end_rows[0])
+            self.assertIn("regression_gate", payload["report"])
+            self.assertTrue(payload["report"]["regression_gate"]["passed"])
+            self.assertIn("kilt_hotpotqa", payload["report"]["regression_gate"]["dataset_id"])
 
             markdown = (Path(tmpdir) / artifacts["report_markdown"]).read_text(encoding="utf-8")
             report_html = (Path(tmpdir) / artifacts["report_html"]).read_text(encoding="utf-8")
             self.assertIn("Retrieval-Only Comparison", markdown)
             self.assertIn("End-to-End Comparison", markdown)
             self.assertIn("Metric Validity Caveats", markdown)
+            self.assertIn("avg_selected_list_count", markdown)
+            self.assertIn("avg_visited_page_count", markdown)
+            self.assertIn("avg_effective_probe_count", markdown)
+            self.assertIn("score_mode", markdown)
+            self.assertIn("Regression Gate", markdown)
+            self.assertIn("router_balance_penalty", markdown)
+            self.assertIn("max_list_size", markdown)
             self.assertIn("TurboQuant Outcome", report_html)
             self.assertIn("Expected TurboQuant Profile", report_html)
             self.assertIn("pgvector_hnsw_approx", report_html)

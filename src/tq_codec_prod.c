@@ -7,6 +7,8 @@
 
 #define TQ_PROD_GAMMA_BYTES 4
 
+static size_t tq_prod_decode_counter = 0;
+
 static void
 tq_set_error(char *errmsg, size_t errmsg_len, const char *message)
 {
@@ -366,6 +368,8 @@ tq_prod_decode(const TqProdCodecConfig *config,
 	if (!tq_prod_unpack_parts(packed, packed_len, &layout, &gamma, errmsg, errmsg_len))
 		return false;
 
+	tq_prod_decode_counter += 1;
+
 	for (i = 0; i < config->dimension; i++)
 	{
 		uint32_t	idx_code = tq_unpack_bits(packed, i * tq_prod_idx_bits(config), tq_prod_idx_bits(config));
@@ -515,6 +519,19 @@ tq_prod_score_decompose_ip(const TqProdCodecConfig *config,
 }
 
 bool
+tq_prod_score_code_from_lut(const TqProdCodecConfig *config,
+							const TqProdLut *lut,
+							const uint8_t *packed,
+							size_t packed_len,
+							float *score,
+							char *errmsg,
+							size_t errmsg_len)
+{
+	return tq_prod_score_packed_ip(config, lut, packed, packed_len,
+								   score, errmsg, errmsg_len);
+}
+
+bool
 tq_prod_score_packed_ip(const TqProdCodecConfig *config,
 						const TqProdLut *lut,
 						const uint8_t *packed,
@@ -536,4 +553,16 @@ tq_prod_score_packed_ip(const TqProdCodecConfig *config,
 	return tq_prod_score_decompose_ip(config, lut, packed, packed_len,
 									  &mse_contribution, &qjl_contribution, score,
 									  errmsg, errmsg_len);
+}
+
+void
+tq_prod_decode_counter_reset(void)
+{
+	tq_prod_decode_counter = 0;
+}
+
+size_t
+tq_prod_decode_counter_get(void)
+{
+	return tq_prod_decode_counter;
 }

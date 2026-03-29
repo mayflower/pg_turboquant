@@ -3,7 +3,7 @@ EXTVERSION = 0.1.4
 MODULE_big = pg_turboquant
 OBJS = src/tq_extension.o src/tq_am.o src/tq_am_routine.o src/tq_reloptions.o src/tq_options.o src/tq_page.o src/tq_transform.o src/tq_codec_mse.o src/tq_codec_prod.o src/tq_pgvector_compat.o src/tq_scan.o src/tq_query_tuning.o src/tq_guc.o src/tq_simd_avx2.o src/tq_router.o src/tq_wal.o src/tq_bitmap_filter.o
 DATA = $(wildcard sql/pg_turboquant--*.sql)
-REGRESS = smoke am_catalog reloptions flat_scan flat_streaming planner_costs gucs ivf_scan maintenance maintenance_reuse opclasses metric_fidelity ivf_training transform_contract admin_introspection query_helpers bitmap_scan capability_boundaries simd_dispatch
+REGRESS = smoke am_catalog reloptions flat_scan flat_streaming planner_costs gucs ivf_scan maintenance maintenance_reuse opclasses metric_fidelity ivf_training transform_contract admin_introspection query_helpers bitmap_scan capability_boundaries simd_dispatch scan_stats page_pruning adaptive_probing
 NO_INSTALLCHECK = 1
 .DEFAULT_GOAL := all
 
@@ -25,7 +25,8 @@ PERL5_LOCAL_LIB := $(CURDIR)/third_party/perl5
 
 PG_CPPFLAGS += -Wall -Werror
 
-UNIT_TEST_BIN = tests/unit/test_smoke
+UNIT_TEST_BINS = tests/unit/test_smoke tests/unit/test_scan_stats tests/unit/test_prod_code_domain tests/unit/test_prod_code_domain_simd tests/unit/test_batch_bounds tests/unit/test_probe_budgeting tests/unit/test_router_balance
+UNIT_TEST_COMMON_SRCS = src/tq_am_routine.c src/tq_am_routine.h src/tq_options.c src/tq_options.h src/tq_page.c src/tq_page.h src/tq_transform.c src/tq_transform.h src/tq_codec_mse.c src/tq_codec_mse.h src/tq_codec_prod.c src/tq_codec_prod.h src/tq_pgvector_compat.c src/tq_pgvector_compat.h src/tq_scan.c src/tq_scan.h src/tq_query_tuning.c src/tq_query_tuning.h src/tq_simd_avx2.c src/tq_simd_avx2.h src/tq_router.c src/tq_router.h
 
 .PHONY: unitcheck tapcheck clean-unit installcheck install-pgvector
 
@@ -34,11 +35,11 @@ install-pgvector:
 
 install: install-pgvector
 
-$(UNIT_TEST_BIN): tests/unit/test_smoke.c src/tq_am_routine.c src/tq_am_routine.h src/tq_options.c src/tq_options.h src/tq_page.c src/tq_page.h src/tq_transform.c src/tq_transform.h src/tq_codec_mse.c src/tq_codec_mse.h src/tq_codec_prod.c src/tq_codec_prod.h src/tq_pgvector_compat.c src/tq_pgvector_compat.h src/tq_scan.c src/tq_scan.h src/tq_query_tuning.c src/tq_query_tuning.h src/tq_simd_avx2.c src/tq_simd_avx2.h src/tq_router.c src/tq_router.h
-	$(CC) $(CPPFLAGS) $(CFLAGS) -DTQ_UNIT_TEST=1 -Wall -Werror -std=c11 -o $@ tests/unit/test_smoke.c src/tq_am_routine.c src/tq_options.c src/tq_page.c src/tq_transform.c src/tq_codec_mse.c src/tq_codec_prod.c src/tq_pgvector_compat.c src/tq_scan.c src/tq_query_tuning.c src/tq_simd_avx2.c src/tq_router.c -lm
+tests/unit/%: tests/unit/%.c $(UNIT_TEST_COMMON_SRCS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -DTQ_UNIT_TEST=1 -Wall -Werror -std=c11 -o $@ $< src/tq_am_routine.c src/tq_options.c src/tq_page.c src/tq_transform.c src/tq_codec_mse.c src/tq_codec_prod.c src/tq_pgvector_compat.c src/tq_scan.c src/tq_query_tuning.c src/tq_simd_avx2.c src/tq_router.c -lm
 
-unitcheck: $(UNIT_TEST_BIN)
-	./$(UNIT_TEST_BIN)
+unitcheck: $(UNIT_TEST_BINS)
+	for test_bin in $(UNIT_TEST_BINS); do ./$$test_bin; done
 
 tapcheck: install-pgvector
 	./scripts/fetch_postgres_test_libs.sh
@@ -46,9 +47,9 @@ tapcheck: install-pgvector
 	./scripts/run_tapcheck.sh "$(PGXS)" "$(PGBINDIR)" "$(PG_TEST_PERL)" "$(PERL5_LOCAL_LIB)" "t/*.pl"
 
 clean-unit:
-	rm -f $(UNIT_TEST_BIN)
+	rm -f $(UNIT_TEST_BINS)
 
-EXTRA_CLEAN += $(UNIT_TEST_BIN)
+EXTRA_CLEAN += $(UNIT_TEST_BINS)
 
 ifeq ($(wildcard $(PGXS)),)
 $(error Could not find a usable pgxs.mk via PG_CONFIG=$(PG_CONFIG). Install a full PostgreSQL server toolchain or set PG_CONFIG explicitly)

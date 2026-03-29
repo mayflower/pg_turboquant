@@ -51,6 +51,15 @@ Returns the approximate candidate set without exact reranking.
 
 Returns recommended query settings for the requested candidate pool and final limit.
 
+The helper keeps the SQL surface index-agnostic: it recommends `probes` and `oversample_factor`, then derives a generic `max_visited_codes` budget from the resolved oversampling so skewed IVF workloads can be costed and bounded by predicted visited work instead of raw `probes / lists`.
+
+The current return columns are:
+
+- `probes`
+- `oversample_factor`
+- `max_visited_codes`
+- `max_visited_pages`
+
 ### `tq_bitmap_cosine_filter(...)`
 
 Bitmap-oriented helper used for filtered cosine workloads where ordered ANN scans are not the only plan shape.
@@ -70,6 +79,22 @@ Returns JSON metadata for a TurboQuant index, including:
 ### `tq_runtime_simd_features()`
 
 Returns the compiled and runtime-visible SIMD surface and selected score kernel.
+
+### `tq_last_scan_stats()`
+
+Returns backend-local JSON for the most recent TurboQuant scan in the current session.
+
+The current JSON includes probe-budget and scan-work fields such as:
+
+- `configured_probe_count`
+- `nominal_probe_count`
+- `effective_probe_count`
+- `max_visited_codes`
+- `max_visited_pages`
+- `selected_list_count`
+- `selected_live_count`
+- `visited_page_count`
+- `visited_code_count`
 
 ## Supported plan shapes
 

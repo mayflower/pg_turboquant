@@ -1548,8 +1548,10 @@ test_tq_planner_cost_helper_prefers_flat_for_small_tables(void)
 	memset(&ivf, 0, sizeof(ivf));
 
 	assert(tq_estimate_ordered_scan_cost(4.0, 32.0, 10.0, 0, 1, 4,
+										 0, 0,
 										 0.005, 0.0025, 4.0, 0.01, &flat));
 	assert(tq_estimate_ordered_scan_cost(4.0, 32.0, 10.0, 4, 1, 4,
+										 0, 0,
 										 0.005, 0.0025, 4.0, 0.01, &ivf));
 	assert_float_close((float) flat.scanned_fraction, 1.0f, 1e-6f);
 	assert(ivf.scanned_fraction < flat.scanned_fraction);
@@ -1566,8 +1568,10 @@ test_tq_planner_cost_helper_prefers_ivf_for_large_tables_and_low_probes(void)
 	memset(&ivf, 0, sizeof(ivf));
 
 	assert(tq_estimate_ordered_scan_cost(512.0, 4096.0, 100.0, 0, 1, 4,
+										 0, 0,
 										 0.005, 0.0025, 4.0, 0.01, &flat));
 	assert(tq_estimate_ordered_scan_cost(512.0, 4096.0, 100.0, 16, 1, 4,
+										 0, 0,
 										 0.005, 0.0025, 4.0, 0.01, &ivf));
 	assert(ivf.scanned_fraction < 0.1);
 	assert(ivf.total_cost < flat.total_cost);
@@ -1583,11 +1587,45 @@ test_tq_planner_cost_helper_high_probes_remove_ivf_advantage(void)
 	memset(&ivf, 0, sizeof(ivf));
 
 	assert(tq_estimate_ordered_scan_cost(512.0, 4096.0, 100.0, 0, 16, 4,
+										 0, 0,
 										 0.005, 0.0025, 4.0, 0.01, &flat));
 	assert(tq_estimate_ordered_scan_cost(512.0, 4096.0, 100.0, 16, 16, 4,
+										 0, 0,
 										 0.005, 0.0025, 4.0, 0.01, &ivf));
 	assert_float_close((float) ivf.scanned_fraction, 1.0f, 1e-6f);
 	assert(flat.total_cost < ivf.total_cost);
+}
+
+static void
+test_tq_planner_cost_helper_visit_budgets_limit_ivf_work(void)
+{
+	TqPlannerCostEstimate unbounded;
+	TqPlannerCostEstimate bounded_codes;
+	TqPlannerCostEstimate bounded_pages;
+
+	memset(&unbounded, 0, sizeof(unbounded));
+	memset(&bounded_codes, 0, sizeof(bounded_codes));
+	memset(&bounded_pages, 0, sizeof(bounded_pages));
+
+	assert(tq_estimate_ordered_scan_cost(512.0, 4096.0, 100.0, 16, 16, 4,
+										 0, 0,
+										 0.005, 0.0025, 4.0, 0.01, &unbounded));
+	assert(tq_estimate_ordered_scan_cost(512.0, 4096.0, 100.0, 16, 16, 4,
+										 256, 0,
+										 0.005, 0.0025, 4.0, 0.01, &bounded_codes));
+	assert(tq_estimate_ordered_scan_cost(512.0, 4096.0, 100.0, 16, 16, 4,
+										 0, 32,
+										 0.005, 0.0025, 4.0, 0.01, &bounded_pages));
+
+	assert(bounded_codes.effective_probe_count < unbounded.effective_probe_count);
+	assert(bounded_codes.visited_tuples < unbounded.visited_tuples);
+	assert(bounded_codes.pages_fetched < unbounded.pages_fetched);
+	assert(bounded_codes.total_cost < unbounded.total_cost);
+
+	assert(bounded_pages.effective_probe_count < unbounded.effective_probe_count);
+	assert(bounded_pages.visited_tuples < unbounded.visited_tuples);
+	assert(bounded_pages.pages_fetched < unbounded.pages_fetched);
+	assert(bounded_pages.total_cost < unbounded.total_cost);
 }
 
 static void
@@ -1600,8 +1638,10 @@ test_tq_planner_cost_helper_accounts_for_filter_selectivity(void)
 	memset(&filtered, 0, sizeof(filtered));
 
 	assert(tq_estimate_ordered_scan_cost(512.0, 4096.0, 4096.0, 16, 2, 4,
+										 0, 0,
 										 0.005, 0.0025, 4.0, 0.01, &unfiltered));
 	assert(tq_estimate_ordered_scan_cost(512.0, 4096.0, 8.0, 16, 2, 4,
+										 0, 0,
 										 0.005, 0.0025, 4.0, 0.01, &filtered));
 	assert(filtered.selectivity < unfiltered.selectivity);
 	assert(filtered.total_cost < unfiltered.total_cost);
@@ -2068,7 +2108,7 @@ test_tq_batch_page_scan_tiny_corpus(void)
 	assert(tq_batch_page_append_lane(page, sizeof(page), &(TqTid){.block_number = 1, .offset_number = 3}, &lane, errmsg, sizeof(errmsg)));
 	assert(tq_batch_page_set_code(page, sizeof(page), lane, packed, sizeof(packed), errmsg, sizeof(errmsg)));
 
-	assert(tq_batch_page_scan_prod_cosine(page, sizeof(page), &config, &lut,
+	assert(tq_batch_page_scan_prod_cosine(page, sizeof(page), &config, true, &lut,
 										  query, 2, &heap, errmsg, sizeof(errmsg)));
 
 	assert(tq_candidate_heap_pop_best(&heap, &entry));
@@ -2136,11 +2176,11 @@ test_tq_batch_page_scan_normalized_metric_orders_align(void)
 	assert(tq_batch_page_append_lane(page, sizeof(page), &(TqTid){.block_number = 1, .offset_number = 3}, &lane, errmsg, sizeof(errmsg)));
 	assert(tq_batch_page_set_code(page, sizeof(page), lane, packed, sizeof(packed), errmsg, sizeof(errmsg)));
 
-	assert(tq_batch_page_scan_prod(page, sizeof(page), &config, TQ_DISTANCE_COSINE, &lut,
+	assert(tq_batch_page_scan_prod(page, sizeof(page), &config, true, TQ_DISTANCE_COSINE, &lut,
 								   query, 2, &cosine_heap, errmsg, sizeof(errmsg)));
-	assert(tq_batch_page_scan_prod(page, sizeof(page), &config, TQ_DISTANCE_IP, &lut,
+	assert(tq_batch_page_scan_prod(page, sizeof(page), &config, true, TQ_DISTANCE_IP, &lut,
 								   query, 2, &ip_heap, errmsg, sizeof(errmsg)));
-	assert(tq_batch_page_scan_prod(page, sizeof(page), &config, TQ_DISTANCE_L2, &lut,
+	assert(tq_batch_page_scan_prod(page, sizeof(page), &config, true, TQ_DISTANCE_L2, &lut,
 								   query, 2, &l2_heap, errmsg, sizeof(errmsg)));
 
 	assert(tq_candidate_heap_pop_best(&cosine_heap, &cosine_entry));
@@ -2214,7 +2254,7 @@ test_tq_batch_page_scan_cosine_is_scale_invariant(void)
 	assert(tq_batch_page_append_lane(page, sizeof(page), &(TqTid){.block_number = 1, .offset_number = 3}, &lane, errmsg, sizeof(errmsg)));
 	assert(tq_batch_page_set_code(page, sizeof(page), lane, packed, sizeof(packed), errmsg, sizeof(errmsg)));
 
-	assert(tq_batch_page_scan_prod(page, sizeof(page), &config, TQ_DISTANCE_COSINE, &lut,
+	assert(tq_batch_page_scan_prod(page, sizeof(page), &config, false, TQ_DISTANCE_COSINE, &lut,
 								   query, 2, &heap, errmsg, sizeof(errmsg)));
 
 	assert(tq_candidate_heap_pop_best(&heap, &entry));
@@ -2277,9 +2317,9 @@ test_tq_batch_page_scan_l2_diverges_from_ip_on_non_normalized_input(void)
 	assert(tq_batch_page_append_lane(page, sizeof(page), &(TqTid){.block_number = 1, .offset_number = 3}, &lane, errmsg, sizeof(errmsg)));
 	assert(tq_batch_page_set_code(page, sizeof(page), lane, packed, sizeof(packed), errmsg, sizeof(errmsg)));
 
-	assert(tq_batch_page_scan_prod(page, sizeof(page), &config, TQ_DISTANCE_IP, &lut,
+	assert(tq_batch_page_scan_prod(page, sizeof(page), &config, false, TQ_DISTANCE_IP, &lut,
 								   query, 2, &ip_heap, errmsg, sizeof(errmsg)));
-	assert(tq_batch_page_scan_prod(page, sizeof(page), &config, TQ_DISTANCE_L2, &lut,
+	assert(tq_batch_page_scan_prod(page, sizeof(page), &config, false, TQ_DISTANCE_L2, &lut,
 								   query, 2, &l2_heap, errmsg, sizeof(errmsg)));
 
 	assert(tq_candidate_heap_pop_best(&ip_heap, &ip_entry));
@@ -2689,6 +2729,7 @@ main(void)
 	test_tq_planner_cost_helper_prefers_flat_for_small_tables();
 	test_tq_planner_cost_helper_prefers_ivf_for_large_tables_and_low_probes();
 	test_tq_planner_cost_helper_high_probes_remove_ivf_advantage();
+	test_tq_planner_cost_helper_visit_budgets_limit_ivf_work();
 	test_tq_planner_cost_helper_accounts_for_filter_selectivity();
 	test_tq_candidate_heap_behavior();
 	test_tq_metric_distance_from_ip_score_modes();

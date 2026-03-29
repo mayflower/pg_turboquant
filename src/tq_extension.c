@@ -1,5 +1,7 @@
 #include "postgres.h"
 
+#include <math.h>
+
 #include "access/htup_details.h"
 #include "access/tableam.h"
 #include "catalog/index.h"
@@ -19,6 +21,8 @@
 
 #include "src/tq_page.h"
 #include "src/tq_reloptions.h"
+#include "src/tq_router.h"
+#include "src/tq_scan.h"
 #include "src/tq_simd_avx2.h"
 
 PG_MODULE_MAGIC;
@@ -28,6 +32,7 @@ PG_FUNCTION_INFO_V1(tq_debug_validate_reloptions);
 PG_FUNCTION_INFO_V1(tq_debug_router_metadata);
 PG_FUNCTION_INFO_V1(tq_debug_transform_metadata);
 PG_FUNCTION_INFO_V1(tq_index_metadata_core);
+PG_FUNCTION_INFO_V1(tq_last_scan_stats_core);
 PG_FUNCTION_INFO_V1(tq_runtime_simd_features_core);
 
 typedef struct TqListAggregate
@@ -44,6 +49,7 @@ static const char *tq_codec_kind_name(TqCodecKind codec_kind);
 static const char *tq_transform_kind_name(TqTransformKind transform_kind);
 static const char *tq_router_algorithm_name(TqRouterAlgorithmKind algorithm_kind);
 static void tq_json_append_string(StringInfo buf, const char *value);
+static int tq_u64_compare(const void *left, const void *right);
 static bool tq_read_meta_fields(Relation index_relation,
 								TqMetaPageFields *meta_fields,
 								char *errmsg,
@@ -164,6 +170,19 @@ tq_json_append_string(StringInfo buf, const char *value)
 		}
 	}
 	appendStringInfoChar(buf, '"');
+}
+
+static int
+tq_u64_compare(const void *left, const void *right)
+{
+	const uint64_t *lhs = (const uint64_t *) left;
+	const uint64_t *rhs = (const uint64_t *) right;
+
+	if (*lhs < *rhs)
+		return -1;
+	if (*lhs > *rhs)
+		return 1;
+	return 0;
 }
 
 static bool
@@ -344,6 +363,10 @@ tq_append_list_metadata_json(StringInfo buf,
 	uint64_t	min_live_count = 0;
 	uint64_t	max_live_count = 0;
 	double		avg_live_count = 0.0;
+	double		coeff_var = 0.0;
+	double		max_list_over_avg = 0.0;
+	uint64_t	p95_live_count = 0;
+	uint64_t   *live_counts = NULL;
 
 	appendStringInfoString(buf, "\"lists\":[");
 
@@ -387,9 +410,13 @@ tq_append_list_metadata_json(StringInfo buf,
 
 		appendStringInfoString(buf, "],");
 		appendStringInfo(buf,
-						 "\"list_distribution\":{\"min_live_count\":0,\"max_live_count\":0,\"avg_live_count\":0.00}");
+						 "\"list_distribution\":{\"min_live_count\":0,\"max_live_count\":0,\"avg_live_count\":0.00,"
+						 "\"avg_list_size\":0.00,\"max_list_size\":0,\"p95_list_size\":0,\"coeff_var\":0.0000,"
+						 "\"max_list_over_avg\":0.0000}");
 		return true;
 	}
+
+	live_counts = (uint64_t *) palloc0(sizeof(uint64_t) * (size_t) meta_fields->list_count);
 
 	for (list_id = 0; list_id < meta_fields->list_count; list_id++)
 	{
@@ -421,6 +448,7 @@ tq_append_list_metadata_json(StringInfo buf,
 			min_live_count = aggregate.live_count;
 		if (list_id == 0 || aggregate.live_count > max_live_count)
 			max_live_count = aggregate.live_count;
+		live_counts[list_id] = aggregate.live_count;
 		avg_live_count += (double) aggregate.live_count;
 
 		if (list_id > 0)
@@ -436,12 +464,38 @@ tq_append_list_metadata_json(StringInfo buf,
 	}
 
 	avg_live_count /= (double) meta_fields->list_count;
+	if (avg_live_count > 0.0)
+	{
+		double		variance = 0.0;
+
+		for (list_id = 0; list_id < meta_fields->list_count; list_id++)
+		{
+			double		centered = (double) live_counts[list_id] - avg_live_count;
+
+			variance += centered * centered;
+		}
+		variance /= (double) meta_fields->list_count;
+		coeff_var = sqrt(variance) / avg_live_count;
+		max_list_over_avg = (double) max_live_count / avg_live_count;
+	}
+
+	qsort(live_counts, meta_fields->list_count, sizeof(uint64_t), tq_u64_compare);
+	p95_live_count = live_counts[((meta_fields->list_count * 95u) + 99u) / 100u - 1u];
+	pfree(live_counts);
+
 	appendStringInfoString(buf, "],");
 	appendStringInfo(buf,
-					 "\"list_distribution\":{\"min_live_count\":%llu,\"max_live_count\":%llu,\"avg_live_count\":%.2f}",
+					 "\"list_distribution\":{\"min_live_count\":%llu,\"max_live_count\":%llu,\"avg_live_count\":%.2f,"
+					 "\"avg_list_size\":%.2f,\"max_list_size\":%llu,\"p95_list_size\":%llu,\"coeff_var\":%.4f,"
+					 "\"max_list_over_avg\":%.4f}",
 					 (unsigned long long) min_live_count,
 					 (unsigned long long) max_live_count,
-					 avg_live_count);
+					 avg_live_count,
+					 avg_live_count,
+					 (unsigned long long) max_live_count,
+					 (unsigned long long) p95_live_count,
+					 coeff_var,
+					 max_list_over_avg);
 	return true;
 }
 
@@ -475,7 +529,7 @@ tq_debug_router_metadata(PG_FUNCTION_ARGS)
 	Buffer		buffer;
 	TqMetaPageFields meta_fields;
 	char		error_buf[256];
-	char		result[256];
+	char		result[512];
 
 	(void) fcinfo;
 
@@ -504,12 +558,17 @@ tq_debug_router_metadata(PG_FUNCTION_ARGS)
 
 	snprintf(result,
 			 sizeof(result),
-			 "seed=%u sample_count=%u trained_vector_count=%u max_iterations=%u completed_iterations=%u",
+			 "seed=%u sample_count=%u trained_vector_count=%u max_iterations=%u completed_iterations=%u "
+			 "restart_count=%u selected_restart=%u balance_penalty=%.4f selection_score=%.4f",
 			 meta_fields.router_seed,
 			 meta_fields.router_sample_count,
 			 meta_fields.router_trained_vector_count,
 			 meta_fields.router_max_iterations,
-			 meta_fields.router_completed_iterations);
+			 meta_fields.router_completed_iterations,
+			 meta_fields.router_restart_count,
+			 meta_fields.router_selected_restart,
+			 meta_fields.router_balance_penalty,
+			 meta_fields.router_selection_score);
 	PG_RETURN_TEXT_P(cstring_to_text(result));
 }
 
@@ -637,12 +696,25 @@ tq_index_metadata_core(PG_FUNCTION_ARGS)
 	appendStringInfoString(&buf, "\"algorithm\":");
 	tq_json_append_string(&buf, tq_router_algorithm_name(meta_fields.router_algorithm));
 	appendStringInfo(&buf,
-					 ",\"seed\":%u,\"sample_count\":%u,\"max_iterations\":%u,\"completed_iterations\":%u,\"trained_vector_count\":%u},",
+					 ",\"seed\":%u,\"sample_count\":%u,\"max_iterations\":%u,\"completed_iterations\":%u,"
+					 "\"trained_vector_count\":%u,\"restart_count\":%u,\"selected_restart\":%u,"
+					 "\"mean_distortion\":%.6f,\"max_list_over_avg\":%.4f,\"coeff_var\":%.4f,"
+					 "\"balance_penalty\":%.4f,\"selection_score\":%.6f,"
+					 "\"balance_weights\":{\"max_list_over_avg\":%.2f,\"coeff_var\":%.2f}},",
 					 meta_fields.router_seed,
 					 meta_fields.router_sample_count,
 					 meta_fields.router_max_iterations,
 					 meta_fields.router_completed_iterations,
-					 meta_fields.router_trained_vector_count);
+					 meta_fields.router_trained_vector_count,
+					 meta_fields.router_restart_count,
+					 meta_fields.router_selected_restart,
+					 meta_fields.router_mean_distortion,
+					 meta_fields.router_max_list_over_avg,
+					 meta_fields.router_coeff_var,
+					 meta_fields.router_balance_penalty,
+					 meta_fields.router_selection_score,
+					 TQ_ROUTER_MAX_LIST_WEIGHT,
+					 TQ_ROUTER_COEFF_VAR_WEIGHT);
 	if (!tq_append_list_metadata_json(&buf,
 									  index_relation,
 									  &meta_fields,
@@ -669,6 +741,24 @@ tq_index_metadata_core(PG_FUNCTION_ARGS)
 
 	RelationClose(index_relation);
 	PG_RETURN_TEXT_P(cstring_to_text(buf.data));
+}
+
+Datum
+tq_last_scan_stats_core(PG_FUNCTION_ARGS)
+{
+	TqScanStats stats;
+	char		json[1024];
+
+	memset(&stats, 0, sizeof(stats));
+	memset(json, 0, sizeof(json));
+	tq_scan_stats_snapshot(&stats);
+
+	if (!tq_scan_stats_serialize_json(&stats, json, sizeof(json)))
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("turboquant could not serialize last scan stats")));
+
+	PG_RETURN_TEXT_P(cstring_to_text(json));
 }
 
 Datum

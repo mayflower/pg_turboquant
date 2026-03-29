@@ -21,6 +21,7 @@ tq_reloptions_validator(void *parsed_options, relopt_value *vals, int nvals)
 		.lists = options->lists,
 		.router_samples = options->router_samples,
 		.router_iterations = options->router_iterations,
+		.router_restarts = options->router_restarts,
 		.router_seed = options->router_seed,
 		.normalized = options->normalized,
 		.transform_name = GET_STRING_RELOPTION(options, transform_offset),
@@ -57,6 +58,10 @@ tq_init_local_relopts(local_relopts *relopts)
 							"TurboQuant IVF router Lloyd iteration budget",
 							8, 1, 64,
 							offsetof(TqAmOptions, router_iterations));
+	add_local_int_reloption(relopts, "router_restarts",
+							"TurboQuant IVF router deterministic restart budget",
+							3, 1, 8,
+							offsetof(TqAmOptions, router_restarts));
 	add_local_int_reloption(relopts, "router_seed",
 							"TurboQuant IVF router deterministic seed",
 							20260327, 0, INT_MAX,

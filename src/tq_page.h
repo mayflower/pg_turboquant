@@ -9,9 +9,10 @@
 #include "src/tq_transform.h"
 
 #define TQ_PAGE_MAGIC UINT32_C(0x54515047)
-#define TQ_PAGE_FORMAT_VERSION 4
+#define TQ_PAGE_FORMAT_VERSION 6
 #define TQ_INVALID_BLOCK_NUMBER UINT32_MAX
 #define TQ_DETACHED_FREE_LIST_ID UINT32_MAX
+#define TQ_BATCH_PAGE_NO_REPRESENTATIVE UINT16_MAX
 
 typedef enum TqPageKind
 {
@@ -55,6 +56,13 @@ typedef struct TqMetaPageFields
 	uint32_t		router_completed_iterations;
 	uint32_t		router_trained_vector_count;
 	TqRouterAlgorithmKind router_algorithm;
+	uint32_t		router_restart_count;
+	uint32_t		router_selected_restart;
+	float			router_mean_distortion;
+	float			router_max_list_over_avg;
+	float			router_coeff_var;
+	float			router_balance_penalty;
+	float			router_selection_score;
 } TqMetaPageFields;
 
 typedef struct TqListDirEntry
@@ -87,10 +95,18 @@ typedef struct TqBatchPageHeaderView
 	uint16_t	lane_count;
 	uint16_t	occupied_count;
 	uint16_t	live_count;
+	uint16_t	representative_lane;
 	uint32_t	code_bytes;
 	uint32_t	list_id;
 	uint32_t	next_block;
+	float		residual_radius;
 } TqBatchPageHeaderView;
+
+typedef struct TqBatchPageSummary
+{
+	uint16_t	representative_lane;
+	float		residual_radius;
+} TqBatchPageSummary;
 
 typedef struct TqCentroidPageHeaderView
 {
@@ -201,6 +217,16 @@ extern bool tq_batch_page_should_reclaim(const void *page,
 extern bool tq_batch_page_read_header(const void *page,
 									  size_t page_size,
 									  TqBatchPageHeaderView *header,
+									  char *errmsg,
+									  size_t errmsg_len);
+extern bool tq_batch_page_set_summary(void *page,
+									  size_t page_size,
+									  const TqBatchPageSummary *summary,
+									  char *errmsg,
+									  size_t errmsg_len);
+extern bool tq_batch_page_get_summary(const void *page,
+									  size_t page_size,
+									  TqBatchPageSummary *summary,
 									  char *errmsg,
 									  size_t errmsg_len);
 extern bool tq_batch_page_append_lane(void *page,

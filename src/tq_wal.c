@@ -4,7 +4,7 @@
 
 #include "src/tq_wal.h"
 
-#define TQ_WAL_META_PAGE_HEADER_BYTES 80
+#define TQ_WAL_META_PAGE_HEADER_BYTES 108
 #define TQ_WAL_LIST_DIR_PAGE_HEADER_BYTES 16
 #define TQ_WAL_LIST_DIR_ENTRY_BYTES 24
 #define TQ_WAL_CENTROID_PAGE_HEADER_BYTES 20
@@ -51,6 +51,11 @@ typedef struct TqWalBatchNextBlockArgs
 {
 	uint32_t	next_block;
 } TqWalBatchNextBlockArgs;
+
+typedef struct TqWalBatchSummaryArgs
+{
+	const TqBatchPageSummary *summary;
+} TqWalBatchSummaryArgs;
 
 typedef struct TqWalBatchAppendArgs
 {
@@ -282,6 +287,18 @@ tq_wal_mutate_batch_append(Page page, void *arg, char *errmsg, size_t errmsg_len
 }
 
 static bool
+tq_wal_mutate_batch_summary(Page page, void *arg, char *errmsg, size_t errmsg_len)
+{
+	const TqWalBatchSummaryArgs *args = (const TqWalBatchSummaryArgs *) arg;
+
+	if (!tq_batch_page_set_summary(tq_wal_payload(page), tq_wal_payload_size(page),
+								   args->summary, errmsg, errmsg_len))
+		return false;
+
+	return tq_wal_sync_page_bounds(page, errmsg, errmsg_len);
+}
+
+static bool
 tq_wal_mutate_batch_dead(Page page, void *arg, char *errmsg, size_t errmsg_len)
 {
 	const TqWalBatchDeadArgs *args = (const TqWalBatchDeadArgs *) arg;
@@ -413,6 +430,20 @@ tq_wal_set_batch_next_block(Relation relation,
 	args.next_block = next_block;
 	return tq_wal_apply(relation, buffer, 0,
 						tq_wal_mutate_batch_next_block, &args, errmsg, errmsg_len);
+}
+
+bool
+tq_wal_set_batch_summary(Relation relation,
+						 Buffer buffer,
+						 const TqBatchPageSummary *summary,
+						 char *errmsg,
+						 size_t errmsg_len)
+{
+	TqWalBatchSummaryArgs args;
+
+	args.summary = summary;
+	return tq_wal_apply(relation, buffer, 0,
+						tq_wal_mutate_batch_summary, &args, errmsg, errmsg_len);
 }
 
 bool

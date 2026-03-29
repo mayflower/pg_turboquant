@@ -1,5 +1,7 @@
+import importlib.util
 import json
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,6 +9,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "benchmark_suite.py"
+SPEC = importlib.util.spec_from_file_location("benchmark_suite_module", SCRIPT)
+BENCHMARK_SUITE = importlib.util.module_from_spec(SPEC)
+assert SPEC.loader is not None
+SPEC.loader.exec_module(BENCHMARK_SUITE)
 
 
 class BenchmarkSuiteContractTest(unittest.TestCase):
@@ -14,9 +20,7 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             output = Path(tmpdir) / "benchmark.json"
             cmd = [
-                "uv",
-                "run",
-                "python",
+                sys.executable,
                 str(SCRIPT),
                 "--dry-run",
                 "--output",
@@ -50,6 +54,8 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
                 "non_normalized_varied_norms",
                 "clustered",
                 "mixed_live_dead",
+                "hotpot_skewed",
+                "hotpot_overlap",
             ],
         )
         self.assertEqual(
@@ -76,6 +82,7 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
         self.assertIn("query_api", scenario)
         self.assertIn("index_metadata", scenario)
         self.assertIn("simd", scenario)
+        self.assertIn("scan_stats", scenario)
 
         self.assertIn("recall_at_10", scenario["metrics"])
         self.assertIn("recall_at_100", scenario["metrics"])
@@ -109,6 +116,22 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
         self.assertIn("compiled", scenario["simd"])
         self.assertIn("runtime_available", scenario["simd"])
         self.assertIn("selected_kernel", scenario["simd"])
+        self.assertIn("code_domain_kernel", scenario["simd"])
+        self.assertIn("mode", scenario["scan_stats"])
+        self.assertIn("score_mode", scenario["scan_stats"])
+        self.assertIn("score_kernel", scenario["scan_stats"])
+        self.assertIn("selected_list_count", scenario["scan_stats"])
+        self.assertIn("selected_live_count", scenario["scan_stats"])
+        self.assertIn("visited_page_count", scenario["scan_stats"])
+        self.assertIn("visited_code_count", scenario["scan_stats"])
+        self.assertIn("nominal_probe_count", scenario["scan_stats"])
+        self.assertIn("effective_probe_count", scenario["scan_stats"])
+        self.assertIn("max_visited_codes", scenario["scan_stats"])
+        self.assertIn("max_visited_pages", scenario["scan_stats"])
+        self.assertIn("candidate_heap_count", scenario["scan_stats"])
+        if scenario["method"] in {"turboquant_flat", "turboquant_ivf"}:
+            self.assertEqual(scenario["scan_stats"]["score_mode"], "code_domain")
+            self.assertEqual(scenario["scan_stats"]["decoded_vector_count"], 0)
         self.assertIn("python_version", payload["environment"])
         self.assertIn("platform", payload["environment"])
         self.assertIn("cpu_arch", payload["environment"])
@@ -244,6 +267,88 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
         self.assertTrue(scenario["index_metadata"]["capabilities"]["bitmap_scan"])
         self.assertFalse(scenario["index_metadata"]["capabilities"]["index_only_scan"])
         self.assertEqual(scenario["simd"]["selected_kernel"], scenario["simd"]["preferred_kernel"])
+        self.assertEqual(scenario["scan_stats"]["score_kernel"], "none")
+        self.assertEqual(scenario["simd"]["code_domain_kernel"], "none")
+
+    def test_hotpot_skewed_profile_surfaces_scan_stats(self):
+        payload = self.run_suite(
+            "--profile",
+            "tiny",
+            "--corpus",
+            "hotpot_skewed",
+            "--methods",
+            "turboquant_ivf",
+            "--turboquant-probes",
+            "4",
+            "--turboquant-max-visited-codes",
+            "256",
+        )
+
+        scenario = payload["scenarios"][0]
+        self.assertEqual(scenario["corpus"], "hotpot_skewed")
+        self.assertEqual(scenario["method"], "turboquant_ivf")
+        self.assertIn("scan_stats", scenario)
+        self.assertEqual(scenario["query_knobs"]["turboquant.probes"], 4)
+        self.assertEqual(scenario["query_knobs"]["turboquant.max_visited_codes"], 256)
+        self.assertIn("selected_list_count", scenario["scan_stats"])
+        self.assertIn("selected_live_count", scenario["scan_stats"])
+        self.assertIn("visited_page_count", scenario["scan_stats"])
+        self.assertIn("visited_code_count", scenario["scan_stats"])
+        self.assertIn("nominal_probe_count", scenario["scan_stats"])
+        self.assertIn("effective_probe_count", scenario["scan_stats"])
+        self.assertIn("max_visited_codes", scenario["scan_stats"])
+        self.assertIn("max_visited_pages", scenario["scan_stats"])
+        self.assertLessEqual(
+            scenario["scan_stats"]["effective_probe_count"],
+            scenario["scan_stats"]["nominal_probe_count"],
+        )
+        self.assertEqual(scenario["scan_stats"]["score_mode"], "code_domain")
+        self.assertIn(scenario["scan_stats"]["score_kernel"], ("scalar", "avx2"))
+        self.assertEqual(scenario["scan_stats"]["decoded_vector_count"], 0)
+        self.assertEqual(scenario["simd"]["code_domain_kernel"], scenario["scan_stats"]["score_kernel"])
+
+    def test_hotpot_overlap_profile_surfaces_harder_boundary_metadata(self):
+        payload = self.run_suite(
+            "--profile",
+            "medium",
+            "--corpus",
+            "hotpot_overlap",
+            "--methods",
+            "turboquant_ivf,pgvector_ivfflat,pgvector_hnsw",
+        )
+
+        self.assertEqual(len(payload["scenarios"]), 3)
+        for scenario in payload["scenarios"]:
+            self.assertEqual(scenario["corpus"], "hotpot_overlap")
+            self.assertEqual(scenario["corpus_metadata"]["distribution"], "hotpot_overlap_ivf")
+            self.assertTrue(scenario["corpus_metadata"]["normalized"])
+            self.assertGreater(scenario["corpus_metadata"]["heavy_cluster_fraction"], 0.6)
+            self.assertEqual(scenario["corpus_metadata"]["query_profile"], "boundary_blend")
+            self.assertIn("cluster_count", scenario["corpus_metadata"])
+            self.assertIn("overlap_noise", scenario["corpus_metadata"])
+            if scenario["method"] == "turboquant_ivf":
+                self.assertEqual(scenario["index"]["with"]["lists"], 64)
+                self.assertEqual(scenario["query_knobs"]["turboquant.probes"], 8)
+                self.assertEqual(scenario["query_knobs"]["turboquant.max_visited_codes"], 4096)
+            elif scenario["method"] == "pgvector_ivfflat":
+                self.assertEqual(scenario["index"]["with"]["lists"], 64)
+                self.assertEqual(scenario["query_knobs"]["ivfflat.probes"], 8)
+            elif scenario["method"] == "pgvector_hnsw":
+                self.assertEqual(scenario["query_knobs"]["hnsw.ef_search"], 80)
+
+    def test_insert_values_are_chunked_for_large_corpora(self):
+        rows = [
+            BENCHMARK_SUITE.Row(row_id, (0.1, 0.2, 0.3, 0.4))
+            for row_id in range(1, 301)
+        ]
+
+        chunks = BENCHMARK_SUITE.chunked_insert_value_blocks(rows, max_rows_per_insert=128)
+
+        self.assertEqual(len(chunks), 3)
+        self.assertEqual(chunks[0].count("\n"), 127)
+        self.assertEqual(chunks[1].count("\n"), 127)
+        self.assertIn("(1, 1, '[0.100000,0.200000,0.300000,0.400000]')", chunks[0])
+        self.assertIn("(300, 0, '[0.100000,0.200000,0.300000,0.400000]')", chunks[-1])
 
 
 if __name__ == "__main__":

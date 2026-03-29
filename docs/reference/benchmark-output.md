@@ -25,6 +25,7 @@ The canonical benchmark driver is `scripts/benchmark_suite.py`. Its JSON output 
 - `query_api`
 - `index_metadata`
 - `simd`
+- `scan_stats`
 
 ## Key metric fields
 
@@ -59,3 +60,23 @@ The suite records which helper was used, for example:
 - `tq_bitmap_cosine_filter`
 
 It also records candidate and final limits so query shape can be reproduced exactly.
+
+## Scan observability metadata
+
+`scan_stats` records backend-local work counters captured from `tq_last_scan_stats()` after the benchmark query. Important fields currently include:
+
+- `mode`
+- `score_mode`
+- `configured_probe_count`
+- `nominal_probe_count`
+- `effective_probe_count`
+- `max_visited_codes`
+- `max_visited_pages`
+- `selected_list_count`
+- `selected_live_count`
+- `visited_page_count`
+- `visited_code_count`
+- `candidate_heap_count`
+- `decoded_vector_count`
+- `page_prune_count`
+- `early_stop_count`

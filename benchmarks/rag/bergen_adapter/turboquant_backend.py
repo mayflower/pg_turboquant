@@ -25,6 +25,8 @@ class PgTurboquantBackend:
     rerank_k: int | None = None
     probes_guc: str = "turboquant.probes"
     oversample_guc: str = "turboquant.oversample_factor"
+    max_visited_codes_guc: str = "turboquant.max_visited_codes"
+    max_visited_pages_guc: str = "turboquant.max_visited_pages"
     helper_schema: str = "public"
 
     @property
@@ -51,6 +53,12 @@ class PgTurboquantBackend:
         oversampling = request.ann.get("oversampling")
         if oversampling is not None:
             session_statements.append((f"SET LOCAL {self.oversample_guc} = %s", (oversampling,)))
+        max_visited_codes = request.ann.get("max_visited_codes")
+        if max_visited_codes is not None:
+            session_statements.append((f"SET LOCAL {self.max_visited_codes_guc} = %s", (max_visited_codes,)))
+        max_visited_pages = request.ann.get("max_visited_pages")
+        if max_visited_pages is not None:
+            session_statements.append((f"SET LOCAL {self.max_visited_pages_guc} = %s", (max_visited_pages,)))
 
         query_literal = vector_literal(request.query_vector)
         if self.mode == MODE_APPROX:
@@ -97,11 +105,17 @@ class PgTurboquantBackend:
     def serialize_run_metadata(self, plan: RetrievalPlan) -> dict[str, Any]:
         probes = None
         oversample_factor = None
+        max_visited_codes = None
+        max_visited_pages = None
         for sql, params in plan.session_statements:
             if self.probes_guc in sql:
                 probes = params[0]
             elif self.oversample_guc in sql:
                 oversample_factor = params[0]
+            elif self.max_visited_codes_guc in sql:
+                max_visited_codes = params[0]
+            elif self.max_visited_pages_guc in sql:
+                max_visited_pages = params[0]
 
         sql_template_hash = hashlib.sha256(plan.sql.encode("utf-8")).hexdigest()
         return {
@@ -112,6 +126,8 @@ class PgTurboquantBackend:
             "mode": self.mode,
             "probes": probes,
             "oversample_factor": oversample_factor,
+            "max_visited_codes": max_visited_codes,
+            "max_visited_pages": max_visited_pages,
             "rerank_k": self.rerank_k if self.mode == MODE_APPROX_RERANK else None,
             "sql_template_hash": sql_template_hash,
         }

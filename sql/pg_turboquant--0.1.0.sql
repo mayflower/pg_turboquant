@@ -33,10 +33,25 @@ RETURNS text
 LANGUAGE C STRICT
 AS 'MODULE_PATHNAME', 'tq_index_metadata_core';
 
+CREATE FUNCTION tq_last_scan_stats_core()
+RETURNS text
+LANGUAGE C
+AS 'MODULE_PATHNAME', 'tq_last_scan_stats_core';
+
 CREATE FUNCTION tq_runtime_simd_features_core()
 RETURNS text
 LANGUAGE C STRICT
 AS 'MODULE_PATHNAME', 'tq_runtime_simd_features_core';
+
+CREATE FUNCTION tq_last_scan_stats()
+RETURNS jsonb
+LANGUAGE sql
+VOLATILE
+AS $$
+	SELECT tq_last_scan_stats_core()::jsonb;
+$$;
+
+COMMENT ON FUNCTION tq_last_scan_stats() IS 'Returns backend-local JSON metrics for the last turboquant scan in the current session.';
 
 CREATE FUNCTION tq_runtime_simd_features()
 RETURNS jsonb
@@ -122,7 +137,10 @@ CREATE FUNCTION tq_resolve_query_knobs(candidate_limit integer,
 									   final_limit integer,
 									   requested_probes integer DEFAULT NULL,
 									   requested_oversample_factor integer DEFAULT NULL)
-RETURNS TABLE(probes integer, oversample_factor integer)
+RETURNS TABLE(probes integer,
+			  oversample_factor integer,
+			  max_visited_codes integer,
+			  max_visited_pages integer)
 LANGUAGE plpgsql
 AS $$
 BEGIN
@@ -174,21 +192,36 @@ BEGIN
 		oversample_factor := requested_oversample_factor;
 	END IF;
 
+	max_visited_codes := LEAST(
+		2147483647::bigint,
+		GREATEST(
+			candidate_limit::bigint,
+			candidate_limit::bigint * oversample_factor::bigint
+		)
+	)::integer;
+	max_visited_pages := 0;
+
 	RETURN QUERY
-	SELECT tq_resolve_query_knobs.probes, tq_resolve_query_knobs.oversample_factor;
+	SELECT tq_resolve_query_knobs.probes,
+		   tq_resolve_query_knobs.oversample_factor,
+		   tq_resolve_query_knobs.max_visited_codes,
+		   tq_resolve_query_knobs.max_visited_pages;
 END;
 $$;
 
 CREATE FUNCTION tq_recommended_query_knobs(candidate_limit integer,
 										   final_limit integer DEFAULT NULL)
-RETURNS TABLE(probes integer, oversample_factor integer)
+RETURNS TABLE(probes integer,
+			  oversample_factor integer,
+			  max_visited_codes integer,
+			  max_visited_pages integer)
 LANGUAGE SQL
 AS $$
-	SELECT probes, oversample_factor
+	SELECT probes, oversample_factor, max_visited_codes, max_visited_pages
 	FROM tq_resolve_query_knobs(candidate_limit, final_limit, NULL, NULL);
 $$;
 
-COMMENT ON FUNCTION tq_recommended_query_knobs(integer, integer) IS 'Returns recommended turboquant probes and oversample_factor values for a two-stage query.';
+COMMENT ON FUNCTION tq_recommended_query_knobs(integer, integer) IS 'Returns recommended turboquant probes, oversample_factor, and visit budgets for a two-stage query.';
 
 CREATE FUNCTION tq_approx_candidates(indexed_table regclass,
 									 id_column name,
@@ -207,16 +240,20 @@ DECLARE
 	order_operator text;
 	resolved_probes integer;
 	resolved_oversample integer;
+	resolved_max_visited_codes integer;
+	resolved_max_visited_pages integer;
 	helper_sql text;
 BEGIN
 	order_operator := tq_metric_order_operator(metric);
 
-	SELECT knobs.probes, knobs.oversample_factor
-	INTO resolved_probes, resolved_oversample
+	SELECT knobs.probes, knobs.oversample_factor, knobs.max_visited_codes, knobs.max_visited_pages
+	INTO resolved_probes, resolved_oversample, resolved_max_visited_codes, resolved_max_visited_pages
 	FROM tq_resolve_query_knobs(candidate_limit, candidate_limit, probes, oversample_factor) AS knobs;
 
 	EXECUTE format('SET LOCAL turboquant.probes = %s', resolved_probes);
 	EXECUTE format('SET LOCAL turboquant.oversample_factor = %s', resolved_oversample);
+	EXECUTE format('SET LOCAL turboquant.max_visited_codes = %s', resolved_max_visited_codes);
+	EXECUTE format('SET LOCAL turboquant.max_visited_pages = %s', resolved_max_visited_pages);
 
 	helper_sql := format($fmt$
 		WITH approx AS MATERIALIZED (
@@ -254,16 +291,20 @@ DECLARE
 	order_operator text;
 	resolved_probes integer;
 	resolved_oversample integer;
+	resolved_max_visited_codes integer;
+	resolved_max_visited_pages integer;
 	helper_sql text;
 BEGIN
 	order_operator := tq_metric_order_operator(metric);
 
-	SELECT knobs.probes, knobs.oversample_factor
-	INTO resolved_probes, resolved_oversample
+	SELECT knobs.probes, knobs.oversample_factor, knobs.max_visited_codes, knobs.max_visited_pages
+	INTO resolved_probes, resolved_oversample, resolved_max_visited_codes, resolved_max_visited_pages
 	FROM tq_resolve_query_knobs(candidate_limit, candidate_limit, probes, oversample_factor) AS knobs;
 
 	EXECUTE format('SET LOCAL turboquant.probes = %s', resolved_probes);
 	EXECUTE format('SET LOCAL turboquant.oversample_factor = %s', resolved_oversample);
+	EXECUTE format('SET LOCAL turboquant.max_visited_codes = %s', resolved_max_visited_codes);
+	EXECUTE format('SET LOCAL turboquant.max_visited_pages = %s', resolved_max_visited_pages);
 
 	helper_sql := format($fmt$
 		WITH approx AS MATERIALIZED (
@@ -307,16 +348,20 @@ DECLARE
 	order_operator text;
 	resolved_probes integer;
 	resolved_oversample integer;
+	resolved_max_visited_codes integer;
+	resolved_max_visited_pages integer;
 	helper_sql text;
 BEGIN
 	order_operator := tq_metric_order_operator(metric);
 
-	SELECT knobs.probes, knobs.oversample_factor
-	INTO resolved_probes, resolved_oversample
+	SELECT knobs.probes, knobs.oversample_factor, knobs.max_visited_codes, knobs.max_visited_pages
+	INTO resolved_probes, resolved_oversample, resolved_max_visited_codes, resolved_max_visited_pages
 	FROM tq_resolve_query_knobs(candidate_limit, final_limit, probes, oversample_factor) AS knobs;
 
 	EXECUTE format('SET LOCAL turboquant.probes = %s', resolved_probes);
 	EXECUTE format('SET LOCAL turboquant.oversample_factor = %s', resolved_oversample);
+	EXECUTE format('SET LOCAL turboquant.max_visited_codes = %s', resolved_max_visited_codes);
+	EXECUTE format('SET LOCAL turboquant.max_visited_pages = %s', resolved_max_visited_pages);
 
 	helper_sql := format($fmt$
 		WITH approx AS MATERIALIZED (
@@ -368,16 +413,20 @@ DECLARE
 	order_operator text;
 	resolved_probes integer;
 	resolved_oversample integer;
+	resolved_max_visited_codes integer;
+	resolved_max_visited_pages integer;
 	helper_sql text;
 BEGIN
 	order_operator := tq_metric_order_operator(metric);
 
-	SELECT knobs.probes, knobs.oversample_factor
-	INTO resolved_probes, resolved_oversample
+	SELECT knobs.probes, knobs.oversample_factor, knobs.max_visited_codes, knobs.max_visited_pages
+	INTO resolved_probes, resolved_oversample, resolved_max_visited_codes, resolved_max_visited_pages
 	FROM tq_resolve_query_knobs(candidate_limit, final_limit, probes, oversample_factor) AS knobs;
 
 	EXECUTE format('SET LOCAL turboquant.probes = %s', resolved_probes);
 	EXECUTE format('SET LOCAL turboquant.oversample_factor = %s', resolved_oversample);
+	EXECUTE format('SET LOCAL turboquant.max_visited_codes = %s', resolved_max_visited_codes);
+	EXECUTE format('SET LOCAL turboquant.max_visited_pages = %s', resolved_max_visited_pages);
 
 	helper_sql := format($fmt$
 		WITH approx AS MATERIALIZED (

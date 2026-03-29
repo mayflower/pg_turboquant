@@ -11,6 +11,23 @@ typedef struct TqRouterProbeScore
 	float		score;
 } TqRouterProbeScore;
 
+typedef struct TqRouterObjective
+{
+	float		mean_distortion;
+	float		max_list_over_avg;
+	float		coeff_var;
+	float		balance_penalty;
+	float		selection_score;
+} TqRouterObjective;
+
+static void tq_router_reseed_empty_centroid(const float *sampled_vectors,
+											const uint32_t *assignments,
+											uint32_t sample_count,
+											uint32_t dimension,
+											uint32_t centroid_index,
+											uint32_t list_count,
+											float *centroids);
+
 static void
 tq_set_error(char *errmsg, size_t errmsg_len, const char *message)
 {
@@ -210,12 +227,12 @@ tq_router_initialize_kmeanspp(const float *sampled_vectors,
 							  uint32_t sample_count,
 							  uint32_t dimension,
 							  uint32_t list_count,
-							  const TqRouterTrainingConfig *config,
+							  uint32_t seed,
 							  TqRouterModel *model)
 {
 	bool	   *chosen = NULL;
 	double	   *weights = NULL;
-	uint32_t	state = config->seed;
+	uint32_t	state = seed;
 	size_t		centroid_index = 0;
 	size_t		first_index = 0;
 
@@ -228,7 +245,7 @@ tq_router_initialize_kmeanspp(const float *sampled_vectors,
 		return;
 	}
 
-	first_index = config->seed % sample_count;
+	first_index = seed % sample_count;
 	memcpy(model->centroids,
 		   sampled_vectors + (first_index * (size_t) dimension),
 		   sizeof(float) * (size_t) dimension);
@@ -270,6 +287,238 @@ tq_router_initialize_kmeanspp(const float *sampled_vectors,
 
 	free(chosen);
 	free(weights);
+}
+
+static uint32_t
+tq_router_restart_seed(const TqRouterTrainingConfig *config, uint32_t restart_index)
+{
+	uint32_t	state = config->seed;
+	uint32_t	index = 0;
+
+	for (index = 0; index < restart_index; index++)
+		(void) tq_router_lcg_next(&state);
+
+	return state;
+}
+
+static bool
+tq_router_run_kmeans_restart(const float *sampled_vectors,
+							 uint32_t sample_count,
+							 uint32_t dimension,
+							 uint32_t list_count,
+							 uint32_t restart_seed,
+							 uint32_t max_iterations,
+							 TqRouterModel *model,
+							 uint32_t *completed_iterations,
+							 char *errmsg,
+							 size_t errmsg_len)
+{
+	uint32_t   *assignments = NULL;
+	float	   *sums = NULL;
+	uint32_t   *counts = NULL;
+	uint32_t	iteration = 0;
+	bool		have_changes = true;
+
+	assignments = (uint32_t *) malloc(sizeof(uint32_t) * (size_t) sample_count);
+	sums = (float *) calloc((size_t) list_count * (size_t) dimension, sizeof(float));
+	counts = (uint32_t *) calloc(list_count, sizeof(uint32_t));
+	if (assignments == NULL || sums == NULL || counts == NULL)
+	{
+		free(assignments);
+		free(sums);
+		free(counts);
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant router: out of memory");
+		return false;
+	}
+
+	tq_router_initialize_kmeanspp(sampled_vectors, sample_count, dimension, list_count,
+								  restart_seed, model);
+
+	for (iteration = 0; iteration < max_iterations && have_changes; iteration++)
+	{
+		uint32_t	sample_index = 0;
+
+		memset(sums, 0, sizeof(float) * (size_t) list_count * (size_t) dimension);
+		memset(counts, 0, sizeof(uint32_t) * (size_t) list_count);
+		have_changes = false;
+
+		for (sample_index = 0; sample_index < sample_count; sample_index++)
+		{
+			const float *sample = sampled_vectors + ((size_t) sample_index * (size_t) dimension);
+			uint32_t	best_list = 0;
+			float		best_distance = 0.0f;
+			bool		have_best = false;
+			uint32_t	list_index = 0;
+			float	   *sum_dst = NULL;
+			uint32_t	dimension_index = 0;
+
+			for (list_index = 0; list_index < list_count; list_index++)
+			{
+				const float *centroid = model->centroids + ((size_t) list_index * (size_t) dimension);
+				float		current_distance = tq_router_squared_l2_distance(sample, centroid, dimension);
+
+				if (!have_best || current_distance < best_distance)
+				{
+					have_best = true;
+					best_distance = current_distance;
+					best_list = list_index;
+				}
+			}
+
+			if (iteration == 0 || assignments[sample_index] != best_list)
+			{
+				assignments[sample_index] = best_list;
+				have_changes = true;
+			}
+
+			sum_dst = sums + ((size_t) best_list * (size_t) dimension);
+			for (dimension_index = 0; dimension_index < dimension; dimension_index++)
+				sum_dst[dimension_index] += sample[dimension_index];
+			counts[best_list] += 1;
+		}
+
+		for (sample_index = 0; sample_index < list_count; sample_index++)
+		{
+			float	   *centroid = model->centroids + ((size_t) sample_index * (size_t) dimension);
+			uint32_t	dimension_index = 0;
+
+			if (counts[sample_index] == 0)
+			{
+				tq_router_reseed_empty_centroid(sampled_vectors, assignments, sample_count,
+												dimension, sample_index, list_count,
+												model->centroids);
+				continue;
+			}
+
+			for (dimension_index = 0; dimension_index < dimension; dimension_index++)
+			{
+				centroid[dimension_index] =
+					sums[((size_t) sample_index * (size_t) dimension) + (size_t) dimension_index]
+					/ (float) counts[sample_index];
+			}
+		}
+	}
+
+	free(assignments);
+	free(sums);
+	free(counts);
+
+	*completed_iterations = iteration;
+	return true;
+}
+
+static bool
+tq_router_evaluate_objective(const TqRouterModel *model,
+							 const float *vectors,
+							 size_t vector_count,
+							 uint32_t dimension,
+							 TqRouterObjective *objective,
+							 char *errmsg,
+							 size_t errmsg_len)
+{
+	uint32_t   *counts = NULL;
+	size_t		vector_index = 0;
+	double		total_distortion = 0.0;
+	double		avg_list_size = 0.0;
+	double		max_list_size = 0.0;
+	double		variance = 0.0;
+	uint32_t	list_index = 0;
+
+	if (objective == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant router: objective output must be non-null");
+		return false;
+	}
+
+	counts = (uint32_t *) calloc(model->list_count, sizeof(uint32_t));
+	if (counts == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant router: out of memory");
+		return false;
+	}
+
+	for (vector_index = 0; vector_index < vector_count; vector_index++)
+	{
+		const float *vector = vectors + (vector_index * (size_t) dimension);
+		uint32_t	list_id = 0;
+		uint32_t	dimension_index = 0;
+		double		distortion = 0.0;
+
+		if (!tq_router_assign_best(model, vector, &list_id, NULL, errmsg, errmsg_len))
+		{
+			free(counts);
+			return false;
+		}
+
+		counts[list_id] += 1;
+		for (dimension_index = 0; dimension_index < dimension; dimension_index++)
+		{
+			double		diff =
+				(double) vector[dimension_index] -
+				(double) model->centroids[(list_id * (size_t) dimension) + (size_t) dimension_index];
+
+			distortion += diff * diff;
+		}
+		total_distortion += distortion;
+	}
+
+	avg_list_size = (double) vector_count / (double) model->list_count;
+	for (list_index = 0; list_index < model->list_count; list_index++)
+	{
+		double		current = (double) counts[list_index];
+		double		centered = current - avg_list_size;
+
+		if (current > max_list_size)
+			max_list_size = current;
+		variance += centered * centered;
+	}
+	variance /= (double) model->list_count;
+
+	objective->mean_distortion = vector_count == 0
+		? 0.0f
+		: (float) (total_distortion / (double) vector_count);
+	objective->max_list_over_avg = avg_list_size <= 0.0
+		? 0.0f
+		: (float) (max_list_size / avg_list_size);
+	objective->coeff_var = avg_list_size <= 0.0
+		? 0.0f
+		: (float) (sqrt(variance) / avg_list_size);
+	objective->balance_penalty =
+		(TQ_ROUTER_MAX_LIST_WEIGHT * (objective->max_list_over_avg > 1.0f
+									  ? (objective->max_list_over_avg - 1.0f)
+									  : 0.0f))
+		+ (TQ_ROUTER_COEFF_VAR_WEIGHT * objective->coeff_var);
+	objective->selection_score =
+		objective->mean_distortion * (1.0f + objective->balance_penalty);
+
+	free(counts);
+	return true;
+}
+
+static bool
+tq_router_objective_is_better(const TqRouterObjective *candidate,
+							  const TqRouterObjective *best,
+							  uint32_t candidate_restart,
+							  uint32_t best_restart)
+{
+	const float	epsilon = 1e-6f;
+
+	if (candidate->selection_score + epsilon < best->selection_score)
+		return true;
+	if (candidate->selection_score > best->selection_score + epsilon)
+		return false;
+	if (candidate->balance_penalty + epsilon < best->balance_penalty)
+		return true;
+	if (candidate->balance_penalty > best->balance_penalty + epsilon)
+		return false;
+	if (candidate->mean_distortion + epsilon < best->mean_distortion)
+		return true;
+	if (candidate->mean_distortion > best->mean_distortion + epsilon)
+		return false;
+	return candidate_restart < best_restart;
 }
 
 static void
@@ -374,6 +623,13 @@ tq_router_train_first(const float *vectors,
 	model->metadata.max_iterations = 0;
 	model->metadata.completed_iterations = 0;
 	model->metadata.trained_vector_count = (uint32_t) vector_count;
+	model->metadata.restart_count = 1;
+	model->metadata.selected_restart = 0;
+	model->metadata.mean_distortion = 0.0f;
+	model->metadata.max_list_over_avg = 0.0f;
+	model->metadata.coeff_var = 0.0f;
+	model->metadata.balance_penalty = 0.0f;
+	model->metadata.selection_score = 0.0f;
 
 	for (i = 0; i < list_count; i++)
 	{
@@ -398,11 +654,11 @@ tq_router_train_kmeans(const float *vectors,
 {
 	float	   *sampled_vectors = NULL;
 	uint32_t	sample_count = 0;
-	uint32_t   *assignments = NULL;
-	float	   *sums = NULL;
-	uint32_t   *counts = NULL;
-	uint32_t	iteration = 0;
-	bool		have_changes = true;
+	uint32_t	restart_count = 0;
+	uint32_t	restart_index = 0;
+	uint32_t	best_restart = 0;
+	TqRouterObjective best_objective;
+	bool		have_best = false;
 
 	if (!tq_router_validate_training_inputs(vectors, vector_count, dimension, list_count,
 											config, model, errmsg, errmsg_len))
@@ -418,100 +674,67 @@ tq_router_train_kmeans(const float *vectors,
 		return false;
 	}
 
-	assignments = (uint32_t *) malloc(sizeof(uint32_t) * (size_t) sample_count);
-	sums = (float *) calloc((size_t) list_count * (size_t) dimension, sizeof(float));
-	counts = (uint32_t *) calloc(list_count, sizeof(uint32_t));
-	if (assignments == NULL || sums == NULL || counts == NULL)
+	restart_count = config->restart_count == 0 ? 1 : config->restart_count;
+	memset(&best_objective, 0, sizeof(best_objective));
+
+	for (restart_index = 0; restart_index < restart_count; restart_index++)
 	{
-		free(sampled_vectors);
-		free(assignments);
-		free(sums);
-		free(counts);
-		tq_router_reset(model);
-		tq_set_error(errmsg, errmsg_len,
-					 "invalid turboquant router: out of memory");
-		return false;
-	}
+		TqRouterModel candidate;
+		TqRouterObjective objective;
+		uint32_t	completed_iterations = 0;
+		uint32_t	restart_seed = tq_router_restart_seed(config, restart_index);
 
-	tq_router_initialize_kmeanspp(sampled_vectors, sample_count, dimension, list_count,
-								  config, model);
-
-	for (iteration = 0; iteration < config->max_iterations && have_changes; iteration++)
-	{
-		uint32_t	sample_index = 0;
-
-		memset(sums, 0, sizeof(float) * (size_t) list_count * (size_t) dimension);
-		memset(counts, 0, sizeof(uint32_t) * (size_t) list_count);
-		have_changes = false;
-
-		for (sample_index = 0; sample_index < sample_count; sample_index++)
+		memset(&candidate, 0, sizeof(candidate));
+		memset(&objective, 0, sizeof(objective));
+		if (!tq_router_allocate_model(dimension, list_count, &candidate, errmsg, errmsg_len))
 		{
-			const float *sample = sampled_vectors + ((size_t) sample_index * (size_t) dimension);
-			uint32_t	best_list = 0;
-			float		best_distance = 0.0f;
-			bool		have_best = false;
-			uint32_t	list_index = 0;
-			float	   *sum_dst = NULL;
-			uint32_t	dimension_index = 0;
-
-			for (list_index = 0; list_index < list_count; list_index++)
-			{
-				const float *centroid = model->centroids + ((size_t) list_index * (size_t) dimension);
-				float		current_distance = tq_router_squared_l2_distance(sample, centroid, dimension);
-
-				if (!have_best || current_distance < best_distance)
-				{
-					have_best = true;
-					best_distance = current_distance;
-					best_list = list_index;
-				}
-			}
-
-			if (iteration == 0 || assignments[sample_index] != best_list)
-			{
-				assignments[sample_index] = best_list;
-				have_changes = true;
-			}
-
-			sum_dst = sums + ((size_t) best_list * (size_t) dimension);
-			for (dimension_index = 0; dimension_index < dimension; dimension_index++)
-				sum_dst[dimension_index] += sample[dimension_index];
-			counts[best_list] += 1;
+			free(sampled_vectors);
+			tq_router_reset(model);
+			return false;
 		}
 
-		for (sample_index = 0; sample_index < list_count; sample_index++)
+		if (!tq_router_run_kmeans_restart(sampled_vectors, sample_count, dimension, list_count,
+										  restart_seed, config->max_iterations, &candidate,
+										  &completed_iterations, errmsg, errmsg_len)
+			|| !tq_router_evaluate_objective(&candidate, vectors, vector_count, dimension,
+											 &objective, errmsg, errmsg_len))
 		{
-			float	   *centroid = model->centroids + ((size_t) sample_index * (size_t) dimension);
-			uint32_t	dimension_index = 0;
-
-			if (counts[sample_index] == 0)
-			{
-				tq_router_reseed_empty_centroid(sampled_vectors, assignments, sample_count,
-												dimension, sample_index, list_count,
-												model->centroids);
-				continue;
-			}
-
-			for (dimension_index = 0; dimension_index < dimension; dimension_index++)
-			{
-				centroid[dimension_index] =
-					sums[((size_t) sample_index * (size_t) dimension) + (size_t) dimension_index]
-					/ (float) counts[sample_index];
-			}
+			tq_router_reset(&candidate);
+			free(sampled_vectors);
+			tq_router_reset(model);
+			return false;
 		}
+
+		if (!have_best
+			|| tq_router_objective_is_better(&objective, &best_objective,
+											 restart_index, best_restart))
+		{
+			memcpy(model->centroids,
+				   candidate.centroids,
+				   sizeof(float) * (size_t) list_count * (size_t) dimension);
+			best_objective = objective;
+			best_restart = restart_index;
+			model->metadata.completed_iterations = completed_iterations;
+			have_best = true;
+		}
+
+		tq_router_reset(&candidate);
 	}
 
 	model->metadata.algorithm = TQ_ROUTER_ALGORITHM_KMEANS;
 	model->metadata.seed = config->seed;
 	model->metadata.sample_count = sample_count;
 	model->metadata.max_iterations = config->max_iterations;
-	model->metadata.completed_iterations = iteration;
 	model->metadata.trained_vector_count = (uint32_t) vector_count;
+	model->metadata.restart_count = restart_count;
+	model->metadata.selected_restart = best_restart;
+	model->metadata.mean_distortion = best_objective.mean_distortion;
+	model->metadata.max_list_over_avg = best_objective.max_list_over_avg;
+	model->metadata.coeff_var = best_objective.coeff_var;
+	model->metadata.balance_penalty = best_objective.balance_penalty;
+	model->metadata.selection_score = best_objective.selection_score;
 
 	free(sampled_vectors);
-	free(assignments);
-	free(sums);
-	free(counts);
 	return true;
 }
 

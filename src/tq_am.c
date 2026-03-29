@@ -75,6 +75,7 @@ typedef struct TqScanOpaque
 	uint32_t	query_dimension;
 	TqDistanceKind distance_kind;
 	TqVectorInputKind input_kind;
+	bool		normalized;
 	bool		prepared;
 } TqScanOpaque;
 
@@ -84,6 +85,12 @@ typedef struct TqVacuumSummary
 	double		tuples_removed;
 	BlockNumber reclaimable_pages;
 } TqVacuumSummary;
+
+typedef struct TqBoundedPageCandidate
+{
+	BlockNumber block_number;
+	float		optimistic_distance;
+} TqBoundedPageCandidate;
 
 static void tq_load_option_config(Relation index_relation, TqOptionConfig *config);
 static void tq_reset_scan_opaque(TqScanOpaque *opaque);
@@ -121,6 +128,17 @@ static void tq_write_batch_pages(TqBuildState *state,
 static void tq_update_batch_page_next_block(Relation index_relation,
 											BlockNumber block_number,
 											BlockNumber next_block);
+static bool tq_recompute_batch_page_summary(const TqProdCodecConfig *config,
+											const void *page,
+											size_t page_size,
+											TqBatchPageSummary *summary,
+											char *errmsg,
+											size_t errmsg_len);
+static bool tq_refresh_batch_page_summary(Relation index_relation,
+										  Buffer buffer,
+										  const TqProdCodecConfig *config,
+										  char *errmsg,
+										  size_t errmsg_len);
 static bool tq_load_router_model(Relation index_relation,
 								 const TqMetaPageFields *meta_fields,
 								 TqRouterModel *model,
@@ -152,6 +170,7 @@ static void tq_truncate_reusable_tail_pages(Relation index_relation,
 											 size_t errmsg_len);
 static void tq_append_packed_tuple(Relation index_relation,
 								   const TqMetaPageFields *meta_fields,
+								   const TqProdCodecConfig *prod_config,
 								   uint32_t list_id,
 								   const TqTid *heap_tid,
 								   const uint8_t *packed_code,
@@ -162,11 +181,24 @@ static void tq_summarize_index(Relation index_relation,
 							   void *callback_state,
 							   bool apply_deletes,
 							   TqVacuumSummary *summary);
-static bool tq_scan_batch_chain(Relation index_relation,
-								BlockNumber head_block,
+static bool tq_scan_batch_block(Relation index_relation,
+								BlockNumber block_number,
 								TqScanOpaque *opaque,
 								char *errmsg,
 								size_t errmsg_len);
+static bool tq_collect_bounded_pages_for_chain(Relation index_relation,
+											   BlockNumber head_block,
+											   TqScanOpaque *opaque,
+											   TqBoundedPageCandidate *pages,
+											   size_t max_pages,
+											   size_t *page_count,
+											   char *errmsg,
+											   size_t errmsg_len);
+static bool tq_count_batch_pages_for_chain(Relation index_relation,
+										   BlockNumber head_block,
+										   size_t *page_count,
+										   char *errmsg,
+										   size_t errmsg_len);
 static bool tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque);
 static int64 tq_scan_all_live_tids_to_bitmap(Relation index_relation,
 											 TIDBitmap *tbm,
@@ -257,6 +289,7 @@ tq_load_option_config(Relation index_relation, TqOptionConfig *config)
 	config->lists = 0;
 	config->router_samples = 256;
 	config->router_iterations = 8;
+	config->router_restarts = 3;
 	config->router_seed = 20260327;
 	config->normalized = true;
 	config->transform_name = "hadamard";
@@ -269,6 +302,7 @@ tq_load_option_config(Relation index_relation, TqOptionConfig *config)
 	config->lists = options->lists;
 	config->router_samples = options->router_samples;
 	config->router_iterations = options->router_iterations;
+	config->router_restarts = options->router_restarts == 0 ? 3 : options->router_restarts;
 	config->router_seed = options->router_seed;
 	config->normalized = options->normalized;
 	config->transform_name = GET_STRING_RELOPTION(options, transform_offset);
@@ -457,6 +491,13 @@ tq_buildstate_initialize(TqBuildState *state, uint32_t dimension)
 	state->meta_fields.router_completed_iterations = 0;
 	state->meta_fields.router_trained_vector_count = 0;
 	state->meta_fields.router_algorithm = TQ_ROUTER_ALGORITHM_FIRST_K;
+	state->meta_fields.router_restart_count = (uint32_t) state->option_config.router_restarts;
+	state->meta_fields.router_selected_restart = 0;
+	state->meta_fields.router_mean_distortion = 0.0f;
+	state->meta_fields.router_max_list_over_avg = 0.0f;
+	state->meta_fields.router_coeff_var = 0.0f;
+	state->meta_fields.router_balance_penalty = 0.0f;
+	state->meta_fields.router_selection_score = 0.0f;
 	state->initialized = true;
 }
 
@@ -518,6 +559,150 @@ tq_update_batch_page_next_block(Relation index_relation,
 		elog(ERROR, "%s", error_buf);
 	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 	ReleaseBuffer(buffer);
+}
+
+static float
+tq_vector_l2_distance(const float *left, const float *right, uint32_t dimension)
+{
+	float sum = 0.0f;
+	uint32_t i = 0;
+
+	for (i = 0; i < dimension; i++)
+	{
+		float diff = left[i] - right[i];
+
+		sum += diff * diff;
+	}
+
+	return sqrtf(sum);
+}
+
+static int
+tq_bounded_page_candidate_compare(const void *left, const void *right)
+{
+	const TqBoundedPageCandidate *lhs = (const TqBoundedPageCandidate *) left;
+	const TqBoundedPageCandidate *rhs = (const TqBoundedPageCandidate *) right;
+
+	if (lhs->optimistic_distance < rhs->optimistic_distance)
+		return -1;
+	if (lhs->optimistic_distance > rhs->optimistic_distance)
+		return 1;
+	if (lhs->block_number < rhs->block_number)
+		return -1;
+	if (lhs->block_number > rhs->block_number)
+		return 1;
+	return 0;
+}
+
+static bool
+tq_recompute_batch_page_summary(const TqProdCodecConfig *config,
+								const void *page,
+								size_t page_size,
+								TqBatchPageSummary *summary,
+								char *errmsg,
+								size_t errmsg_len)
+{
+	TqBatchPageHeaderView header;
+	TqBatchPageSummary computed;
+	uint16_t lane = 0;
+	uint8_t *rep_code = NULL;
+	uint8_t *lane_code = NULL;
+	float *rep_vector = NULL;
+	float *lane_vector = NULL;
+	bool ok = false;
+
+	if (config == NULL || page == NULL || summary == NULL)
+	{
+		snprintf(errmsg, errmsg_len,
+				 "invalid turboquant batch summary: codec, page, and summary output must be non-null");
+		return false;
+	}
+
+	memset(&header, 0, sizeof(header));
+	memset(&computed, 0, sizeof(computed));
+	computed.representative_lane = TQ_BATCH_PAGE_NO_REPRESENTATIVE;
+	computed.residual_radius = 0.0f;
+
+	if (!tq_batch_page_read_header(page, page_size, &header, errmsg, errmsg_len))
+		return false;
+
+	if (header.live_count == 0
+		|| !tq_batch_page_next_live_lane(page, page_size, -1, &lane, errmsg, errmsg_len))
+	{
+		*summary = computed;
+		return true;
+	}
+
+	rep_code = (uint8_t *) palloc((Size) header.code_bytes);
+	lane_code = (uint8_t *) palloc((Size) header.code_bytes);
+	rep_vector = (float *) palloc(sizeof(float) * (Size) config->dimension);
+	lane_vector = (float *) palloc(sizeof(float) * (Size) config->dimension);
+
+	ok = tq_batch_page_get_code(page, page_size, lane, rep_code, header.code_bytes,
+								errmsg, errmsg_len)
+		&& tq_prod_decode(config, rep_code, header.code_bytes, rep_vector,
+						  config->dimension, errmsg, errmsg_len);
+	if (!ok)
+		goto done;
+
+	computed.representative_lane = lane;
+	computed.residual_radius = 0.0f;
+
+	do
+	{
+		float distance = 0.0f;
+
+		if (lane == computed.representative_lane)
+			continue;
+
+		ok = tq_batch_page_get_code(page, page_size, lane, lane_code, header.code_bytes,
+									errmsg, errmsg_len)
+			&& tq_prod_decode(config, lane_code, header.code_bytes, lane_vector,
+							  config->dimension, errmsg, errmsg_len);
+		if (!ok)
+			goto done;
+
+		distance = tq_vector_l2_distance(rep_vector, lane_vector, config->dimension);
+		if (distance > computed.residual_radius)
+			computed.residual_radius = distance;
+	}
+	while (tq_batch_page_next_live_lane(page, page_size, (int) lane, &lane, errmsg, errmsg_len));
+
+	*summary = computed;
+	ok = true;
+
+done:
+	if (rep_code != NULL)
+		pfree(rep_code);
+	if (lane_code != NULL)
+		pfree(lane_code);
+	if (rep_vector != NULL)
+		pfree(rep_vector);
+	if (lane_vector != NULL)
+		pfree(lane_vector);
+	return ok;
+}
+
+static bool
+tq_refresh_batch_page_summary(Relation index_relation,
+							  Buffer buffer,
+							  const TqProdCodecConfig *config,
+							  char *errmsg,
+							  size_t errmsg_len)
+{
+	TqBatchPageSummary summary;
+	Page page = BufferGetPage(buffer);
+
+	memset(&summary, 0, sizeof(summary));
+	if (!tq_recompute_batch_page_summary(config,
+										 tq_page_payload(page),
+										 tq_page_payload_size(page),
+										 &summary,
+										 errmsg,
+										 errmsg_len))
+		return false;
+
+	return tq_wal_set_batch_summary(index_relation, buffer, &summary, errmsg, errmsg_len);
 }
 
 static void
@@ -743,7 +928,12 @@ tq_write_batch_pages(TqBuildState *state,
 			if (!tq_wal_append_batch_code(state->index_relation, current_buffer,
 										 tid, state->packed_code,
 										 state->prod_layout.total_bytes,
-										 &lanes_used, error_buf, sizeof(error_buf)))
+										 &lanes_used, error_buf, sizeof(error_buf))
+				|| !tq_refresh_batch_page_summary(state->index_relation,
+												 current_buffer,
+												 &state->prod_config,
+												 error_buf,
+												 sizeof(error_buf)))
 				elog(ERROR, "%s", error_buf);
 			LockBuffer(current_buffer, BUFFER_LOCK_UNLOCK);
 
@@ -785,6 +975,7 @@ tq_buildstate_flush(TqBuildState *state)
 		router_config.seed = (uint32_t) state->option_config.router_seed;
 		router_config.sample_count = (uint32_t) state->option_config.router_samples;
 		router_config.max_iterations = (uint32_t) state->option_config.router_iterations;
+		router_config.restart_count = (uint32_t) state->option_config.router_restarts;
 
 		if (!tq_router_train_kmeans(state->collected_vectors, state->vector_count,
 									state->dimension, list_count, &router_config,
@@ -797,6 +988,13 @@ tq_buildstate_flush(TqBuildState *state)
 		state->meta_fields.router_completed_iterations = state->router_model.metadata.completed_iterations;
 		state->meta_fields.router_trained_vector_count = state->router_model.metadata.trained_vector_count;
 		state->meta_fields.router_algorithm = state->router_model.metadata.algorithm;
+		state->meta_fields.router_restart_count = state->router_model.metadata.restart_count;
+		state->meta_fields.router_selected_restart = state->router_model.metadata.selected_restart;
+		state->meta_fields.router_mean_distortion = state->router_model.metadata.mean_distortion;
+		state->meta_fields.router_max_list_over_avg = state->router_model.metadata.max_list_over_avg;
+		state->meta_fields.router_coeff_var = state->router_model.metadata.coeff_var;
+		state->meta_fields.router_balance_penalty = state->router_model.metadata.balance_penalty;
+		state->meta_fields.router_selection_score = state->router_model.metadata.selection_score;
 
 		for (vector_index = 0; vector_index < state->vector_count; vector_index++)
 		{
@@ -910,6 +1108,13 @@ tq_ambuildempty(Relation index_relation)
 	meta_fields.router_completed_iterations = 0;
 	meta_fields.router_trained_vector_count = 0;
 	meta_fields.router_algorithm = TQ_ROUTER_ALGORITHM_FIRST_K;
+	meta_fields.router_restart_count = 3;
+	meta_fields.router_selected_restart = 0;
+	meta_fields.router_mean_distortion = 0.0f;
+	meta_fields.router_max_list_over_avg = 0.0f;
+	meta_fields.router_coeff_var = 0.0f;
+	meta_fields.router_balance_penalty = 0.0f;
+	meta_fields.router_selection_score = 0.0f;
 	tq_write_meta_page(index_relation, &meta_fields);
 }
 
@@ -1021,6 +1226,13 @@ tq_aminsert(Relation index_relation, Datum *values, bool *isnull,
 		meta_fields.router_completed_iterations = 0;
 		meta_fields.router_trained_vector_count = 0;
 		meta_fields.router_algorithm = TQ_ROUTER_ALGORITHM_FIRST_K;
+		meta_fields.router_restart_count = (uint32_t) option_config.router_restarts;
+		meta_fields.router_selected_restart = 0;
+		meta_fields.router_mean_distortion = 0.0f;
+		meta_fields.router_max_list_over_avg = 0.0f;
+		meta_fields.router_coeff_var = 0.0f;
+		meta_fields.router_balance_penalty = 0.0f;
+		meta_fields.router_selection_score = 0.0f;
 		needs_meta_write = true;
 	}
 	else
@@ -1082,6 +1294,7 @@ tq_aminsert(Relation index_relation, Datum *values, bool *isnull,
 			router_config.seed = meta_fields.router_seed;
 			router_config.sample_count = meta_fields.router_sample_count;
 			router_config.max_iterations = meta_fields.router_max_iterations;
+			router_config.restart_count = meta_fields.router_restart_count;
 
 			if (!tq_router_train_kmeans(transformed_values, 1, meta_fields.transform_output_dimension,
 										meta_fields.list_count, &router_config,
@@ -1093,6 +1306,13 @@ tq_aminsert(Relation index_relation, Datum *values, bool *isnull,
 			meta_fields.router_completed_iterations = router_model.metadata.completed_iterations;
 			meta_fields.router_trained_vector_count = router_model.metadata.trained_vector_count;
 			meta_fields.router_algorithm = router_model.metadata.algorithm;
+			meta_fields.router_restart_count = router_model.metadata.restart_count;
+			meta_fields.router_selected_restart = router_model.metadata.selected_restart;
+			meta_fields.router_mean_distortion = router_model.metadata.mean_distortion;
+			meta_fields.router_max_list_over_avg = router_model.metadata.max_list_over_avg;
+			meta_fields.router_coeff_var = router_model.metadata.coeff_var;
+			meta_fields.router_balance_penalty = router_model.metadata.balance_penalty;
+			meta_fields.router_selection_score = router_model.metadata.selection_score;
 			tq_write_centroid_pages(index_relation, &router_model, &meta_fields.centroid_root_block);
 			tq_write_directory_pages(index_relation, entries, meta_fields.list_count,
 									 &meta_fields.directory_root_block);
@@ -1118,7 +1338,7 @@ tq_aminsert(Relation index_relation, Datum *values, bool *isnull,
 	if (needs_meta_write)
 		tq_write_meta_page_buffer(index_relation, meta_buffer, &meta_fields);
 
-	tq_append_packed_tuple(index_relation, &meta_fields, list_id,
+	tq_append_packed_tuple(index_relation, &meta_fields, &prod_config, list_id,
 						   &page_tid, packed_code, prod_layout.total_bytes);
 	LockBuffer(meta_buffer, BUFFER_LOCK_UNLOCK);
 	ReleaseBuffer(meta_buffer);
@@ -1225,6 +1445,8 @@ tq_amcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 										  config.lists,
 										  tq_guc_probes,
 										  tq_guc_oversample_factor,
+										  tq_guc_max_visited_codes,
+										  tq_guc_max_visited_pages,
 										  cpu_index_tuple_cost,
 										  cpu_operator_cost,
 										  random_page_cost,
@@ -1385,8 +1607,8 @@ tq_load_router_model(Relation index_relation,
 			loaded += 1;
 		}
 
-		block_number = header.next_block;
-		ReleaseBuffer(buffer);
+			block_number = header.next_block;
+			ReleaseBuffer(buffer);
 	}
 
 	if (loaded != meta_fields->list_count)
@@ -1669,6 +1891,7 @@ tq_truncate_reusable_tail_pages(Relation index_relation,
 static void
 tq_append_packed_tuple(Relation index_relation,
 					   const TqMetaPageFields *meta_fields,
+					   const TqProdCodecConfig *prod_config,
 					   uint32_t list_id,
 					   const TqTid *heap_tid,
 					   const uint8_t *packed_code,
@@ -1790,7 +2013,12 @@ tq_append_packed_tuple(Relation index_relation,
 	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 	if (!tq_wal_append_batch_code(index_relation, buffer, heap_tid,
 								  packed_code, packed_code_len, &lane_index,
-								  error_buf, sizeof(error_buf)))
+								  error_buf, sizeof(error_buf))
+		|| !tq_refresh_batch_page_summary(index_relation,
+										  buffer,
+										  prod_config,
+										  error_buf,
+										  sizeof(error_buf)))
 	{
 		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 		ReleaseBuffer(buffer);
@@ -2004,8 +2232,17 @@ tq_summarize_index(Relation index_relation,
 
 				if (header.live_count != header.occupied_count)
 				{
+					TqProdCodecConfig prod_config;
+
+					memset(&prod_config, 0, sizeof(prod_config));
+					prod_config.dimension = meta_fields->transform_output_dimension;
+					prod_config.bits = (uint8_t) meta_fields->bits;
+
 					if (!tq_wal_compact_batch_page(index_relation, buffer,
 												   error_buf, sizeof(error_buf))
+						|| !tq_refresh_batch_page_summary(index_relation, buffer,
+														  &prod_config,
+														  error_buf, sizeof(error_buf))
 						|| !tq_batch_page_read_header(tq_page_payload(page), tq_page_payload_size(page),
 													  &header, error_buf, sizeof(error_buf))
 						|| !tq_batch_page_should_reclaim(tq_page_payload(page), tq_page_payload_size(page),
@@ -2072,11 +2309,46 @@ tq_summarize_index(Relation index_relation,
 }
 
 static bool
-tq_scan_batch_chain(Relation index_relation,
-					BlockNumber head_block,
+tq_scan_batch_block(Relation index_relation,
+					BlockNumber block_number,
 					TqScanOpaque *opaque,
 					char *errmsg,
 					size_t errmsg_len)
+{
+	Buffer buffer;
+	Page page;
+
+	buffer = ReadBufferExtended(index_relation, MAIN_FORKNUM, block_number, RBM_NORMAL, NULL);
+	page = BufferGetPage(buffer);
+	if (!tq_batch_page_scan_prod(tq_page_payload(page),
+								 tq_page_payload_size(page),
+								 &opaque->prod_config,
+								 opaque->normalized,
+								 opaque->distance_kind,
+								 &opaque->lut,
+								 opaque->query_values,
+								 opaque->query_dimension,
+								 &opaque->candidates,
+								 errmsg,
+								 errmsg_len))
+	{
+		ReleaseBuffer(buffer);
+		return false;
+	}
+
+	ReleaseBuffer(buffer);
+	return true;
+}
+
+static bool
+tq_collect_bounded_pages_for_chain(Relation index_relation,
+								   BlockNumber head_block,
+								   TqScanOpaque *opaque,
+								   TqBoundedPageCandidate *pages,
+								   size_t max_pages,
+								   size_t *page_count,
+								   char *errmsg,
+								   size_t errmsg_len)
 {
 	BlockNumber block_number = head_block;
 
@@ -2090,22 +2362,82 @@ tq_scan_batch_chain(Relation index_relation,
 		page = BufferGetPage(buffer);
 		memset(&header, 0, sizeof(header));
 		if (!tq_batch_page_read_header(tq_page_payload(page), tq_page_payload_size(page),
-									   &header, errmsg, errmsg_len)
-			|| !tq_batch_page_scan_prod(tq_page_payload(page),
-										tq_page_payload_size(page),
-										&opaque->prod_config,
-										opaque->distance_kind,
-										&opaque->lut,
-										opaque->query_values,
-										opaque->query_dimension,
-										&opaque->candidates,
-										errmsg,
-										errmsg_len))
+									   &header, errmsg, errmsg_len))
 		{
 			ReleaseBuffer(buffer);
 			return false;
 		}
 
+		if (header.live_count > 0)
+		{
+			if (*page_count >= max_pages)
+			{
+				snprintf(errmsg, errmsg_len,
+						 "invalid turboquant scan: bounded page array exceeded capacity");
+				ReleaseBuffer(buffer);
+				return false;
+			}
+
+			pages[*page_count].block_number = block_number;
+			if (!tq_scan_page_optimistic_distance_bound(&opaque->prod_config,
+													   &opaque->lut,
+													   tq_page_payload(page),
+													   tq_page_payload_size(page),
+													   opaque->normalized,
+													   opaque->distance_kind,
+													   opaque->query_values,
+													   opaque->query_dimension,
+													   &pages[*page_count].optimistic_distance,
+													   errmsg,
+													   errmsg_len))
+			{
+				ReleaseBuffer(buffer);
+				return false;
+			}
+			*page_count += 1;
+		}
+
+		block_number = header.next_block;
+		ReleaseBuffer(buffer);
+	}
+
+	return true;
+}
+
+static bool
+tq_count_batch_pages_for_chain(Relation index_relation,
+							   BlockNumber head_block,
+							   size_t *page_count,
+							   char *errmsg,
+							   size_t errmsg_len)
+{
+	BlockNumber block_number = head_block;
+
+	if (page_count == NULL)
+	{
+		snprintf(errmsg, errmsg_len,
+				 "invalid turboquant scan: page count output must be non-null");
+		return false;
+	}
+
+	*page_count = 0;
+	while (block_number != TQ_INVALID_BLOCK_NUMBER)
+	{
+		Buffer buffer;
+		Page page;
+		TqBatchPageHeaderView header;
+
+		buffer = ReadBufferExtended(index_relation, MAIN_FORKNUM, block_number, RBM_NORMAL, NULL);
+		page = BufferGetPage(buffer);
+		memset(&header, 0, sizeof(header));
+		if (!tq_batch_page_read_header(tq_page_payload(page), tq_page_payload_size(page),
+									   &header, errmsg, errmsg_len))
+		{
+			ReleaseBuffer(buffer);
+			return false;
+		}
+
+		*page_count += 1;
 		block_number = header.next_block;
 		ReleaseBuffer(buffer);
 	}
@@ -2139,6 +2471,9 @@ tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque)
 						   error_buf, sizeof(error_buf)))
 		elog(ERROR, "%s", error_buf);
 	ReleaseBuffer(buffer);
+
+	tq_scan_stats_begin(meta_fields.list_count == 0 ? TQ_SCAN_MODE_FLAT : TQ_SCAN_MODE_IVF,
+						(size_t) tq_guc_probes);
 
 	if (meta_fields.codec != TQ_CODEC_PROD
 		|| meta_fields.dimension == 0)
@@ -2194,6 +2529,7 @@ tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque)
 	memcpy(opaque->query_values, transformed_query,
 		   sizeof(float) * (size_t) meta_fields.transform_output_dimension);
 	opaque->query_dimension = meta_fields.transform_output_dimension;
+	opaque->normalized = meta_fields.normalized;
 
 	if (!tq_prod_lut_build(&opaque->prod_config, transformed_query, &opaque->lut,
 						   error_buf, sizeof(error_buf)))
@@ -2216,10 +2552,24 @@ tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque)
 
 		for (block_number = 1; block_number < nblocks; block_number++)
 		{
+			TqBatchPageHeaderView header;
+
 			buffer = ReadBufferExtended(scan->indexRelation, MAIN_FORKNUM, block_number, RBM_NORMAL, NULL);
+			memset(&header, 0, sizeof(header));
+			if (!tq_batch_page_read_header(tq_page_payload(BufferGetPage(buffer)),
+										   tq_page_payload_size(BufferGetPage(buffer)),
+										   &header,
+										   error_buf,
+										   sizeof(error_buf)))
+			{
+				ReleaseBuffer(buffer);
+				elog(ERROR, "%s", error_buf);
+			}
+			tq_scan_stats_add_selected_live((size_t) header.live_count);
 			if (!tq_batch_page_scan_prod(tq_page_payload(BufferGetPage(buffer)),
 										tq_page_payload_size(BufferGetPage(buffer)),
 										&opaque->prod_config,
+										opaque->normalized,
 										opaque->distance_kind,
 										&opaque->lut,
 										opaque->query_values,
@@ -2230,13 +2580,22 @@ tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque)
 				elog(ERROR, "%s", error_buf);
 			ReleaseBuffer(buffer);
 		}
+		tq_scan_stats_set_candidate_heap_metrics(opaque->candidates.capacity,
+												 opaque->candidates.count);
 	}
 	else
 	{
 		TqRouterModel router_model;
+		TqProbeBudgetResult probe_budget;
 		uint32_t   *selected_lists;
+		uint32_t   *ranked_live_counts = NULL;
+		uint32_t   *ranked_page_counts = NULL;
+		TqBoundedPageCandidate *page_candidates = NULL;
 		uint32_t	selected_count = 0;
+		uint32_t	effective_count = 0;
 		uint32_t	index = 0;
+		size_t		page_count = 0;
+		size_t		max_pages = 0;
 
 		memset(&router_model, 0, sizeof(router_model));
 		if (!tq_load_router_model(scan->indexRelation, &meta_fields, &router_model,
@@ -2255,22 +2614,63 @@ tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque)
 			elog(ERROR, "%s", error_buf);
 		}
 
+		ranked_live_counts = (uint32_t *) palloc0(sizeof(uint32_t) * (size_t) selected_count);
+		ranked_page_counts = (uint32_t *) palloc0(sizeof(uint32_t) * (size_t) selected_count);
+
 		for (index = 0; index < selected_count; index++)
 		{
 			TqListDirEntry entry;
+			size_t		list_page_count = 0;
 
 			memset(&entry, 0, sizeof(entry));
 			if (!tq_read_list_directory_entry(scan->indexRelation,
 											  meta_fields.directory_root_block,
 											  selected_lists[index],
 											  &entry,
+											  error_buf, sizeof(error_buf))
+				|| !tq_count_batch_pages_for_chain(scan->indexRelation,
+												   entry.head_block,
+												   &list_page_count,
 											  error_buf, sizeof(error_buf)))
 			{
 				tq_router_reset(&router_model);
+				pfree(ranked_live_counts);
+				pfree(ranked_page_counts);
 				pfree(selected_lists);
 				elog(ERROR, "%s", error_buf);
 			}
-			total_live += entry.live_count;
+
+			ranked_live_counts[index] = entry.live_count;
+			ranked_page_counts[index] = (uint32_t) list_page_count;
+		}
+
+		memset(&probe_budget, 0, sizeof(probe_budget));
+		if (!tq_choose_probe_budget(ranked_live_counts,
+									ranked_page_counts,
+									(size_t) selected_count,
+									tq_guc_probes,
+									tq_guc_max_visited_codes,
+									tq_guc_max_visited_pages,
+									&probe_budget,
+									error_buf,
+									sizeof(error_buf)))
+		{
+			tq_router_reset(&router_model);
+			pfree(ranked_live_counts);
+			pfree(ranked_page_counts);
+			pfree(selected_lists);
+			elog(ERROR, "%s", error_buf);
+		}
+		effective_count = (uint32_t) probe_budget.effective_probe_count;
+		tq_scan_stats_set_probe_budget(probe_budget.nominal_probe_count,
+									   probe_budget.effective_probe_count,
+									   probe_budget.max_visited_codes,
+									   probe_budget.max_visited_pages);
+
+		for (index = 0; index < effective_count; index++)
+		{
+			total_live += ranked_live_counts[index];
+			tq_scan_stats_record_selected_list((size_t) ranked_live_counts[index]);
 		}
 
 		if (total_live > 0
@@ -2282,7 +2682,10 @@ tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque)
 					(errcode(ERRCODE_OUT_OF_MEMORY),
 					 errmsg("turboquant could not allocate scan candidate heap")));
 
-		for (index = 0; index < selected_count; index++)
+		max_pages = (size_t) Max((BlockNumber) 1, RelationGetNumberOfBlocks(scan->indexRelation));
+		page_candidates = (TqBoundedPageCandidate *) palloc0(sizeof(TqBoundedPageCandidate) * max_pages);
+
+		for (index = 0; index < effective_count; index++)
 		{
 			TqListDirEntry entry;
 
@@ -2292,19 +2695,74 @@ tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque)
 											  selected_lists[index],
 											  &entry,
 											  error_buf, sizeof(error_buf))
-				|| !tq_scan_batch_chain(scan->indexRelation,
-										entry.head_block,
-										opaque,
-										error_buf,
-										sizeof(error_buf)))
+				|| !tq_collect_bounded_pages_for_chain(scan->indexRelation,
+													   entry.head_block,
+													   opaque,
+													   page_candidates,
+													   max_pages,
+													   &page_count,
+													   error_buf,
+													   sizeof(error_buf)))
 			{
 				tq_router_reset(&router_model);
+				pfree(ranked_live_counts);
+				pfree(ranked_page_counts);
+				pfree(page_candidates);
 				pfree(selected_lists);
 				elog(ERROR, "%s", error_buf);
 			}
 		}
 
+		qsort(page_candidates, page_count, sizeof(page_candidates[0]),
+			  tq_bounded_page_candidate_compare);
+
+		for (index = 0; index < page_count; index++)
+		{
+			bool should_prune = false;
+
+			if (!tq_scan_should_prune_page(&opaque->candidates,
+										   page_candidates[index].optimistic_distance,
+										   &should_prune,
+										   error_buf,
+										   sizeof(error_buf)))
+			{
+				tq_router_reset(&router_model);
+				pfree(ranked_live_counts);
+				pfree(ranked_page_counts);
+				pfree(page_candidates);
+				pfree(selected_lists);
+				elog(ERROR, "%s", error_buf);
+			}
+
+			if (should_prune)
+			{
+				tq_scan_stats_add_page_prunes(page_count - (size_t) index);
+				tq_scan_stats_add_early_stops(1);
+				break;
+			}
+
+			if (!tq_scan_batch_block(scan->indexRelation,
+									 page_candidates[index].block_number,
+									 opaque,
+									 error_buf,
+									 sizeof(error_buf)))
+			{
+				tq_router_reset(&router_model);
+				pfree(ranked_live_counts);
+				pfree(ranked_page_counts);
+				pfree(page_candidates);
+				pfree(selected_lists);
+				elog(ERROR, "%s", error_buf);
+			}
+		}
+
+		tq_scan_stats_set_candidate_heap_metrics(opaque->candidates.capacity,
+												 opaque->candidates.count);
+
 		tq_router_reset(&router_model);
+		pfree(ranked_live_counts);
+		pfree(ranked_page_counts);
+		pfree(page_candidates);
 		pfree(selected_lists);
 	}
 
@@ -2350,6 +2808,9 @@ tq_scan_all_live_tids_to_bitmap(Relation index_relation,
 				return -1;
 			}
 
+			tq_scan_stats_record_page_visit();
+			tq_scan_stats_add_selected_live((size_t) header.live_count);
+
 			if (header.live_count > 0)
 			{
 				uint16_t	lane = 0;
@@ -2373,6 +2834,7 @@ tq_scan_all_live_tids_to_bitmap(Relation index_relation,
 						ItemPointerSet(&itemptr, tid.block_number, tid.offset_number);
 						tbm_add_tuples(tbm, &itemptr, 1, true);
 						match_count++;
+						tq_scan_stats_record_code_visit(false);
 					}
 					while (tq_batch_page_next_live_lane(tq_page_payload(page), tq_page_payload_size(page),
 														(int) lane, &lane, errmsg, errmsg_len));
@@ -2447,6 +2909,8 @@ tq_amgetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 
 	memset(&meta_fields, 0, sizeof(meta_fields));
 	memset(error_buf, 0, sizeof(error_buf));
+	tq_scan_stats_begin(TQ_SCAN_MODE_BITMAP, 0);
+	tq_scan_stats_set_score_mode(TQ_SCAN_SCORE_MODE_BITMAP_FILTER);
 	if (!tq_read_meta_page(scan->indexRelation, &meta_fields, error_buf, sizeof(error_buf)))
 		elog(ERROR, "%s", error_buf);
 
@@ -2480,6 +2944,7 @@ tq_amgetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 												  error_buf, sizeof(error_buf));
 	if (match_count < 0)
 		elog(ERROR, "%s", error_buf);
+	tq_scan_stats_set_candidate_heap_metrics(0, 0);
 	return match_count;
 }
 

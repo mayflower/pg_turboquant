@@ -41,6 +41,7 @@ CREATE INDEX tq_query_helper_docs_idx
 	);
 
 SELECT * FROM tq_recommended_query_knobs(24, 10);
+SELECT * FROM tq_resolve_query_knobs(24, 10, 6, 4);
 
 SELECT *
 FROM tq_approx_candidates(

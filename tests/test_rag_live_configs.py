@@ -48,6 +48,18 @@ class RagLiveConfigContractTest(unittest.TestCase):
         self.assertEqual(config.schema["passages_table"], "rag_passages")
         self.assertEqual(config.backends[0]["kind"], "pg_turboquant")
         self.assertEqual(config.backends[0]["options"]["lists"], 64)
+        self.assertEqual(config.backends[0]["options"]["router_restarts"], 3)
+        self.assertEqual(config.backends[0]["ann"]["probes"], 8)
+        self.assertEqual(config.backends[0]["ann"]["oversampling"], 4)
+        self.assertEqual(config.backends[0]["ann"]["max_visited_codes"], 4096)
+        self.assertEqual(config.backends[0]["ann"]["max_visited_pages"], 0)
+        self.assertEqual(config.regression_gate["dataset_id"], "kilt_hotpotqa")
+        self.assertEqual(config.regression_gate["method_id"], "pg_turboquant_approx")
+        self.assertEqual(config.regression_gate["recall_at_10_floor"], 0.90)
+        self.assertEqual(config.regression_gate["max_visited_code_fraction"], 0.85)
+        self.assertEqual(config.regression_gate["max_visited_page_fraction"], 0.60)
+        self.assertEqual(config.regression_gate["expected_score_mode"], "code_domain")
+        self.assertEqual(config.regression_gate["max_effective_probe_count"], 8)
         self.assertEqual(len(config.backends), 3)
 
 

@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from .operational_metrics import QueryOperationalMetrics, summarize_query_operational_metrics
+
 
 @dataclass(frozen=True)
 class QueryEvaluation:
@@ -104,6 +106,7 @@ def export_retrieval_run(
     output_dir: str | Path,
     run_metadata: dict[str, object],
     metrics: dict[str, float],
+    operational_metrics: Sequence[QueryOperationalMetrics] | None = None,
 ) -> dict[str, str]:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -115,8 +118,14 @@ def export_retrieval_run(
     csv_name = "retrieval-results.csv"
     markdown_name = "retrieval-results.md"
 
+    payload = {
+        "run_metadata": run_metadata,
+        "metrics": metrics,
+        "operational_summary": summarize_query_operational_metrics(list(operational_metrics or [])),
+    }
+
     (output_dir / json_name).write_text(
-        json.dumps({"run_metadata": run_metadata, "metrics": metrics}, indent=2, sort_keys=True),
+        json.dumps(payload, indent=2, sort_keys=True),
         encoding="utf-8",
     )
 
@@ -138,6 +147,44 @@ def export_retrieval_run(
     ]
     for key, value in ordered_metric_items(metrics):
         markdown_lines.append(f"| {key} | {value:.6f} |")
+
+    operational_summary = payload["operational_summary"]
+    if operational_summary:
+        markdown_lines.extend(
+            [
+                "",
+                "## Operational Summary",
+                "",
+            ]
+        )
+        latency_summary = operational_summary.get("latency_ms", {})
+        if latency_summary:
+            markdown_lines.extend(
+                [
+                    "| Metric | Avg | P50 | P95 | P99 |",
+                    "|---|---:|---:|---:|---:|",
+                ]
+            )
+            for stage, distribution in latency_summary.items():
+                markdown_lines.append(
+                    f"| {stage}_latency_ms | {distribution['avg']:.6f} | {distribution['p50']:.6f} | "
+                    f"{distribution['p95']:.6f} | {distribution['p99']:.6f} |"
+                )
+
+        scan_stats = operational_summary.get("scan_stats", {})
+        if scan_stats:
+            markdown_lines.extend(
+                [
+                    "",
+                    "| Metric | Value |",
+                    "|---|---:|",
+                ]
+            )
+            for key, summary in scan_stats.items():
+                if "uniform" in summary:
+                    markdown_lines.append(f"| scan_{key} | {summary['uniform'] or ''} |")
+                else:
+                    markdown_lines.append(f"| avg_{key} | {summary['avg']:.6f} |")
     (output_dir / markdown_name).write_text("\n".join(markdown_lines) + "\n", encoding="utf-8")
 
     return {"json": json_name, "csv": csv_name, "markdown": markdown_name}

@@ -18,15 +18,31 @@
     "documents_table": "rag_documents",
     "passages_table": "rag_passages"
   },
+  "regression_gate": {
+    "dataset_id": "kilt_hotpotqa",
+    "method_id": "pg_turboquant_approx",
+    "recall_at_10_floor": 0.9,
+    "max_visited_code_fraction": 0.85,
+    "max_visited_page_fraction": 0.6,
+    "expected_score_mode": "code_domain",
+    "max_effective_probe_count": 8
+  },
   "backends": [
     {
       "kind": "pg_turboquant",
       "index_name": "rag_passages_tq_idx",
       "metric": "cosine",
       "mode": "approx",
+      "ann": {
+        "probes": 8,
+        "oversampling": 4,
+        "max_visited_codes": 4096,
+        "max_visited_pages": 0
+      },
       "options": {
         "lists": 64,
-        "bits": 4
+        "bits": 4,
+        "router_restarts": 3
       }
     },
     {

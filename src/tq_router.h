@@ -7,11 +7,15 @@
 
 #include "src/tq_options.h"
 
+#define TQ_ROUTER_MAX_LIST_WEIGHT 0.25f
+#define TQ_ROUTER_COEFF_VAR_WEIGHT 0.15f
+
 typedef struct TqRouterTrainingConfig
 {
 	uint32_t	seed;
 	uint32_t	sample_count;
 	uint32_t	max_iterations;
+	uint32_t	restart_count;
 } TqRouterTrainingConfig;
 
 typedef struct TqRouterTrainingMetadata
@@ -22,6 +26,13 @@ typedef struct TqRouterTrainingMetadata
 	uint32_t	max_iterations;
 	uint32_t	completed_iterations;
 	uint32_t	trained_vector_count;
+	uint32_t	restart_count;
+	uint32_t	selected_restart;
+	float		mean_distortion;
+	float		max_list_over_avg;
+	float		coeff_var;
+	float		balance_penalty;
+	float		selection_score;
 } TqRouterTrainingMetadata;
 
 typedef struct TqRouterModel

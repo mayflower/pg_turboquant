@@ -9,6 +9,7 @@ from benchmarks.rag.retrieval_eval import (
     compute_retrieval_metrics,
     export_retrieval_run,
 )
+from benchmarks.rag.operational_metrics import QueryOperationalMetrics
 
 
 class RagRetrievalEvalContractTest(unittest.TestCase):
@@ -68,11 +69,34 @@ class RagRetrievalEvalContractTest(unittest.TestCase):
                     "backend": "pg_turboquant",
                 },
                 metrics=metrics,
+                operational_metrics=[
+                    QueryOperationalMetrics(
+                        retrieval_latency_ms=12.0,
+                        scan_stats={
+                            "mode": "ivf",
+                            "score_mode": "code_domain",
+                            "selected_list_count": 3,
+                            "selected_live_count": 24,
+                            "visited_page_count": 6,
+                            "visited_code_count": 12,
+                            "effective_probe_count": 2,
+                            "page_prune_count": 4,
+                        },
+                    )
+                ],
             )
 
             json_payload = json.loads((output_dir / artifacts["json"]).read_text(encoding="utf-8"))
             self.assertEqual(json_payload["run_metadata"]["result_kind"], "retrieval_only")
             self.assertEqual(json_payload["metrics"]["recall@2"], 1.0)
+            self.assertEqual(
+                json_payload["operational_summary"]["scan_stats"]["score_mode"]["uniform"],
+                "code_domain",
+            )
+            self.assertEqual(
+                json_payload["operational_summary"]["scan_stats"]["selected_list_count"]["avg"],
+                3.0,
+            )
 
             with (output_dir / artifacts["csv"]).open("r", encoding="utf-8", newline="") as handle:
                 rows = list(csv.DictReader(handle))
@@ -82,6 +106,9 @@ class RagRetrievalEvalContractTest(unittest.TestCase):
             markdown = (output_dir / artifacts["markdown"]).read_text(encoding="utf-8")
             self.assertIn("| Metric | Value |", markdown)
             self.assertIn("retrieval_only", markdown)
+            self.assertIn("Operational Summary", markdown)
+            self.assertIn("scan_score_mode", markdown)
+            self.assertIn("avg_selected_list_count", markdown)
 
 
 if __name__ == "__main__":

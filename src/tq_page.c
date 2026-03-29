@@ -10,10 +10,10 @@
 #include <stdio.h>
 #include <string.h>
 
-#define TQ_META_PAGE_HEADER_BYTES 80
+#define TQ_META_PAGE_HEADER_BYTES 108
 #define TQ_LIST_DIR_PAGE_HEADER_BYTES 16
 #define TQ_LIST_DIR_ENTRY_BYTES 24
-#define TQ_BATCH_PAGE_HEADER_BYTES 36
+#define TQ_BATCH_PAGE_HEADER_BYTES 44
 #define TQ_CENTROID_PAGE_HEADER_BYTES 20
 #define TQ_TID_STORAGE_BYTES 6
 
@@ -43,6 +43,13 @@
 #define TQ_META_ROUTER_COMPLETED_ITERATIONS_OFFSET 68
 #define TQ_META_ROUTER_TRAINED_VECTOR_COUNT_OFFSET 72
 #define TQ_META_ROUTER_ALGORITHM_OFFSET 76
+#define TQ_META_ROUTER_RESTART_COUNT_OFFSET 80
+#define TQ_META_ROUTER_SELECTED_RESTART_OFFSET 84
+#define TQ_META_ROUTER_MEAN_DISTORTION_OFFSET 88
+#define TQ_META_ROUTER_MAX_LIST_OVER_AVG_OFFSET 92
+#define TQ_META_ROUTER_COEFF_VAR_OFFSET 96
+#define TQ_META_ROUTER_BALANCE_PENALTY_OFFSET 100
+#define TQ_META_ROUTER_SELECTION_SCORE_OFFSET 104
 
 #define TQ_LIST_DIR_ENTRY_CAPACITY_OFFSET 8
 #define TQ_LIST_DIR_ENTRY_COUNT_OFFSET 10
@@ -51,7 +58,7 @@
 #define TQ_BATCH_LANE_COUNT_OFFSET 8
 #define TQ_BATCH_OCCUPIED_COUNT_OFFSET 10
 #define TQ_BATCH_LIVE_COUNT_OFFSET 12
-#define TQ_BATCH_FLAGS_OFFSET 14
+#define TQ_BATCH_REPRESENTATIVE_LANE_OFFSET 14
 #define TQ_BATCH_LIST_ID_OFFSET 16
 #define TQ_BATCH_NEXT_BLOCK_OFFSET 20
 #define TQ_BATCH_CODE_BYTES_OFFSET 24
@@ -59,6 +66,8 @@
 #define TQ_BATCH_TID_OFFSET_OFFSET 30
 #define TQ_BATCH_CODE_OFFSET_OFFSET 32
 #define TQ_BATCH_TOTAL_BYTES_OFFSET 34
+#define TQ_BATCH_RESIDUAL_RADIUS_OFFSET 36
+#define TQ_BATCH_FLAGS_OFFSET 40
 
 #define TQ_CENTROID_DIMENSION_OFFSET 8
 #define TQ_CENTROID_CAPACITY_OFFSET 12
@@ -124,6 +133,25 @@ tq_read_u64(const uint8_t *src, size_t offset)
 	for (i = 0; i < sizeof(uint64_t); i++)
 		value |= ((uint64_t) src[offset + i]) << (i * 8);
 
+	return value;
+}
+
+static void
+tq_write_float32(uint8_t *dst, size_t offset, float value)
+{
+	uint32_t bits = 0;
+
+	memcpy(&bits, &value, sizeof(bits));
+	tq_write_u32(dst, offset, bits);
+}
+
+static float
+tq_read_float32(const uint8_t *src, size_t offset)
+{
+	uint32_t bits = tq_read_u32(src, offset);
+	float value = 0.0f;
+
+	memcpy(&value, &bits, sizeof(value));
 	return value;
 }
 
@@ -299,6 +327,14 @@ tq_batch_validate_header(const uint8_t *page,
 	{
 		tq_set_error(errmsg, errmsg_len,
 					 "invalid turboquant batch page: live lanes exceed occupied lanes");
+		return false;
+	}
+
+	if (tq_read_u16(page, TQ_BATCH_REPRESENTATIVE_LANE_OFFSET) != TQ_BATCH_PAGE_NO_REPRESENTATIVE
+		&& tq_read_u16(page, TQ_BATCH_REPRESENTATIVE_LANE_OFFSET) >= tq_read_u16(page, TQ_BATCH_OCCUPIED_COUNT_OFFSET))
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant batch page: representative lane exceeds occupied lanes");
 		return false;
 	}
 
@@ -547,6 +583,13 @@ tq_meta_page_init(void *page,
 	tq_write_u32(bytes, TQ_META_ROUTER_COMPLETED_ITERATIONS_OFFSET, fields->router_completed_iterations);
 	tq_write_u32(bytes, TQ_META_ROUTER_TRAINED_VECTOR_COUNT_OFFSET, fields->router_trained_vector_count);
 	tq_write_u16(bytes, TQ_META_ROUTER_ALGORITHM_OFFSET, (uint16_t) fields->router_algorithm);
+	tq_write_u32(bytes, TQ_META_ROUTER_RESTART_COUNT_OFFSET, fields->router_restart_count);
+	tq_write_u32(bytes, TQ_META_ROUTER_SELECTED_RESTART_OFFSET, fields->router_selected_restart);
+	tq_write_float32(bytes, TQ_META_ROUTER_MEAN_DISTORTION_OFFSET, fields->router_mean_distortion);
+	tq_write_float32(bytes, TQ_META_ROUTER_MAX_LIST_OVER_AVG_OFFSET, fields->router_max_list_over_avg);
+	tq_write_float32(bytes, TQ_META_ROUTER_COEFF_VAR_OFFSET, fields->router_coeff_var);
+	tq_write_float32(bytes, TQ_META_ROUTER_BALANCE_PENALTY_OFFSET, fields->router_balance_penalty);
+	tq_write_float32(bytes, TQ_META_ROUTER_SELECTION_SCORE_OFFSET, fields->router_selection_score);
 	return true;
 }
 
@@ -596,6 +639,13 @@ tq_meta_page_read(const void *page,
 	fields->router_completed_iterations = tq_read_u32(bytes, TQ_META_ROUTER_COMPLETED_ITERATIONS_OFFSET);
 	fields->router_trained_vector_count = tq_read_u32(bytes, TQ_META_ROUTER_TRAINED_VECTOR_COUNT_OFFSET);
 	fields->router_algorithm = (TqRouterAlgorithmKind) tq_read_u16(bytes, TQ_META_ROUTER_ALGORITHM_OFFSET);
+	fields->router_restart_count = tq_read_u32(bytes, TQ_META_ROUTER_RESTART_COUNT_OFFSET);
+	fields->router_selected_restart = tq_read_u32(bytes, TQ_META_ROUTER_SELECTED_RESTART_OFFSET);
+	fields->router_mean_distortion = tq_read_float32(bytes, TQ_META_ROUTER_MEAN_DISTORTION_OFFSET);
+	fields->router_max_list_over_avg = tq_read_float32(bytes, TQ_META_ROUTER_MAX_LIST_OVER_AVG_OFFSET);
+	fields->router_coeff_var = tq_read_float32(bytes, TQ_META_ROUTER_COEFF_VAR_OFFSET);
+	fields->router_balance_penalty = tq_read_float32(bytes, TQ_META_ROUTER_BALANCE_PENALTY_OFFSET);
+	fields->router_selection_score = tq_read_float32(bytes, TQ_META_ROUTER_SELECTION_SCORE_OFFSET);
 	if (fields->transform_version != TQ_TRANSFORM_CONTRACT_VERSION)
 	{
 		tq_set_error(errmsg, errmsg_len,
@@ -950,6 +1000,7 @@ tq_batch_page_init(void *page,
 	tq_write_u16(bytes, TQ_BATCH_LANE_COUNT_OFFSET, params->lane_count);
 	tq_write_u16(bytes, TQ_BATCH_OCCUPIED_COUNT_OFFSET, 0);
 	tq_write_u16(bytes, TQ_BATCH_LIVE_COUNT_OFFSET, 0);
+	tq_write_u16(bytes, TQ_BATCH_REPRESENTATIVE_LANE_OFFSET, TQ_BATCH_PAGE_NO_REPRESENTATIVE);
 	tq_write_u16(bytes, TQ_BATCH_FLAGS_OFFSET, 0);
 	tq_write_u32(bytes, TQ_BATCH_LIST_ID_OFFSET, params->list_id);
 	tq_write_u32(bytes, TQ_BATCH_NEXT_BLOCK_OFFSET, params->next_block);
@@ -958,6 +1009,7 @@ tq_batch_page_init(void *page,
 	tq_write_u16(bytes, TQ_BATCH_TID_OFFSET_OFFSET, (uint16_t) tid_offset);
 	tq_write_u16(bytes, TQ_BATCH_CODE_OFFSET_OFFSET, (uint16_t) code_offset);
 	tq_write_u16(bytes, TQ_BATCH_TOTAL_BYTES_OFFSET, (uint16_t) total_bytes);
+	tq_write_float32(bytes, TQ_BATCH_RESIDUAL_RADIUS_OFFSET, 0.0f);
 	return true;
 }
 
@@ -1087,9 +1139,74 @@ tq_batch_page_read_header(const void *page,
 	header->lane_count = tq_read_u16(bytes, TQ_BATCH_LANE_COUNT_OFFSET);
 	header->occupied_count = tq_read_u16(bytes, TQ_BATCH_OCCUPIED_COUNT_OFFSET);
 	header->live_count = tq_read_u16(bytes, TQ_BATCH_LIVE_COUNT_OFFSET);
+	header->representative_lane = tq_read_u16(bytes, TQ_BATCH_REPRESENTATIVE_LANE_OFFSET);
 	header->code_bytes = tq_read_u32(bytes, TQ_BATCH_CODE_BYTES_OFFSET);
 	header->list_id = tq_read_u32(bytes, TQ_BATCH_LIST_ID_OFFSET);
 	header->next_block = tq_read_u32(bytes, TQ_BATCH_NEXT_BLOCK_OFFSET);
+	header->residual_radius = tq_read_float32(bytes, TQ_BATCH_RESIDUAL_RADIUS_OFFSET);
+	return true;
+}
+
+bool
+tq_batch_page_set_summary(void *page,
+						  size_t page_size,
+						  const TqBatchPageSummary *summary,
+						  char *errmsg,
+						  size_t errmsg_len)
+{
+	uint8_t *bytes = (uint8_t *) page;
+
+	if (page == NULL || summary == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant batch page: page and summary must be non-null");
+		return false;
+	}
+
+	if (!tq_batch_validate_header(bytes, page_size, errmsg, errmsg_len))
+		return false;
+
+	if (summary->representative_lane != TQ_BATCH_PAGE_NO_REPRESENTATIVE
+		&& summary->representative_lane >= tq_read_u16(bytes, TQ_BATCH_OCCUPIED_COUNT_OFFSET))
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant batch page: summary representative lane exceeds occupied lanes");
+		return false;
+	}
+
+	if (summary->residual_radius < 0.0f)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant batch page: summary residual radius must be non-negative");
+		return false;
+	}
+
+	tq_write_u16(bytes, TQ_BATCH_REPRESENTATIVE_LANE_OFFSET, summary->representative_lane);
+	tq_write_float32(bytes, TQ_BATCH_RESIDUAL_RADIUS_OFFSET, summary->residual_radius);
+	return true;
+}
+
+bool
+tq_batch_page_get_summary(const void *page,
+						  size_t page_size,
+						  TqBatchPageSummary *summary,
+						  char *errmsg,
+						  size_t errmsg_len)
+{
+	const uint8_t *bytes = (const uint8_t *) page;
+
+	if (page == NULL || summary == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant batch page: page and summary output must be non-null");
+		return false;
+	}
+
+	if (!tq_batch_validate_header(bytes, page_size, errmsg, errmsg_len))
+		return false;
+
+	summary->representative_lane = tq_read_u16(bytes, TQ_BATCH_REPRESENTATIVE_LANE_OFFSET);
+	summary->residual_radius = tq_read_float32(bytes, TQ_BATCH_RESIDUAL_RADIUS_OFFSET);
 	return true;
 }
 
@@ -1358,6 +1475,8 @@ tq_batch_page_compact(void *page,
 	}
 
 	tq_write_u16(bytes, TQ_BATCH_OCCUPIED_COUNT_OFFSET, tq_read_u16(bytes, TQ_BATCH_LIVE_COUNT_OFFSET));
+	tq_write_u16(bytes, TQ_BATCH_REPRESENTATIVE_LANE_OFFSET, TQ_BATCH_PAGE_NO_REPRESENTATIVE);
+	tq_write_float32(bytes, TQ_BATCH_RESIDUAL_RADIUS_OFFSET, 0.0f);
 	return true;
 }
 

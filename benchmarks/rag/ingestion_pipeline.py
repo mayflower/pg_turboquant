@@ -38,6 +38,7 @@ class CampaignConfig:
     chunking: ChunkingConfig
     schema: dict[str, str]
     backends: list[dict[str, Any]]
+    regression_gate: dict[str, Any] | None = None
 
 
 def hf_auth_kwargs(env: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -58,6 +59,11 @@ def load_campaign_config(path: str | Path) -> CampaignConfig:
         chunking=ChunkingConfig(**payload["chunking"]),
         schema=dict(payload["schema"]),
         backends=[dict(item) for item in payload["backends"]],
+        regression_gate=(
+            dict(payload["regression_gate"])
+            if isinstance(payload.get("regression_gate"), Mapping)
+            else None
+        ),
     )
 
 

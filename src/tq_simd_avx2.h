@@ -25,6 +25,7 @@ extern bool tq_simd_neon_runtime_available(void);
 extern void tq_simd_force_disable(bool disabled);
 extern void tq_simd_avx2_force_disable(bool disabled);
 extern TqProdScoreKernel tq_prod_score_preferred_kernel(void);
+extern TqProdScoreKernel tq_prod_code_domain_preferred_kernel(const TqProdCodecConfig *config);
 extern const char *tq_prod_score_kernel_name(TqProdScoreKernel kernel);
 extern bool tq_prod_score_query_dispatch(const TqProdCodecConfig *config,
 										 const float *query,
@@ -36,5 +37,14 @@ extern bool tq_prod_score_query_dispatch(const TqProdCodecConfig *config,
 										 TqProdScoreKernel *used_kernel,
 										 char *errmsg,
 										 size_t errmsg_len);
+extern bool tq_prod_score_code_from_lut_dispatch(const TqProdCodecConfig *config,
+												 const TqProdLut *lut,
+												 const uint8_t *packed,
+												 size_t packed_len,
+												 TqProdScoreKernel kernel,
+												 float *score,
+												 TqProdScoreKernel *used_kernel,
+												 char *errmsg,
+												 size_t errmsg_len);
 
 #endif

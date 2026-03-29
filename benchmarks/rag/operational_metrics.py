@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 
 @dataclass(frozen=True)
@@ -32,6 +32,7 @@ class QueryOperationalMetrics:
     prompt_tokens: int | None = None
     prompt_context_count: int | None = None
     approximate_query_costs: tuple[ApproximateQueryCost, ...] = ()
+    scan_stats: Mapping[str, Any] | None = None
 
     def total_latency_ms(self) -> float | None:
         stages = [
@@ -79,6 +80,9 @@ class QueryOperationalMetrics:
                 cost.to_dict() for cost in self.approximate_query_costs
             ]
 
+        if self.scan_stats is not None:
+            payload["scan_stats"] = dict(self.scan_stats)
+
         return payload
 
     @classmethod
@@ -97,6 +101,7 @@ class QueryOperationalMetrics:
             prompt_tokens=_maybe_int(budgets, "prompt_tokens"),
             prompt_context_count=_maybe_int(budgets, "prompt_context_count"),
             approximate_query_costs=approximate_query_costs,
+            scan_stats=dict(payload["scan_stats"]) if isinstance(payload.get("scan_stats"), Mapping) else None,
         )
 
 
@@ -137,6 +142,10 @@ def summarize_query_operational_metrics(
     cost_summary = _summarize_costs(normalized)
     if cost_summary:
         summary["approximate_query_costs"] = cost_summary
+
+    scan_stats_summary = _summarize_scan_stats(normalized)
+    if scan_stats_summary:
+        summary["scan_stats"] = scan_stats_summary
 
     return summary
 
@@ -204,10 +213,39 @@ def _summarize_costs(
 def _distribution(values: Sequence[float]) -> dict[str, object]:
     return {
         "count": len(values),
+        "avg": sum(values) / len(values),
         "p50": _percentile(values, 50),
         "p95": _percentile(values, 95),
         "p99": _percentile(values, 99),
     }
+
+
+def _summarize_scan_stats(
+    metrics: Sequence[QueryOperationalMetrics],
+) -> dict[str, object]:
+    grouped_numeric: dict[str, list[float]] = {}
+    grouped_text: dict[str, list[str]] = {}
+
+    for item in metrics:
+        if not isinstance(item.scan_stats, Mapping):
+            continue
+        for key, value in item.scan_stats.items():
+            if isinstance(value, (int, float)):
+                grouped_numeric.setdefault(key, []).append(float(value))
+            elif isinstance(value, str):
+                grouped_text.setdefault(key, []).append(value)
+
+    summary: dict[str, object] = {}
+    for key, values in grouped_numeric.items():
+        summary[key] = _distribution(values)
+    for key, values in grouped_text.items():
+        distinct = sorted(set(values))
+        summary[key] = {
+            "count": len(values),
+            "uniform": distinct[0] if len(distinct) == 1 else None,
+            "values": distinct,
+        }
+    return summary
 
 
 def _percentile(values: Sequence[float], pct: float) -> float:

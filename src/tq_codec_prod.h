@@ -56,6 +56,13 @@ extern bool tq_prod_lut_build(const TqProdCodecConfig *config,
 							  char *errmsg,
 							  size_t errmsg_len);
 extern void tq_prod_lut_reset(TqProdLut *lut);
+extern bool tq_prod_score_code_from_lut(const TqProdCodecConfig *config,
+										const TqProdLut *lut,
+										const uint8_t *packed,
+										size_t packed_len,
+										float *score,
+										char *errmsg,
+										size_t errmsg_len);
 extern bool tq_prod_score_decompose_ip(const TqProdCodecConfig *config,
 									   const TqProdLut *lut,
 									   const uint8_t *packed,
@@ -72,5 +79,7 @@ extern bool tq_prod_score_packed_ip(const TqProdCodecConfig *config,
 									float *score,
 									char *errmsg,
 									size_t errmsg_len);
+extern void tq_prod_decode_counter_reset(void);
+extern size_t tq_prod_decode_counter_get(void);
 
 #endif

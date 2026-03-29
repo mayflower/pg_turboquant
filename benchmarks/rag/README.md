@@ -116,7 +116,7 @@ The RAG harness now tracks operational measurements separately from answer-quali
 - prompt token budget and prompt context count
 - optional approximate query-cost fields, each with an explicit unit
 
-Where per-query distributions exist, exports summarize them with `p50`, `p95`, and `p99` rather than collapsing retrieval-only and full end-to-end latency into one generic field.
+Where per-query distributions exist, exports summarize them with `avg`, `p50`, `p95`, and `p99` rather than collapsing retrieval-only and full end-to-end latency into one generic field.
 
 ## HotpotQA multihop overlay
 
@@ -148,6 +148,8 @@ The repository now also carries a comparative campaign/report layer for the firs
   `pg_turboquant` approx, `pg_turboquant` approx + rerank, `pgvector` HNSW, `pgvector` HNSW + rerank, `pgvector` IVFFlat, and `pgvector` IVFFlat + rerank
 - retrieval-only and end-to-end tables are emitted separately
 - JSON plus CSV artifacts remain the reproducible source of truth for every table in the Markdown report
+- Hotpot-focused reports now include average selected-list/live counts, average visited page/code counts, average effective probes, average page-prune counts, score mode, and derived visited-work fractions
+- a Hotpot regression gate can be attached to the report and is evaluated on recall plus visited scan work, not on wall-clock latency
 - narrative findings stay split across retrieval quality, answer quality, latency, and footprint
 - metric-validity caveats are called out explicitly in the generated report
 
@@ -245,12 +247,13 @@ uv run python benchmarks/rag/run_comparative_campaign.py \
 - `benchmarks/rag/configs/regression/` — local BEIR smoke configs and fixtures for retrieval-only regression gating
 - `benchmarks/rag/campaign_report.py` — comparative campaign planning, artifact emission, and narrative report generation
 - `benchmarks/rag/live_campaign.py` — testable BERGEN-backed live campaign orchestration helpers
+- `benchmarks/rag/configs/live/kilt_hotpotqa_ivf_live.json` — live Hotpot IVF config with recall and scan-work regression thresholds
 - `benchmarks/rag/dataset_pack.py` — schema validation and benchmark-plan resolution for the primary dataset pack
 - `benchmarks/rag/end_to_end.py` — fixed-generator prompt building, cache consumption, and end-to-end exports
 - `benchmarks/rag/ingestion_pipeline.py` — shared ingestion, manifest, embedding, and backend index-build helpers
 - `benchmarks/rag/multihop_eval.py` — optional HotpotQA-style multihop support-coverage metrics and machine-readable diagnostics
 - `benchmarks/rag/operational_metrics.py` — deterministic token-budget estimation plus stage-latency and cost-summary aggregation
-- `benchmarks/rag/regression_gate.py` — BEIR-style retrieval-only regression helpers plus optional LoTTE harness selection scaffolding
+- `benchmarks/rag/regression_gate.py` — retrieval-only regression helpers for BEIR fixtures plus the Hotpot recall-and-scan-work gate used by comparative reports
 - `benchmarks/rag/rerank_eval.py` — explicit exact SQL rerank planning and dual-stage export helpers
 - `benchmarks/rag/retrieval_eval.py` — reusable retrieval-only metrics and export helpers
 - `benchmarks/rag/run_comparative_campaign.py` — CLI entrypoint for local fixture-backed comparative RAG campaign runs

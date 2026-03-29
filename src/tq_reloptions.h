@@ -10,6 +10,7 @@ typedef struct TqAmOptions
 	int			lists;
 	int			router_samples;
 	int			router_iterations;
+	int			router_restarts;
 	int			router_seed;
 	bool		normalized;
 	int			transform_offset;

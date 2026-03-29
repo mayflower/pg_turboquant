@@ -63,12 +63,33 @@ ORDER BY embedding <=> '[1,0,0,0]'
 LIMIT 10;
 
 SET turboquant.probes = 16;
+SET turboquant.max_visited_codes = 0;
+SET turboquant.max_visited_pages = 0;
 
 EXPLAIN
 SELECT id
 FROM tq_planner_ivf_docs
 ORDER BY embedding <=> '[1,0,0,0]'
 LIMIT 10;
+
+SET turboquant.max_visited_codes = 256;
+
+EXPLAIN
+SELECT id
+FROM tq_planner_ivf_docs
+ORDER BY embedding <=> '[1,0,0,0]'
+LIMIT 10;
+
+SET turboquant.max_visited_codes = 0;
+SET turboquant.max_visited_pages = 32;
+
+EXPLAIN
+SELECT id
+FROM tq_planner_ivf_docs
+ORDER BY embedding <=> '[1,0,0,0]'
+LIMIT 10;
+
+SET turboquant.max_visited_pages = 0;
 
 EXPLAIN
 SELECT id

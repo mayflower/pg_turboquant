@@ -69,6 +69,11 @@ FROM (
 	LIMIT 3
 ) ranked;
 
+SELECT
+	(tq_last_scan_stats()->>'score_mode') AS normalized_cosine_score_mode,
+	(tq_last_scan_stats()->>'visited_code_count')::int > 0 AS normalized_cosine_visited_codes,
+	(tq_last_scan_stats()->>'decoded_vector_count')::int = 0 AS normalized_cosine_no_decodes;
+
 SELECT array_agg(id) AS approx_normalized_ip
 FROM (
 	SELECT id
@@ -76,6 +81,102 @@ FROM (
 	ORDER BY embedding <#> '[1,0]'
 	LIMIT 3
 ) ranked;
+
+SELECT
+	(tq_last_scan_stats()->>'score_mode') AS normalized_ip_score_mode,
+	(tq_last_scan_stats()->>'visited_code_count')::int > 0 AS normalized_ip_visited_codes,
+	(tq_last_scan_stats()->>'decoded_vector_count')::int = 0 AS normalized_ip_no_decodes;
+
+SELECT
+	(
+		SELECT array_agg(id)
+		FROM (
+			SELECT id
+			FROM tq_metric_normalized_docs
+			ORDER BY embedding <=> '[1,0]'
+			LIMIT 3
+		) ranked
+	) = (
+		SELECT array_agg(id)
+		FROM (
+			SELECT id
+			FROM tq_metric_normalized_docs
+			ORDER BY embedding <#> '[1,0]'
+			LIMIT 3
+		) ranked
+	) AS normalized_flat_cosine_ip_ranking_matches;
+
+CREATE TABLE tq_metric_normalized_ivf_docs (
+	id int4 PRIMARY KEY,
+	embedding vector(2)
+);
+
+INSERT INTO tq_metric_normalized_ivf_docs (id, embedding) VALUES
+	(1, '[1.0,0.0]'),
+	(2, '[0.98,0.02]'),
+	(3, '[0.0,1.0]'),
+	(4, '[0.02,0.98]'),
+	(5, '[-1.0,0.0]'),
+	(6, '[-0.98,0.02]'),
+	(7, '[0.0,-1.0]'),
+	(8, '[0.02,-0.98]');
+
+CREATE INDEX tq_metric_normalized_ivf_cosine_idx
+	ON tq_metric_normalized_ivf_docs
+	USING turboquant (embedding tq_cosine_ops)
+	WITH (bits = 4, lists = 4, lanes = auto, transform = 'hadamard', normalized = true,
+		  router_samples = 8, router_iterations = 6, router_seed = 7);
+
+CREATE INDEX tq_metric_normalized_ivf_ip_idx
+	ON tq_metric_normalized_ivf_docs
+	USING turboquant (embedding tq_ip_ops)
+	WITH (bits = 4, lists = 4, lanes = auto, transform = 'hadamard', normalized = true,
+		  router_samples = 8, router_iterations = 6, router_seed = 7);
+
+SET turboquant.probes = 2;
+
+SELECT array_agg(id) AS approx_normalized_ivf_cosine
+FROM (
+	SELECT id
+	FROM tq_metric_normalized_ivf_docs
+	ORDER BY embedding <=> '[1,0]'
+	LIMIT 4
+) ranked;
+
+SELECT
+	(tq_last_scan_stats()->>'score_mode') AS normalized_ivf_cosine_score_mode,
+	(tq_last_scan_stats()->>'decoded_vector_count')::int = 0 AS normalized_ivf_cosine_no_decodes;
+
+SELECT array_agg(id) AS approx_normalized_ivf_ip
+FROM (
+	SELECT id
+	FROM tq_metric_normalized_ivf_docs
+	ORDER BY embedding <#> '[1,0]'
+	LIMIT 4
+) ranked;
+
+SELECT
+	(tq_last_scan_stats()->>'score_mode') AS normalized_ivf_ip_score_mode,
+	(tq_last_scan_stats()->>'decoded_vector_count')::int = 0 AS normalized_ivf_ip_no_decodes;
+
+SELECT
+	(
+		SELECT array_agg(id)
+		FROM (
+			SELECT id
+			FROM tq_metric_normalized_ivf_docs
+			ORDER BY embedding <=> '[1,0]'
+			LIMIT 4
+		) ranked
+	) = (
+		SELECT array_agg(id)
+		FROM (
+			SELECT id
+			FROM tq_metric_normalized_ivf_docs
+			ORDER BY embedding <#> '[1,0]'
+			LIMIT 4
+		) ranked
+	) AS normalized_ivf_cosine_ip_ranking_matches;
 
 SELECT array_agg(id) AS approx_normalized_l2
 FROM (

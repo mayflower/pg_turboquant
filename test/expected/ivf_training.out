@@ -30,12 +30,27 @@ CREATE INDEX tq_ivf_training_idx
 		normalized = true,
 		router_samples = 8,
 		router_iterations = 6,
+		router_restarts = 3,
 		router_seed = 7
 	);
 SELECT tq_debug_router_metadata('tq_ivf_training_idx'::regclass);
-                               tq_debug_router_metadata                               
---------------------------------------------------------------------------------------
- seed=7 sample_count=8 trained_vector_count=8 max_iterations=6 completed_iterations=2
+                                                                       tq_debug_router_metadata                                                                        
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ seed=7 sample_count=8 trained_vector_count=8 max_iterations=6 completed_iterations=2 restart_count=3 selected_restart=0 balance_penalty=0.0000 selection_score=0.0002
+(1 row)
+
+SELECT
+	(meta->'router'->>'restart_count')::int AS router_restarts,
+	(meta->'router'->>'selected_restart')::int AS selected_restart,
+	round((meta->'router'->>'balance_penalty')::numeric, 4) AS balance_penalty,
+	round((meta->'list_distribution'->>'avg_list_size')::numeric, 2) AS avg_list_size,
+	(meta->'list_distribution'->>'max_list_size')::int AS max_list_size,
+	(meta->'list_distribution'->>'p95_list_size')::int AS p95_list_size,
+	round((meta->'list_distribution'->>'coeff_var')::numeric, 4) AS coeff_var
+FROM (SELECT tq_index_metadata('tq_ivf_training_idx'::regclass) AS meta) AS s;
+ router_restarts | selected_restart | balance_penalty | avg_list_size | max_list_size | p95_list_size | coeff_var 
+-----------------+------------------+-----------------+---------------+---------------+---------------+-----------
+               3 |                0 |          0.0000 |          2.00 |             2 |             2 |    0.0000
 (1 row)
 
 SELECT array_agg(id) AS approx_clustered_ids
@@ -68,12 +83,27 @@ CREATE INDEX tq_ivf_sparse_idx
 		normalized = true,
 		router_samples = 2,
 		router_iterations = 4,
+		router_restarts = 3,
 		router_seed = 11
 	);
 SELECT tq_debug_router_metadata('tq_ivf_sparse_idx'::regclass);
-                               tq_debug_router_metadata                                
----------------------------------------------------------------------------------------
- seed=11 sample_count=2 trained_vector_count=2 max_iterations=4 completed_iterations=2
+                                                                        tq_debug_router_metadata                                                                        
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ seed=11 sample_count=2 trained_vector_count=2 max_iterations=4 completed_iterations=2 restart_count=3 selected_restart=0 balance_penalty=0.4000 selection_score=0.0000
+(1 row)
+
+SELECT
+	(meta->'router'->>'restart_count')::int AS router_restarts,
+	(meta->'router'->>'selected_restart')::int AS selected_restart,
+	round((meta->'router'->>'balance_penalty')::numeric, 4) AS balance_penalty,
+	round((meta->'list_distribution'->>'avg_list_size')::numeric, 2) AS avg_list_size,
+	(meta->'list_distribution'->>'max_list_size')::int AS max_list_size,
+	(meta->'list_distribution'->>'p95_list_size')::int AS p95_list_size,
+	round((meta->'list_distribution'->>'coeff_var')::numeric, 4) AS coeff_var
+FROM (SELECT tq_index_metadata('tq_ivf_sparse_idx'::regclass) AS meta) AS s;
+ router_restarts | selected_restart | balance_penalty | avg_list_size | max_list_size | p95_list_size | coeff_var 
+-----------------+------------------+-----------------+---------------+---------------+---------------+-----------
+               3 |                0 |          0.4000 |          0.50 |             1 |             1 |    1.0000
 (1 row)
 
 SELECT array_agg(id) AS sparse_ids

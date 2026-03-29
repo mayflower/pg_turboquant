@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
@@ -147,13 +148,29 @@ class PostgresRetrieverAdapter:
         return normalized
 
     def retrieve(self, request: RetrievalRequest) -> list[dict[str, Any]]:
+        rows, _ = self.retrieve_with_metadata(request)
+        return rows
+
+    def retrieve_with_metadata(
+        self, request: RetrievalRequest
+    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
         plan = self.build_plan(request)
         with self.connect_fn(self.dsn) as connection:
             with connection.cursor() as cursor:
                 for sql, params in plan.session_statements:
                     cursor.execute(render_session_statement(sql, params))
                 cursor.execute(plan.sql, plan.params)
-                return self.normalize_rows(cursor.fetchall())
+                rows = self.normalize_rows(cursor.fetchall())
+                scan_stats = None
+                if getattr(self.backend, "name", None) == "pg_turboquant":
+                    cursor.execute("SELECT public.tq_last_scan_stats()::text")
+                    raw = cursor.fetchone()[0]
+                    if raw:
+                        try:
+                            scan_stats = json.loads(raw)
+                        except json.JSONDecodeError:
+                            scan_stats = None
+                return rows, scan_stats
 
 
 def validate_metric(metric: str) -> str:

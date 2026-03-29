@@ -35,9 +35,15 @@ CREATE INDEX tq_query_helper_docs_idx
 		normalized = true
 	);
 SELECT * FROM tq_recommended_query_knobs(24, 10);
- probes | oversample_factor 
---------+-------------------
-      3 |                 8
+ probes | oversample_factor | max_visited_codes | max_visited_pages 
+--------+-------------------+-------------------+-------------------
+      3 |                 8 |               192 |                 0
+(1 row)
+
+SELECT * FROM tq_resolve_query_knobs(24, 10, 6, 4);
+ probes | oversample_factor | max_visited_codes | max_visited_pages 
+--------+-------------------+-------------------+-------------------
+      6 |                 4 |                96 |                 0
 (1 row)
 
 SELECT *
@@ -146,7 +152,7 @@ FROM tq_approx_candidates(
 ERROR:  invalid turboquant metric: angular
 HINT:  Use one of: cosine, ip, l2.
 CONTEXT:  PL/pgSQL function tq_metric_order_operator(text) line 11 at RAISE
-PL/pgSQL function tq_approx_candidates(regclass,name,name,vector,text,integer,integer,integer) line 8 at assignment
+PL/pgSQL function tq_approx_candidates(regclass,name,name,vector,text,integer,integer,integer) line 10 at assignment
 SELECT *
 FROM tq_rerank_candidates(
 	'tq_query_helper_docs'::regclass,
@@ -160,6 +166,6 @@ FROM tq_rerank_candidates(
 ERROR:  invalid turboquant limits: final_limit (3) exceeds candidate_limit (2)
 HINT:  final_limit must be less than or equal to candidate_limit.
 CONTEXT:  PL/pgSQL function tq_resolve_query_knobs(integer,integer,integer,integer) line 20 at RAISE
-SQL statement "SELECT knobs.probes, knobs.oversample_factor
-	                                           FROM tq_resolve_query_knobs(candidate_limit, final_limit, probes, oversample_factor) AS knobs"
-PL/pgSQL function tq_rerank_candidates(regclass,name,name,vector,text,integer,integer,integer,integer) line 10 at SQL statement
+SQL statement "SELECT knobs.probes, knobs.oversample_factor, knobs.max_visited_codes, knobs.max_visited_pages
+	                                                                                                   FROM tq_resolve_query_knobs(candidate_limit, final_limit, probes, oversample_factor) AS knobs"
+PL/pgSQL function tq_rerank_candidates(regclass,name,name,vector,text,integer,integer,integer,integer) line 12 at SQL statement

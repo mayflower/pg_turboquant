@@ -37,6 +37,8 @@ SUPPORTED_DATASETS = frozenset({"kilt_nq", "kilt_hotpotqa", "kilt_triviaqa", "po
 
 DEFAULT_TURBOQUANT_PROBES = 8
 DEFAULT_TURBOQUANT_OVERSAMPLING = 4
+DEFAULT_TURBOQUANT_MAX_VISITED_CODES = 4096
+DEFAULT_TURBOQUANT_MAX_VISITED_PAGES = 0
 DEFAULT_HNSW_EF_SEARCH = 80
 DEFAULT_IVFFLAT_PROBES = 8
 DEFAULT_GENERATION_TOP_K = 5
@@ -104,6 +106,8 @@ def run_live_campaign(
     prompt_name: str | None = None,
     turboquant_probes: int = DEFAULT_TURBOQUANT_PROBES,
     turboquant_oversampling: int = DEFAULT_TURBOQUANT_OVERSAMPLING,
+    turboquant_max_visited_codes: int = DEFAULT_TURBOQUANT_MAX_VISITED_CODES,
+    turboquant_max_visited_pages: int = DEFAULT_TURBOQUANT_MAX_VISITED_PAGES,
     hnsw_ef_search: int = DEFAULT_HNSW_EF_SEARCH,
     ivfflat_probes: int = DEFAULT_IVFFLAT_PROBES,
     backend_isolation: bool = True,
@@ -158,6 +162,8 @@ def run_live_campaign(
             "turboquant": {
                 "probes": turboquant_probes,
                 "oversampling": turboquant_oversampling,
+                "max_visited_codes": turboquant_max_visited_codes,
+                "max_visited_pages": turboquant_max_visited_pages,
             },
             "pgvector_hnsw": {"ef_search": hnsw_ef_search},
             "pgvector_ivfflat": {"probes": ivfflat_probes},
@@ -248,6 +254,8 @@ def run_live_campaign(
                 ivfflat_index_name=scenario_index_names["pgvector_ivfflat"],
                 turboquant_probes=turboquant_probes,
                 turboquant_oversampling=turboquant_oversampling,
+                turboquant_max_visited_codes=turboquant_max_visited_codes,
+                turboquant_max_visited_pages=turboquant_max_visited_pages,
                 hnsw_ef_search=hnsw_ef_search,
                 ivfflat_probes=ivfflat_probes,
             )
@@ -395,6 +403,8 @@ def _run_retrieval_scenario(
     ivfflat_index_name: str,
     turboquant_probes: int,
     turboquant_oversampling: int,
+    turboquant_max_visited_codes: int,
+    turboquant_max_visited_pages: int,
     hnsw_ef_search: int,
     ivfflat_probes: int,
 ) -> dict[str, object]:
@@ -425,6 +435,8 @@ def _run_retrieval_scenario(
         method_id=method_id,
         turboquant_probes=turboquant_probes,
         turboquant_oversampling=turboquant_oversampling,
+        turboquant_max_visited_codes=turboquant_max_visited_codes,
+        turboquant_max_visited_pages=turboquant_max_visited_pages,
         hnsw_ef_search=hnsw_ef_search,
         ivfflat_probes=ivfflat_probes,
     )
@@ -458,7 +470,7 @@ def _run_retrieval_scenario(
 
         if approx_adapter is not None:
             started_at = clock_fn()
-            approx_rows = approx_adapter.retrieve(
+            approx_rows, approx_scan_stats = approx_adapter.retrieve_with_metadata(
                 RetrievalRequest(
                     query_vector=query_vector,
                     top_k=rerank_top_k,
@@ -479,9 +491,10 @@ def _run_retrieval_scenario(
         else:
             approx_rows = None
             approx_latency_ms = None
+            approx_scan_stats = None
 
         started_at = clock_fn()
-        final_rows = adapter.retrieve(
+        final_rows, final_scan_stats = adapter.retrieve_with_metadata(
             RetrievalRequest(
                 query_vector=query_vector,
                 top_k=dataset_top_k,
@@ -506,6 +519,7 @@ def _run_retrieval_scenario(
             QueryOperationalMetrics(
                 retrieval_latency_ms=approx_latency_ms if approx_latency_ms is not None else retrieval_latency_ms,
                 rerank_latency_ms=retrieval_latency_ms if approx_latency_ms is not None else None,
+                scan_stats=approx_scan_stats if approx_scan_stats is not None else final_scan_stats,
             )
         )
         raw_queries.append(
@@ -541,6 +555,12 @@ def _run_retrieval_scenario(
     }
     if hasattr(backend, "serialize_run_metadata"):
         run_metadata.update(backend.serialize_run_metadata(adapter.build_plan(_request_stub(metric, dataset_top_k, ann))))
+    if method_id.startswith("pg_turboquant_"):
+        run_metadata["index_metadata"] = _fetch_turboquant_index_metadata(
+            dsn=dsn,
+            connect_fn=connect_fn,
+            index_name=turboquant_index_name,
+        )
 
     if approx_adapter is None:
         metrics = compute_retrieval_metrics(final_evaluations, ks=eval_ks)
@@ -548,6 +568,7 @@ def _run_retrieval_scenario(
             output_dir=retrieval_root,
             run_metadata=run_metadata,
             metrics=metrics,
+            operational_metrics=operational_metrics,
         )
     else:
         run_metadata["candidate_pool_size"] = rerank_top_k
@@ -565,9 +586,11 @@ def _run_retrieval_scenario(
         json.dumps(raw_queries, indent=2, sort_keys=True),
         encoding="utf-8",
     )
+    result_payload = json.loads((retrieval_root / artifacts["json"]).read_text(encoding="utf-8"))
     return {
         "run_metadata": run_metadata,
         "metrics": metrics,
+        "operational_summary": result_payload.get("operational_summary", {}),
         "artifacts": artifacts,
         "query_results": raw_queries,
     }
@@ -686,6 +709,27 @@ def _fetch_relation_size_bytes(
         return None
 
 
+def _fetch_turboquant_index_metadata(
+    *,
+    dsn: str,
+    connect_fn: Callable[[str], Any],
+    index_name: str,
+) -> dict[str, Any] | None:
+    try:
+        with connect_fn(dsn) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT tq_index_metadata(%s::regclass)", (index_name,))
+                row = cursor.fetchone()
+                if not row or row[0] is None:
+                    return None
+                value = row[0]
+                if isinstance(value, dict):
+                    return value
+                return json.loads(value)
+    except Exception:
+        return None
+
+
 def _metric_ks(top_k: int) -> tuple[int, ...]:
     return tuple(sorted({1, 5, 10, int(top_k)}))
 
@@ -695,6 +739,8 @@ def _ann_settings_for_method(
     method_id: str,
     turboquant_probes: int,
     turboquant_oversampling: int,
+    turboquant_max_visited_codes: int,
+    turboquant_max_visited_pages: int,
     hnsw_ef_search: int,
     ivfflat_probes: int,
 ) -> dict[str, int]:
@@ -702,6 +748,8 @@ def _ann_settings_for_method(
         return {
             "probes": turboquant_probes,
             "oversampling": turboquant_oversampling,
+            "max_visited_codes": turboquant_max_visited_codes,
+            "max_visited_pages": turboquant_max_visited_pages,
         }
     if method_id.startswith("pgvector_hnsw_"):
         return {"ef_search": hnsw_ef_search}

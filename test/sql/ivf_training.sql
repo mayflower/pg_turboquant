@@ -34,10 +34,21 @@ CREATE INDEX tq_ivf_training_idx
 		normalized = true,
 		router_samples = 8,
 		router_iterations = 6,
+		router_restarts = 3,
 		router_seed = 7
 	);
 
 SELECT tq_debug_router_metadata('tq_ivf_training_idx'::regclass);
+
+SELECT
+	(meta->'router'->>'restart_count')::int AS router_restarts,
+	(meta->'router'->>'selected_restart')::int AS selected_restart,
+	round((meta->'router'->>'balance_penalty')::numeric, 4) AS balance_penalty,
+	round((meta->'list_distribution'->>'avg_list_size')::numeric, 2) AS avg_list_size,
+	(meta->'list_distribution'->>'max_list_size')::int AS max_list_size,
+	(meta->'list_distribution'->>'p95_list_size')::int AS p95_list_size,
+	round((meta->'list_distribution'->>'coeff_var')::numeric, 4) AS coeff_var
+FROM (SELECT tq_index_metadata('tq_ivf_training_idx'::regclass) AS meta) AS s;
 
 SELECT array_agg(id) AS approx_clustered_ids
 FROM (
@@ -67,10 +78,21 @@ CREATE INDEX tq_ivf_sparse_idx
 		normalized = true,
 		router_samples = 2,
 		router_iterations = 4,
+		router_restarts = 3,
 		router_seed = 11
 	);
 
 SELECT tq_debug_router_metadata('tq_ivf_sparse_idx'::regclass);
+
+SELECT
+	(meta->'router'->>'restart_count')::int AS router_restarts,
+	(meta->'router'->>'selected_restart')::int AS selected_restart,
+	round((meta->'router'->>'balance_penalty')::numeric, 4) AS balance_penalty,
+	round((meta->'list_distribution'->>'avg_list_size')::numeric, 2) AS avg_list_size,
+	(meta->'list_distribution'->>'max_list_size')::int AS max_list_size,
+	(meta->'list_distribution'->>'p95_list_size')::int AS p95_list_size,
+	round((meta->'list_distribution'->>'coeff_var')::numeric, 4) AS coeff_var
+FROM (SELECT tq_index_metadata('tq_ivf_sparse_idx'::regclass) AS meta) AS s;
 
 SELECT array_agg(id) AS sparse_ids
 FROM (

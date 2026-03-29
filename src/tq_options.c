@@ -68,6 +68,7 @@ tq_validate_option_config(const TqOptionConfig *config, char *errmsg, size_t err
 {
 	int			router_samples = config->router_samples == 0 ? 256 : config->router_samples;
 	int			router_iterations = config->router_iterations == 0 ? 8 : config->router_iterations;
+	int			router_restarts = config->router_restarts == 0 ? 3 : config->router_restarts;
 
 	if (config->bits < 2 || config->bits > 8)
 	{
@@ -94,6 +95,13 @@ tq_validate_option_config(const TqOptionConfig *config, char *errmsg, size_t err
 	{
 		tq_set_error(errmsg, errmsg_len,
 					 "invalid value for parameter \"router_iterations\": turboquant router_iterations must be between 1 and 64");
+		return false;
+	}
+
+	if (router_restarts < 1 || router_restarts > 8)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid value for parameter \"router_restarts\": turboquant router_restarts must be between 1 and 8");
 		return false;
 	}
 

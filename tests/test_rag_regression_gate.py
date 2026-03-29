@@ -12,6 +12,7 @@ from benchmarks.rag.bergen_adapter import (
 from benchmarks.rag.regression_gate import (
     REGRESSION_CONFIG_DIR,
     BeirFixtureQuery,
+    evaluate_hotpot_regression_gate,
     load_regression_config,
     load_regression_fixture,
     resolve_regression_harness,
@@ -146,6 +147,68 @@ class RagRegressionGateContractTest(unittest.TestCase):
         fixture = load_regression_fixture(REGRESSION_CONFIG_DIR / "beir_tiny_smoke_fixture.json")
         self.assertEqual([entry.query_id for entry in fixture], ["q1", "q2"])
         self.assertEqual(fixture[0].relevant_ids, ["d1"])
+
+    def test_hotpot_gate_enforces_recall_and_scan_work_thresholds(self):
+        gate = evaluate_hotpot_regression_gate(
+            retrieval_rows=[
+                {
+                    "dataset_id": "kilt_hotpotqa",
+                    "method_id": "pg_turboquant_approx",
+                    "recall@10": 0.93,
+                    "avg_effective_probe_count": 3.0,
+                    "visited_code_fraction": 0.40,
+                    "visited_page_fraction": 0.30,
+                    "score_mode": "code_domain",
+                }
+            ],
+            gate_config={
+                "dataset_id": "kilt_hotpotqa",
+                "method_id": "pg_turboquant_approx",
+                "recall_at_10_floor": 0.90,
+                "max_visited_code_fraction": 0.85,
+                "max_visited_page_fraction": 0.60,
+                "expected_score_mode": "code_domain",
+                "max_effective_probe_count": 8,
+            },
+        )
+
+        self.assertTrue(gate["passed"])
+        self.assertTrue(gate["checks"]["recall_at_10_floor"]["passed"])
+        self.assertTrue(gate["checks"]["max_visited_code_fraction"]["passed"])
+        self.assertTrue(gate["checks"]["max_visited_page_fraction"]["passed"])
+        self.assertTrue(gate["checks"]["expected_score_mode"]["passed"])
+        self.assertTrue(gate["checks"]["max_effective_probe_count"]["passed"])
+
+    def test_hotpot_gate_reports_failing_check_details(self):
+        gate = evaluate_hotpot_regression_gate(
+            retrieval_rows=[
+                {
+                    "dataset_id": "kilt_hotpotqa",
+                    "method_id": "pg_turboquant_approx",
+                    "recall@10": 0.82,
+                    "avg_effective_probe_count": 9.0,
+                    "visited_code_fraction": 0.91,
+                    "visited_page_fraction": 0.71,
+                    "score_mode": "decode",
+                }
+            ],
+            gate_config={
+                "dataset_id": "kilt_hotpotqa",
+                "method_id": "pg_turboquant_approx",
+                "recall_at_10_floor": 0.90,
+                "max_visited_code_fraction": 0.85,
+                "max_visited_page_fraction": 0.60,
+                "expected_score_mode": "code_domain",
+                "max_effective_probe_count": 8,
+            },
+        )
+
+        self.assertFalse(gate["passed"])
+        self.assertFalse(gate["checks"]["recall_at_10_floor"]["passed"])
+        self.assertFalse(gate["checks"]["max_visited_code_fraction"]["passed"])
+        self.assertFalse(gate["checks"]["max_visited_page_fraction"]["passed"])
+        self.assertFalse(gate["checks"]["expected_score_mode"]["passed"])
+        self.assertFalse(gate["checks"]["max_effective_probe_count"]["passed"])
 
 
 if __name__ == "__main__":

@@ -33,6 +33,7 @@ typedef struct TqOptionConfig
 	int			lists;
 	int			router_samples;
 	int			router_iterations;
+	int			router_restarts;
 	int			router_seed;
 	bool		normalized;
 	const char *transform_name;

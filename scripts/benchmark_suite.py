@@ -27,6 +27,8 @@ SUPPORTED_CORPORA = (
     "non_normalized_varied_norms",
     "clustered",
     "mixed_live_dead",
+    "hotpot_skewed",
+    "hotpot_overlap",
 )
 PROFILE_CONFIGS = {
     "tiny": {"rows": 128, "queries": 8, "dimension": 4, "repetitions": 2},
@@ -139,6 +141,7 @@ def synthetic_simd_metadata() -> dict:
     return {
         "preferred_kernel": preferred,
         "selected_kernel": preferred,
+        "code_domain_kernel": "scalar",
         "compiled": {
             "scalar": True,
             "avx2": avx2,
@@ -152,6 +155,20 @@ def synthetic_simd_metadata() -> dict:
             "neon": neon,
         },
     }
+
+
+def synthetic_code_domain_kernel(corpus: Corpus, spec: dict, simd_metadata: dict) -> str:
+    if spec["index_method"] != "turboquant":
+        return "none"
+    if spec.get("query_mode") == "bitmap_filter":
+        return "none"
+    if int(spec["with"].get("bits", 0)) != 4:
+        return "scalar"
+    if corpus.dimension == 0 or corpus.dimension % 8 != 0:
+        return "scalar"
+    if simd_metadata.get("runtime_available", {}).get("avx2"):
+        return "avx2"
+    return "scalar"
 
 
 def environment_metadata() -> dict:
@@ -337,6 +354,134 @@ def generate_mixed_live_dead(config: dict, rng: random.Random) -> Corpus:
     )
 
 
+def generate_hotpot_skewed(config: dict, rng: random.Random) -> Corpus:
+    dimension = config["dimension"]
+    row_count = max(config["rows"], 1024)
+    heavy_count = max(1, int(row_count * 0.72))
+    cluster_count = 4
+    centers = []
+    rows = []
+    queries = []
+
+    for _ in range(cluster_count):
+        center = [rng.uniform(-1.0, 1.0) for _ in range(dimension)]
+        centers.append(rounded(normalize(center)))
+
+    for row_id in range(1, row_count + 1):
+        if row_id <= heavy_count:
+            center = centers[0]
+            noise = 0.025
+        else:
+            center = centers[1 + ((row_id - heavy_count - 1) % (cluster_count - 1))]
+            noise = 0.08
+
+        values = [
+            center[axis] + rng.uniform(-noise, noise)
+            for axis in range(dimension)
+        ]
+        rows.append(Row(row_id, rounded(normalize(values))))
+
+    for query_index in range(config["queries"]):
+        if query_index % 3 == 0:
+            center = centers[0]
+            noise = 0.02
+        else:
+            center = centers[1 + (query_index % (cluster_count - 1))]
+            noise = 0.04
+
+        values = [
+            center[axis] + rng.uniform(-noise, noise)
+            for axis in range(dimension)
+        ]
+        queries.append(rounded(normalize(values)))
+
+    return Corpus(
+        name="hotpot_skewed",
+        dimension=dimension,
+        rows=rows,
+        queries=queries,
+        metadata={
+            "distribution": "hotpot_skewed_ivf",
+            "normalized": True,
+            "heavy_cluster_fraction": round(heavy_count / max(1, row_count), 4),
+            "cluster_count": cluster_count,
+        },
+    )
+
+
+def generate_hotpot_overlap(config: dict, rng: random.Random) -> Corpus:
+    dimension = config["dimension"]
+    row_count = max(config["rows"], 2048)
+    heavy_count = max(1, int(row_count * 0.68))
+    cluster_count = 6
+    rows = []
+    queries = []
+
+    anchor = [rng.uniform(-1.0, 1.0) for _ in range(dimension)]
+    anchor = list(normalize(anchor))
+    centers = []
+
+    for cluster_index in range(cluster_count):
+        offset = [rng.uniform(-1.0, 1.0) for _ in range(dimension)]
+        offset = normalize(offset)
+        blend = 0.12 + (cluster_index * 0.015)
+        center = [
+            ((1.0 - blend) * anchor[axis]) + (blend * offset[axis])
+            for axis in range(dimension)
+        ]
+        centers.append(rounded(normalize(center)))
+
+    for row_id in range(1, row_count + 1):
+        if row_id <= heavy_count:
+            center = centers[0]
+            noise = 0.16
+        else:
+            center = centers[1 + ((row_id - heavy_count - 1) % (cluster_count - 1))]
+            noise = 0.18
+
+        values = [
+            center[axis] + rng.uniform(-noise, noise)
+            for axis in range(dimension)
+        ]
+        rows.append(Row(row_id, rounded(normalize(values))))
+
+    boundary_query_count = max(1, config["queries"] // 2)
+    for query_index in range(config["queries"]):
+        tail_index = 1 + (query_index % (cluster_count - 1))
+        if query_index < boundary_query_count:
+            blend = 0.5 + (0.04 if query_index % 2 == 0 else -0.04)
+            center = [
+                ((1.0 - blend) * centers[0][axis]) + (blend * centers[tail_index][axis])
+                for axis in range(dimension)
+            ]
+            noise = 0.12
+        else:
+            center = list(centers[tail_index])
+            noise = 0.14
+
+        values = [
+            center[axis] + rng.uniform(-noise, noise)
+            for axis in range(dimension)
+        ]
+        queries.append(rounded(normalize(values)))
+
+    return Corpus(
+        name="hotpot_overlap",
+        dimension=dimension,
+        rows=rows,
+        queries=queries,
+        metadata={
+            "distribution": "hotpot_overlap_ivf",
+            "normalized": True,
+            "heavy_cluster_fraction": round(heavy_count / max(1, row_count), 4),
+            "cluster_count": cluster_count,
+            "query_profile": "boundary_blend",
+            "overlap_noise": 0.18,
+            "boundary_query_fraction": round(boundary_query_count / max(1, config["queries"]), 4),
+        },
+    )
+
+
 def build_corpus(corpus_name: str, config: dict, seed: int) -> Corpus:
     rng = random.Random(seed)
     if corpus_name == "normalized_dense":
@@ -347,6 +492,10 @@ def build_corpus(corpus_name: str, config: dict, seed: int) -> Corpus:
         return generate_clustered(config, rng)
     if corpus_name == "mixed_live_dead":
         return generate_mixed_live_dead(config, rng)
+    if corpus_name == "hotpot_skewed":
+        return generate_hotpot_skewed(config, rng)
+    if corpus_name == "hotpot_overlap":
+        return generate_hotpot_overlap(config, rng)
     raise AssertionError(f"unexpected corpus {corpus_name}")
 
 
@@ -398,6 +547,21 @@ def query_psql(base_cmd: list[str], sql: str) -> str:
     return result.stdout.strip()
 
 
+def query_psql_commands(base_cmd: list[str], *commands: str) -> list[str]:
+    cmd = list(base_cmd) + ["-qAt"]
+
+    for sql in commands:
+        cmd.extend(["-c", sql])
+
+    result = subprocess.run(
+        cmd,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return [line for line in result.stdout.splitlines() if line.strip()]
+
+
 def current_wal_lsn(base_cmd: list[str]) -> str:
     return query_psql(base_cmd, "SELECT pg_current_wal_insert_lsn();")
 
@@ -416,12 +580,30 @@ def method_spec(
     corpus: Corpus,
     turboquant_probes: Optional[int] = None,
     turboquant_oversample_factor: Optional[int] = None,
+    turboquant_max_visited_codes: Optional[int] = None,
+    turboquant_max_visited_pages: Optional[int] = None,
 ) -> dict:
-    list_count = min(16, max(4, len(active_rows(corpus)) // 32))
-    turboquant_probe_value = turboquant_probes if turboquant_probes is not None else min(list_count, 4)
+    hotpot_overlap = corpus.name == "hotpot_overlap"
+    if hotpot_overlap:
+        list_count = min(64, max(16, len(active_rows(corpus)) // 16))
+    else:
+        list_count = min(16, max(4, len(active_rows(corpus)) // 32))
+
+    default_turboquant_probes = min(list_count, 8) if hotpot_overlap else min(list_count, 4)
+    turboquant_probe_value = (
+        turboquant_probes if turboquant_probes is not None else default_turboquant_probes
+    )
     turboquant_oversample_value = (
         turboquant_oversample_factor if turboquant_oversample_factor is not None else 4
     )
+    turboquant_max_codes_value = (
+        turboquant_max_visited_codes if turboquant_max_visited_codes is not None else (4096 if hotpot_overlap else 0)
+    )
+    turboquant_max_pages_value = (
+        turboquant_max_visited_pages if turboquant_max_visited_pages is not None else 0
+    )
+    ivfflat_probe_value = min(list_count, 8) if hotpot_overlap else min(list_count, 4)
+    hnsw_ef_search_value = 80 if hotpot_overlap else 40
     if method == "turboquant_flat":
         return {
             "index_method": "turboquant",
@@ -438,11 +620,15 @@ def method_spec(
                 "SET LOCAL enable_bitmapscan = off",
                 f"SET LOCAL turboquant.probes = {turboquant_probe_value}",
                 f"SET LOCAL turboquant.oversample_factor = {turboquant_oversample_value}",
+                f"SET LOCAL turboquant.max_visited_codes = {turboquant_max_codes_value}",
+                f"SET LOCAL turboquant.max_visited_pages = {turboquant_max_pages_value}",
             ],
             "candidate_slots_bound": turboquant_probe_value * turboquant_oversample_value,
             "query_knobs": {
                 "turboquant.probes": turboquant_probe_value,
                 "turboquant.oversample_factor": turboquant_oversample_value,
+                "turboquant.max_visited_codes": turboquant_max_codes_value,
+                "turboquant.max_visited_pages": turboquant_max_pages_value,
             },
         }
     if method == "turboquant_ivf":
@@ -461,11 +647,15 @@ def method_spec(
                 "SET LOCAL enable_bitmapscan = off",
                 f"SET LOCAL turboquant.probes = {turboquant_probe_value}",
                 f"SET LOCAL turboquant.oversample_factor = {turboquant_oversample_value}",
+                f"SET LOCAL turboquant.max_visited_codes = {turboquant_max_codes_value}",
+                f"SET LOCAL turboquant.max_visited_pages = {turboquant_max_pages_value}",
             ],
             "candidate_slots_bound": turboquant_probe_value * turboquant_oversample_value,
             "query_knobs": {
                 "turboquant.probes": turboquant_probe_value,
                 "turboquant.oversample_factor": turboquant_oversample_value,
+                "turboquant.max_visited_codes": turboquant_max_codes_value,
+                "turboquant.max_visited_pages": turboquant_max_pages_value,
             },
         }
     if method == "turboquant_bitmap":
@@ -502,11 +692,11 @@ def method_spec(
             "query_setup": [
                 "SET LOCAL enable_seqscan = off",
                 "SET LOCAL enable_bitmapscan = off",
-                f"SET LOCAL ivfflat.probes = {min(list_count, 4)}",
+                f"SET LOCAL ivfflat.probes = {ivfflat_probe_value}",
             ],
             "candidate_slots_bound": 0,
             "query_knobs": {
-                "ivfflat.probes": min(list_count, 4),
+                "ivfflat.probes": ivfflat_probe_value,
             },
         }
     if method == "pgvector_hnsw":
@@ -520,11 +710,11 @@ def method_spec(
             "query_setup": [
                 "SET LOCAL enable_seqscan = off",
                 "SET LOCAL enable_bitmapscan = off",
-                "SET LOCAL hnsw.ef_search = 40",
+                f"SET LOCAL hnsw.ef_search = {hnsw_ef_search_value}",
             ],
             "candidate_slots_bound": 0,
             "query_knobs": {
-                "hnsw.ef_search": 40,
+                "hnsw.ef_search": hnsw_ef_search_value,
             },
         }
     raise AssertionError(f"unexpected method {method}")
@@ -540,11 +730,20 @@ def render_with_clause(options: dict) -> str:
     return ", ".join(rendered)
 
 
+def chunked_insert_value_blocks(rows: list[Row], max_rows_per_insert: int = 128) -> list[str]:
+    blocks = []
+    for offset in range(0, len(rows), max_rows_per_insert):
+        chunk = rows[offset : offset + max_rows_per_insert]
+        blocks.append(
+            ",\n".join(
+                f"({row.row_id}, {row.row_id % 2}, '{vector_literal(row.values)}')"
+                for row in chunk
+            )
+        )
+    return blocks
+
+
 def load_corpus(base_cmd: list[str], table_name: str, corpus: Corpus) -> None:
-    insert_values = ",\n".join(
-        f"({row.row_id}, {row.row_id % 2}, '{vector_literal(row.values)}')"
-        for row in corpus.rows
-    )
     sql = f"""
     CREATE EXTENSION IF NOT EXISTS vector;
     CREATE EXTENSION IF NOT EXISTS pg_turboquant;
@@ -554,10 +753,13 @@ def load_corpus(base_cmd: list[str], table_name: str, corpus: Corpus) -> None:
         category int4 NOT NULL,
         embedding vector({corpus.dimension})
     );
-    INSERT INTO {table_name} (id, category, embedding) VALUES
-    {insert_values};
     """
     run_psql(base_cmd, sql)
+    for insert_values in chunked_insert_value_blocks(corpus.rows):
+        run_psql(
+            base_cmd,
+            f"INSERT INTO {table_name} (id, category, embedding) VALUES\n{insert_values};",
+        )
 
 
 def apply_mixed_live_dead_workload(base_cmd: list[str], table_name: str, corpus: Corpus) -> None:
@@ -576,8 +778,17 @@ def build_index(
     method: str,
     turboquant_probes: Optional[int],
     turboquant_oversample_factor: Optional[int],
+    turboquant_max_visited_codes: Optional[int],
+    turboquant_max_visited_pages: Optional[int],
 ) -> tuple[float, int, int, dict]:
-    spec = method_spec(method, corpus, turboquant_probes, turboquant_oversample_factor)
+    spec = method_spec(
+        method,
+        corpus,
+        turboquant_probes,
+        turboquant_oversample_factor,
+        turboquant_max_visited_codes,
+        turboquant_max_visited_pages,
+    )
     build_sql = f"""
     DROP INDEX IF EXISTS {index_name};
     CREATE INDEX {index_name}
@@ -707,6 +918,152 @@ def fetch_simd_metadata(base_cmd: list[str], spec: dict) -> dict:
     return metadata
 
 
+def default_scan_stats(method: str) -> dict:
+    if method == "turboquant_flat":
+        mode = "flat"
+        score_mode = "code_domain"
+        score_kernel = "scalar"
+    elif method == "turboquant_ivf":
+        mode = "ivf"
+        score_mode = "code_domain"
+        score_kernel = "scalar"
+    elif method == "turboquant_bitmap":
+        mode = "bitmap"
+        score_mode = "bitmap_filter"
+        score_kernel = "none"
+    else:
+        mode = "none"
+        score_mode = "none"
+        score_kernel = "none"
+
+    return {
+        "mode": mode,
+        "score_mode": score_mode,
+        "score_kernel": score_kernel,
+        "configured_probe_count": 0,
+        "nominal_probe_count": 0,
+        "effective_probe_count": 0,
+        "max_visited_codes": 0,
+        "max_visited_pages": 0,
+        "selected_list_count": 0,
+        "selected_live_count": 0,
+        "visited_page_count": 0,
+        "visited_code_count": 0,
+        "retained_candidate_count": 0,
+        "candidate_heap_capacity": 0,
+        "candidate_heap_count": 0,
+        "decoded_vector_count": 0,
+        "page_prune_count": 0,
+        "early_stop_count": 0,
+    }
+
+
+def aggregate_scan_stats(scan_stats: list[dict], fallback_method: str) -> dict:
+    if not scan_stats:
+        return default_scan_stats(fallback_method)
+
+    numeric_keys = (
+        "configured_probe_count",
+        "nominal_probe_count",
+        "effective_probe_count",
+        "max_visited_codes",
+        "max_visited_pages",
+        "selected_list_count",
+        "selected_live_count",
+        "visited_page_count",
+        "visited_code_count",
+        "retained_candidate_count",
+        "candidate_heap_capacity",
+        "candidate_heap_count",
+        "decoded_vector_count",
+        "page_prune_count",
+        "early_stop_count",
+    )
+    aggregated = {
+        "mode": scan_stats[0].get("mode", default_scan_stats(fallback_method)["mode"]),
+        "score_mode": scan_stats[0].get("score_mode", default_scan_stats(fallback_method)["score_mode"]),
+        "score_kernel": scan_stats[0].get("score_kernel", default_scan_stats(fallback_method)["score_kernel"]),
+    }
+    for key in numeric_keys:
+        values = [float(item.get(key, 0)) for item in scan_stats]
+        aggregated[key] = round(sum(values) / max(1, len(values)), 6)
+    return aggregated
+
+
+def scenario_benchmark_metadata(index_metadata: dict) -> dict:
+    list_distribution = index_metadata.get("list_distribution", {})
+    list_count = int(index_metadata.get("list_count", 0))
+    live_count = int(index_metadata.get("live_count", index_metadata.get("heap_live_rows", 0) or 0))
+    avg_list_size = float(
+        list_distribution.get(
+            "avg_live_count",
+            round(live_count / list_count, 2) if list_count > 0 else 0.0,
+        )
+    )
+    max_list_size = int(list_distribution.get("max_live_count", 0))
+    return {
+        "list_balance": {
+            "list_count": list_count,
+            "live_count": live_count,
+            "avg_list_size": round(avg_list_size, 2),
+            "max_list_size": max_list_size,
+        }
+    }
+
+
+def query_turboquant_ordered_scan_stats(
+    base_cmd: list[str],
+    table_name: str,
+    query_vector: tuple[float, ...],
+    limit: int,
+    query_setup: list[str],
+    method: str,
+) -> dict:
+    query_sql = ";\n".join(
+        query_setup
+        + [
+            (
+                "SELECT coalesce(json_agg(id ORDER BY id), '[]'::json)::text "
+                f"FROM (SELECT id FROM {table_name} "
+                f"ORDER BY embedding <=> '{vector_literal(query_vector)}'::vector LIMIT {limit}) ranked"
+            )
+        ]
+    )
+    rows = query_psql_commands(
+        base_cmd,
+        query_sql + ";\nSELECT tq_last_scan_stats()::text;",
+    )
+    return json.loads(rows[1]) if len(rows) > 1 else default_scan_stats(method)
+
+
+def query_bitmap_ids_and_scan_stats(
+    base_cmd: list[str],
+    table_name: str,
+    query_vector: tuple[float, ...],
+    category: int,
+    threshold: float,
+    query_setup: list[str],
+) -> tuple[list[int], dict]:
+    query_sql = ";\n".join(
+        query_setup
+        + [
+            (
+                "SELECT coalesce(json_agg(id ORDER BY id), '[]'::json)::text "
+                f"FROM {table_name} "
+                f"WHERE category = {category} "
+                f"AND embedding <?=> tq_bitmap_cosine_filter('{vector_literal(query_vector)}'::vector, {threshold})"
+            )
+        ]
+    )
+    rows = query_psql_commands(
+        base_cmd,
+        query_sql + ";\nSELECT tq_last_scan_stats()::text;",
+    )
+    query_ids = list(json.loads(rows[0])) if rows else []
+    scan_stats = json.loads(rows[1]) if len(rows) > 1 else default_scan_stats("turboquant_bitmap")
+    return query_ids, scan_stats
+
+
 def query_top_ids(
     base_cmd: list[str],
     table_name: str,
@@ -742,21 +1099,15 @@ def query_bitmap_ids(
     threshold: float,
     query_setup: list[str],
 ) -> list[int]:
-    query_sql = ";\n".join(
-        query_setup
-        + [
-            (
-                "SELECT coalesce(json_agg(id ORDER BY id), '[]'::json)::text "
-                f"FROM {table_name} "
-                f"WHERE category = {category} "
-                f"AND embedding <?=> tq_bitmap_cosine_filter('{vector_literal(query_vector)}'::vector, {threshold})"
-            )
-        ]
+    query_ids, _ = query_bitmap_ids_and_scan_stats(
+        base_cmd,
+        table_name,
+        query_vector,
+        category,
+        threshold,
+        query_setup,
     )
-    raw = query_psql(base_cmd, query_sql)
-    if not raw:
-        return []
-    return list(json.loads(raw))
+    return query_ids
 
 
 def average_recall(exact_results: list[list[int]], approx_results: list[list[int]], k: int) -> float:
@@ -899,6 +1250,8 @@ def run_scenario(
     scenario_index: int,
     turboquant_probes: Optional[int],
     turboquant_oversample_factor: Optional[int],
+    turboquant_max_visited_codes: Optional[int],
+    turboquant_max_visited_pages: Optional[int],
     requested_rerank_candidate_limit: Optional[int],
 ) -> dict:
     table_name = f"tq_benchmark_{scenario_index:04d}"
@@ -913,6 +1266,8 @@ def run_scenario(
         method,
         turboquant_probes,
         turboquant_oversample_factor,
+        turboquant_max_visited_codes,
+        turboquant_max_visited_pages,
     )
 
     if corpus.name == "mixed_live_dead":
@@ -926,6 +1281,7 @@ def run_scenario(
     exact_results = [exact_top_ids(corpus, query, TOP_K_VALUES[-1]) for query in corpus.queries]
     approx_results = []
     latencies_ms = []
+    scan_stats_results = []
 
     if spec.get("query_mode") == "bitmap_filter":
         exact_results = [
@@ -936,42 +1292,78 @@ def run_scenario(
         for query_index, query in enumerate(corpus.queries):
             best_ids = []
             best_latency_ms = None
+            best_scan_stats = default_scan_stats(method)
             for _ in range(repetitions):
                 started = time.perf_counter()
-                query_ids = query_bitmap_ids(
-                    base_cmd,
-                    table_name,
-                    query,
-                    query_index % 2,
-                    spec["bitmap_threshold"],
-                    spec["query_setup"],
-                )
+                if spec["index_method"] == "turboquant":
+                    query_ids, query_scan_stats = query_bitmap_ids_and_scan_stats(
+                        base_cmd,
+                        table_name,
+                        query,
+                        query_index % 2,
+                        spec["bitmap_threshold"],
+                        spec["query_setup"],
+                    )
+                else:
+                    query_ids = query_bitmap_ids(
+                        base_cmd,
+                        table_name,
+                        query,
+                        query_index % 2,
+                        spec["bitmap_threshold"],
+                        spec["query_setup"],
+                    )
+                    query_scan_stats = default_scan_stats(method)
                 elapsed_ms = (time.perf_counter() - started) * 1000.0
                 if best_latency_ms is None or elapsed_ms < best_latency_ms:
                     best_latency_ms = elapsed_ms
                     best_ids = query_ids
+                    best_scan_stats = query_scan_stats
             approx_results.append(best_ids)
             latencies_ms.append(best_latency_ms or 0.0)
+            scan_stats_results.append(best_scan_stats)
     else:
         for query in corpus.queries:
             best_ids = []
             best_latency_ms = None
+            best_scan_stats = default_scan_stats(method)
             for _ in range(repetitions):
                 started = time.perf_counter()
-                query_ids = query_top_ids(
-                    base_cmd,
-                    table_name,
-                    query,
-                    TOP_K_VALUES[-1],
-                    spec["query_setup"],
-                    requested_rerank_candidate_limit,
-                )
+                if spec["index_method"] == "turboquant":
+                    query_ids = query_top_ids(
+                        base_cmd,
+                        table_name,
+                        query,
+                        TOP_K_VALUES[-1],
+                        spec["query_setup"],
+                        requested_rerank_candidate_limit,
+                    )
+                    query_scan_stats = query_turboquant_ordered_scan_stats(
+                        base_cmd,
+                        table_name,
+                        query,
+                        TOP_K_VALUES[-1],
+                        spec["query_setup"],
+                        method,
+                    )
+                else:
+                    query_ids = query_top_ids(
+                        base_cmd,
+                        table_name,
+                        query,
+                        TOP_K_VALUES[-1],
+                        spec["query_setup"],
+                        requested_rerank_candidate_limit,
+                    )
+                    query_scan_stats = default_scan_stats(method)
                 elapsed_ms = (time.perf_counter() - started) * 1000.0
                 if best_latency_ms is None or elapsed_ms < best_latency_ms:
                     best_latency_ms = elapsed_ms
                     best_ids = query_ids
+                    best_scan_stats = query_scan_stats
             approx_results.append(best_ids)
             latencies_ms.append(best_latency_ms or 0.0)
+            scan_stats_results.append(best_scan_stats)
 
     insert_wal_bytes, inserted_rows = measure_insert_wal(base_cmd, table_name, corpus)
     concurrent_insert_rows_per_second, concurrent_insert_rows, concurrent_insert_workers = (
@@ -999,6 +1391,12 @@ def run_scenario(
         sealed_baseline_insert_wal_bytes = 0
         sealed_baseline_maintenance_wal_bytes = 0
 
+    aggregated_scan_stats = aggregate_scan_stats(scan_stats_results, method)
+    if spec["index_method"] == "turboquant":
+        simd_metadata["code_domain_kernel"] = aggregated_scan_stats.get("score_kernel", "scalar")
+    else:
+        simd_metadata["code_domain_kernel"] = "none"
+
     scenario = {
         "corpus": corpus.name,
         "method": method,
@@ -1017,7 +1415,9 @@ def run_scenario(
         },
         "query_knobs": spec["query_knobs"],
         "index_metadata": index_metadata,
+        "benchmark_metadata": scenario_benchmark_metadata(index_metadata),
         "simd": simd_metadata,
+        "scan_stats": aggregated_scan_stats,
     }
     if spec.get("query_mode") == "bitmap_filter":
         scenario["query_api"] = {
@@ -1082,9 +1482,23 @@ def dry_run_scenario(
     method: str,
     turboquant_probes: Optional[int],
     turboquant_oversample_factor: Optional[int],
+    turboquant_max_visited_codes: Optional[int],
+    turboquant_max_visited_pages: Optional[int],
     requested_rerank_candidate_limit: Optional[int],
 ) -> dict:
-    spec = method_spec(method, corpus, turboquant_probes, turboquant_oversample_factor)
+    spec = method_spec(
+        method,
+        corpus,
+        turboquant_probes,
+        turboquant_oversample_factor,
+        turboquant_max_visited_codes,
+        turboquant_max_visited_pages,
+    )
+    simd_metadata = synthetic_simd_metadata()
+    scan_stats = default_scan_stats(method)
+    scan_stats["score_kernel"] = synthetic_code_domain_kernel(corpus, spec, simd_metadata)
+    simd_metadata["code_domain_kernel"] = scan_stats["score_kernel"]
+
     scenario = {
         "corpus": corpus.name,
         "method": method,
@@ -1103,8 +1517,20 @@ def dry_run_scenario(
         },
         "query_knobs": spec["query_knobs"],
         "index_metadata": synthetic_index_metadata(method, spec, corpus),
-        "simd": synthetic_simd_metadata(),
+        "benchmark_metadata": scenario_benchmark_metadata(synthetic_index_metadata(method, spec, corpus)),
+        "simd": simd_metadata,
+        "scan_stats": scan_stats,
     }
+    if method == "turboquant_ivf":
+        scenario["scan_stats"].update(
+            {
+                "configured_probe_count": spec["query_knobs"]["turboquant.probes"],
+                "nominal_probe_count": spec["query_knobs"]["turboquant.probes"],
+                "effective_probe_count": spec["query_knobs"]["turboquant.probes"],
+                "max_visited_codes": spec["query_knobs"]["turboquant.max_visited_codes"],
+                "max_visited_pages": spec["query_knobs"]["turboquant.max_visited_pages"],
+            }
+        )
     if spec.get("query_mode") == "bitmap_filter":
         scenario["query_api"] = {
             "helper": "tq_bitmap_cosine_filter",
@@ -1168,6 +1594,8 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--turboquant-probes", type=int)
     parser.add_argument("--turboquant-oversample-factor", type=int)
+    parser.add_argument("--turboquant-max-visited-codes", type=int)
+    parser.add_argument("--turboquant-max-visited-pages", type=int)
     parser.add_argument("--rerank-candidate-limit", type=int)
     parser.add_argument("--report", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -1206,6 +1634,8 @@ def main() -> None:
                         method,
                         args.turboquant_probes,
                         args.turboquant_oversample_factor,
+                        args.turboquant_max_visited_codes,
+                        args.turboquant_max_visited_pages,
                         args.rerank_candidate_limit,
                     )
                 )
@@ -1219,6 +1649,8 @@ def main() -> None:
                         scenario_index,
                         args.turboquant_probes,
                         args.turboquant_oversample_factor,
+                        args.turboquant_max_visited_codes,
+                        args.turboquant_max_visited_pages,
                         args.rerank_candidate_limit,
                     )
                 )

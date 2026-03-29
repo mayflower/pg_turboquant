@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Sequence
 
 from .outcome_report import write_outcome_html
+from .regression_gate import evaluate_hotpot_regression_gate
 
 
 COMPARATIVE_METHOD_VARIANTS = [
@@ -136,6 +138,18 @@ def _method_variant(method_id: str) -> dict[str, object]:
 def _retrieval_row(scenario: dict[str, object], result: dict[str, object]) -> dict[str, object]:
     metrics = result.get("metrics", {})
     run_metadata = result.get("run_metadata", {})
+    scan_stats = result.get("operational_summary", {}).get("scan_stats", {})
+    index_metadata = run_metadata.get("index_metadata", {}) or {}
+    router = index_metadata.get("router", {}) if isinstance(index_metadata, dict) else {}
+    list_distribution = index_metadata.get("list_distribution", {}) if isinstance(index_metadata, dict) else {}
+    footprint_bytes = run_metadata.get("footprint_bytes")
+    live_count = index_metadata.get("live_count") if isinstance(index_metadata, dict) else None
+    avg_selected_list_count = _avg_or_p50(scan_stats.get("selected_list_count"))
+    avg_selected_live_count = _avg_or_p50(scan_stats.get("selected_live_count"))
+    avg_visited_page_count = _avg_or_p50(scan_stats.get("visited_page_count"))
+    avg_visited_code_count = _avg_or_p50(scan_stats.get("visited_code_count"))
+    avg_effective_probe_count = _avg_or_p50(scan_stats.get("effective_probe_count"))
+    avg_page_prune_count = _avg_or_p50(scan_stats.get("page_prune_count"))
     row = {
         "dataset_id": scenario["dataset_id"],
         "method_id": scenario["method_id"],
@@ -143,7 +157,26 @@ def _retrieval_row(scenario: dict[str, object], result: dict[str, object]) -> di
         "rerank_enabled": scenario["rerank_enabled"],
         "recall@10": metrics.get("recall@10"),
         "latency_p95_ms": metrics.get("latency_p95_ms"),
-        "footprint_bytes": run_metadata.get("footprint_bytes"),
+        "footprint_bytes": footprint_bytes,
+        "avg_selected_list_count": avg_selected_list_count,
+        "avg_selected_live_count": avg_selected_live_count,
+        "avg_visited_page_count": avg_visited_page_count,
+        "avg_visited_code_count": avg_visited_code_count,
+        "avg_effective_probe_count": avg_effective_probe_count,
+        "avg_page_prune_count": avg_page_prune_count,
+        "visited_code_fraction": _scan_work_fraction(avg_visited_code_count, live_count),
+        "visited_page_fraction": _scan_work_fraction(
+            avg_visited_page_count,
+            _estimated_index_pages(footprint_bytes),
+        ),
+        "score_mode": _uniform_value(scan_stats.get("score_mode")),
+        "page_prune_count_p50": scan_stats.get("page_prune_count", {}).get("p50"),
+        "early_stop_count_p50": scan_stats.get("early_stop_count", {}).get("p50"),
+        "visited_code_count_p50": scan_stats.get("visited_code_count", {}).get("p50"),
+        "router_restarts": router.get("restart_count"),
+        "router_balance_penalty": router.get("balance_penalty"),
+        "max_list_size": list_distribution.get("max_list_size"),
+        "list_coeff_var": list_distribution.get("coeff_var"),
     }
     return row
 
@@ -168,7 +201,7 @@ def _build_report(
     retrieval_rows: Sequence[dict[str, object]],
     end_to_end_rows: Sequence[dict[str, object]],
 ) -> dict[str, object]:
-    return {
+    report = {
         "summary": {
             "dataset_count": len(plan["datasets"]),
             "retrieval_scenario_count": len(retrieval_rows),
@@ -202,6 +235,10 @@ def _build_report(
             "Footprint fields are only as precise as the saved run metadata for each scenario.",
         ],
     }
+    regression_gate = _build_regression_gate(plan, retrieval_rows)
+    if regression_gate is not None:
+        report["regression_gate"] = regression_gate
+    return report
 
 
 def _find_best_rows(
@@ -259,13 +296,20 @@ def _render_markdown_report(
         "",
         "## Retrieval-Only Comparison",
         "",
-        "| Dataset | Method | Recall@10 | P95 Latency (ms) | Footprint (bytes) |",
-        "|---|---|---:|---:|---:|",
+        "| Dataset | Method | Recall@10 | P95 Latency (ms) | Footprint (bytes) | avg_selected_list_count | avg_selected_live_count | avg_visited_page_count | avg_visited_code_count | avg_effective_probe_count | avg_page_prune_count | visited_code_fraction | visited_page_fraction | score_mode | router_restarts | router_balance_penalty | max_list_size | list_coeff_var |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|",
     ]
     for row in retrieval_rows:
         lines.append(
             f"| {row['dataset_id']} | {row['method_id']} | "
-            f"{_fmt(row['recall@10'])} | {_fmt(row['latency_p95_ms'])} | {_fmt(row['footprint_bytes'])} |"
+            f"{_fmt(row['recall@10'])} | {_fmt(row['latency_p95_ms'])} | {_fmt(row['footprint_bytes'])} | "
+            f"{_fmt(row['avg_selected_list_count'])} | {_fmt(row['avg_selected_live_count'])} | "
+            f"{_fmt(row['avg_visited_page_count'])} | {_fmt(row['avg_visited_code_count'])} | "
+            f"{_fmt(row['avg_effective_probe_count'])} | {_fmt(row['avg_page_prune_count'])} | "
+            f"{_fmt(row['visited_code_fraction'])} | {_fmt(row['visited_page_fraction'])} | "
+            f"{_fmt(row['score_mode'])} | {_fmt(row['router_restarts'])} | "
+            f"{_fmt(row['router_balance_penalty'])} | {_fmt(row['max_list_size'])} | "
+            f"{_fmt(row['list_coeff_var'])} |"
         )
 
     lines.extend(
@@ -282,6 +326,27 @@ def _render_markdown_report(
             f"| {row['dataset_id']} | {row['method_id']} | "
             f"{_fmt(row['answer_exact_match'])} | {_fmt(row['answer_f1'])} | {_fmt(row['total_latency_p95_ms'])} |"
         )
+
+    if "regression_gate" in report:
+        gate = report["regression_gate"]
+        lines.extend(
+            [
+                "",
+                "## Regression Gate",
+                "",
+                f"- Dataset: {gate['dataset_id']}",
+                f"- Method: {gate['method_id']}",
+                f"- Passed: {_fmt(gate['passed'])}",
+                "",
+                "| Check | Passed | Observed | Threshold |",
+                "|---|---|---:|---:|",
+            ]
+        )
+        for name, check in gate["checks"].items():
+            threshold = check.get("minimum", check.get("maximum", check.get("expected", "")))
+            lines.append(
+                f"| {name} | {_fmt(check['passed'])} | {_fmt(check.get('observed'))} | {_fmt(threshold)} |"
+            )
 
     lines.extend(["", "## Narrative Findings", ""])
     for section_name, label in (
@@ -303,6 +368,64 @@ def _render_markdown_report(
         lines.append(f"- {caveat}")
     lines.append("")
     return "\n".join(lines)
+
+
+def _build_regression_gate(
+    plan: dict[str, object],
+    retrieval_rows: Sequence[dict[str, object]],
+) -> dict[str, object] | None:
+    raw_configs = plan.get("regression_gate")
+    if not isinstance(raw_configs, dict) or not raw_configs:
+        return None
+
+    configs = [config for config in raw_configs.values() if isinstance(config, dict)]
+    if not configs:
+        return None
+    if len(configs) == 1:
+        return evaluate_hotpot_regression_gate(
+            retrieval_rows=retrieval_rows,
+            gate_config=configs[0],
+        )
+
+    evaluations = [
+        evaluate_hotpot_regression_gate(retrieval_rows=retrieval_rows, gate_config=config)
+        for config in configs
+    ]
+    return {
+        "passed": all(item["passed"] for item in evaluations),
+        "evaluations": evaluations,
+    }
+
+
+def _avg_or_p50(distribution: object) -> float | None:
+    if not isinstance(distribution, dict):
+        return None
+    value = distribution.get("avg", distribution.get("p50"))
+    return None if value is None else float(value)
+
+
+def _uniform_value(distribution: object) -> object:
+    if not isinstance(distribution, dict):
+        return None
+    return distribution.get("uniform")
+
+
+def _scan_work_fraction(numerator: float | None, denominator: object) -> float | None:
+    if numerator is None or denominator is None:
+        return None
+    denominator_value = float(denominator)
+    if denominator_value <= 0.0:
+        return None
+    return round(numerator / denominator_value, 6)
+
+
+def _estimated_index_pages(footprint_bytes: object) -> int | None:
+    if footprint_bytes is None:
+        return None
+    footprint = int(footprint_bytes)
+    if footprint <= 0:
+        return None
+    return max(1, math.ceil(footprint / 8192))
 
 
 def _fmt(value: object) -> str:
