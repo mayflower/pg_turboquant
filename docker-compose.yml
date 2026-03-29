@@ -1,0 +1,12 @@
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.dev
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+    environment:
+      PG_CONFIG: /usr/lib/postgresql/16/bin/pg_config
+    command: sleep infinity
+

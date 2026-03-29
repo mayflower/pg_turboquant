@@ -1,0 +1,46 @@
+{
+  "retrieval": {
+    "kilt_nq:pg_turboquant_approx": {"footprint_bytes": 120000, "metrics": {"recall@10": 0.82, "latency_p50_ms": 10.0, "latency_p95_ms": 18.0}},
+    "kilt_nq:pg_turboquant_rerank": {"footprint_bytes": 121000, "metrics": {"recall@10": 0.86, "latency_p50_ms": 13.0, "latency_p95_ms": 22.0}},
+    "kilt_nq:pgvector_hnsw_approx": {"footprint_bytes": 155000, "metrics": {"recall@10": 0.80, "latency_p50_ms": 9.0, "latency_p95_ms": 16.0}},
+    "kilt_nq:pgvector_hnsw_rerank": {"footprint_bytes": 156000, "metrics": {"recall@10": 0.84, "latency_p50_ms": 12.0, "latency_p95_ms": 21.0}},
+    "kilt_nq:pgvector_ivfflat_approx": {"footprint_bytes": 148000, "metrics": {"recall@10": 0.76, "latency_p50_ms": 8.0, "latency_p95_ms": 15.0}},
+    "kilt_nq:pgvector_ivfflat_rerank": {"footprint_bytes": 149000, "metrics": {"recall@10": 0.81, "latency_p50_ms": 11.0, "latency_p95_ms": 20.0}},
+
+    "kilt_hotpotqa:pg_turboquant_approx": {"footprint_bytes": 125000, "metrics": {"recall@10": 0.70, "latency_p50_ms": 11.0, "latency_p95_ms": 19.0}},
+    "kilt_hotpotqa:pg_turboquant_rerank": {"footprint_bytes": 126000, "metrics": {"recall@10": 0.77, "latency_p50_ms": 15.0, "latency_p95_ms": 24.0}},
+    "kilt_hotpotqa:pgvector_hnsw_approx": {"footprint_bytes": 160000, "metrics": {"recall@10": 0.72, "latency_p50_ms": 10.0, "latency_p95_ms": 17.0}},
+    "kilt_hotpotqa:pgvector_hnsw_rerank": {"footprint_bytes": 161000, "metrics": {"recall@10": 0.76, "latency_p50_ms": 14.0, "latency_p95_ms": 23.0}},
+    "kilt_hotpotqa:pgvector_ivfflat_approx": {"footprint_bytes": 151000, "metrics": {"recall@10": 0.68, "latency_p50_ms": 9.0, "latency_p95_ms": 16.0}},
+    "kilt_hotpotqa:pgvector_ivfflat_rerank": {"footprint_bytes": 152000, "metrics": {"recall@10": 0.74, "latency_p50_ms": 13.0, "latency_p95_ms": 22.0}},
+
+    "popqa:pg_turboquant_approx": {"footprint_bytes": 118000, "metrics": {"recall@10": 0.79, "latency_p50_ms": 9.0, "latency_p95_ms": 17.0}},
+    "popqa:pg_turboquant_rerank": {"footprint_bytes": 119000, "metrics": {"recall@10": 0.83, "latency_p50_ms": 12.0, "latency_p95_ms": 21.0}},
+    "popqa:pgvector_hnsw_approx": {"footprint_bytes": 153000, "metrics": {"recall@10": 0.78, "latency_p50_ms": 8.0, "latency_p95_ms": 15.0}},
+    "popqa:pgvector_hnsw_rerank": {"footprint_bytes": 154000, "metrics": {"recall@10": 0.82, "latency_p50_ms": 11.0, "latency_p95_ms": 20.0}},
+    "popqa:pgvector_ivfflat_approx": {"footprint_bytes": 145000, "metrics": {"recall@10": 0.74, "latency_p50_ms": 8.0, "latency_p95_ms": 14.0}},
+    "popqa:pgvector_ivfflat_rerank": {"footprint_bytes": 146000, "metrics": {"recall@10": 0.80, "latency_p50_ms": 10.0, "latency_p95_ms": 19.0}}
+  },
+  "end_to_end": {
+    "kilt_nq:pg_turboquant_approx": {"answer_metrics": {"answer_exact_match": 0.47, "answer_f1": 0.61}, "total_latency_p50_ms": 28.0, "total_latency_p95_ms": 42.0, "total_latency_p99_ms": 48.0},
+    "kilt_nq:pg_turboquant_rerank": {"answer_metrics": {"answer_exact_match": 0.52, "answer_f1": 0.66}, "total_latency_p50_ms": 34.0, "total_latency_p95_ms": 49.0, "total_latency_p99_ms": 56.0},
+    "kilt_nq:pgvector_hnsw_approx": {"answer_metrics": {"answer_exact_match": 0.45, "answer_f1": 0.59}, "total_latency_p50_ms": 24.0, "total_latency_p95_ms": 37.0, "total_latency_p99_ms": 43.0},
+    "kilt_nq:pgvector_hnsw_rerank": {"answer_metrics": {"answer_exact_match": 0.49, "answer_f1": 0.63}, "total_latency_p50_ms": 31.0, "total_latency_p95_ms": 45.0, "total_latency_p99_ms": 51.0},
+    "kilt_nq:pgvector_ivfflat_approx": {"answer_metrics": {"answer_exact_match": 0.41, "answer_f1": 0.55}, "total_latency_p50_ms": 22.0, "total_latency_p95_ms": 35.0, "total_latency_p99_ms": 41.0},
+    "kilt_nq:pgvector_ivfflat_rerank": {"answer_metrics": {"answer_exact_match": 0.46, "answer_f1": 0.60}, "total_latency_p50_ms": 29.0, "total_latency_p95_ms": 43.0, "total_latency_p99_ms": 49.0},
+
+    "kilt_hotpotqa:pg_turboquant_approx": {"answer_metrics": {"answer_exact_match": 0.35, "answer_f1": 0.50}, "total_latency_p50_ms": 30.0, "total_latency_p95_ms": 45.0, "total_latency_p99_ms": 52.0},
+    "kilt_hotpotqa:pg_turboquant_rerank": {"answer_metrics": {"answer_exact_match": 0.41, "answer_f1": 0.56}, "total_latency_p50_ms": 37.0, "total_latency_p95_ms": 53.0, "total_latency_p99_ms": 60.0},
+    "kilt_hotpotqa:pgvector_hnsw_approx": {"answer_metrics": {"answer_exact_match": 0.36, "answer_f1": 0.51}, "total_latency_p50_ms": 27.0, "total_latency_p95_ms": 40.0, "total_latency_p99_ms": 47.0},
+    "kilt_hotpotqa:pgvector_hnsw_rerank": {"answer_metrics": {"answer_exact_match": 0.40, "answer_f1": 0.55}, "total_latency_p50_ms": 35.0, "total_latency_p95_ms": 50.0, "total_latency_p99_ms": 57.0},
+    "kilt_hotpotqa:pgvector_ivfflat_approx": {"answer_metrics": {"answer_exact_match": 0.32, "answer_f1": 0.47}, "total_latency_p50_ms": 25.0, "total_latency_p95_ms": 38.0, "total_latency_p99_ms": 45.0},
+    "kilt_hotpotqa:pgvector_ivfflat_rerank": {"answer_metrics": {"answer_exact_match": 0.38, "answer_f1": 0.53}, "total_latency_p50_ms": 33.0, "total_latency_p95_ms": 48.0, "total_latency_p99_ms": 55.0},
+
+    "popqa:pg_turboquant_approx": {"answer_metrics": {"answer_exact_match": 0.50, "answer_f1": 0.65}, "total_latency_p50_ms": 27.0, "total_latency_p95_ms": 39.0, "total_latency_p99_ms": 45.0},
+    "popqa:pg_turboquant_rerank": {"answer_metrics": {"answer_exact_match": 0.55, "answer_f1": 0.69}, "total_latency_p50_ms": 33.0, "total_latency_p95_ms": 46.0, "total_latency_p99_ms": 53.0},
+    "popqa:pgvector_hnsw_approx": {"answer_metrics": {"answer_exact_match": 0.48, "answer_f1": 0.63}, "total_latency_p50_ms": 23.0, "total_latency_p95_ms": 34.0, "total_latency_p99_ms": 40.0},
+    "popqa:pgvector_hnsw_rerank": {"answer_metrics": {"answer_exact_match": 0.53, "answer_f1": 0.67}, "total_latency_p50_ms": 30.0, "total_latency_p95_ms": 43.0, "total_latency_p99_ms": 49.0},
+    "popqa:pgvector_ivfflat_approx": {"answer_metrics": {"answer_exact_match": 0.44, "answer_f1": 0.59}, "total_latency_p50_ms": 21.0, "total_latency_p95_ms": 32.0, "total_latency_p99_ms": 38.0},
+    "popqa:pgvector_ivfflat_rerank": {"answer_metrics": {"answer_exact_match": 0.51, "answer_f1": 0.64}, "total_latency_p50_ms": 28.0, "total_latency_p95_ms": 41.0, "total_latency_p99_ms": 47.0}
+  }
+}

@@ -1,0 +1,20 @@
+DROP EXTENSION IF EXISTS pg_turboquant CASCADE;
+NOTICE:  extension "pg_turboquant" does not exist, skipping
+DROP EXTENSION IF EXISTS vector CASCADE;
+NOTICE:  extension "vector" does not exist, skipping
+CREATE EXTENSION vector;
+CREATE EXTENSION pg_turboquant;
+SELECT extname = 'pg_turboquant' AS extension_present
+FROM pg_extension
+WHERE extname = 'pg_turboquant';
+ extension_present 
+-------------------
+ t
+(1 row)
+
+SELECT tq_smoke();
+   tq_smoke    
+---------------
+ pg_turboquant
+(1 row)
+

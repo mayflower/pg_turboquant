@@ -1,0 +1,55 @@
+SET client_min_messages = warning;
+DROP EXTENSION IF EXISTS pg_turboquant CASCADE;
+DROP EXTENSION IF EXISTS vector CASCADE;
+CREATE EXTENSION vector;
+CREATE EXTENSION pg_turboquant;
+
+CREATE TABLE tq_capability_docs (
+	id int4 PRIMARY KEY,
+	category int4 NOT NULL,
+	payload text NOT NULL,
+	embedding vector(4)
+);
+
+INSERT INTO tq_capability_docs (id, category, payload, embedding) VALUES
+	(1, 1, 'alpha', '[1,0,0,0]'),
+	(2, 1, 'beta', '[0.98,0.02,0,0]'),
+	(3, 2, 'gamma', '[0,1,0,0]');
+
+CREATE INDEX tq_capability_embedding_idx
+	ON tq_capability_docs
+	USING turboquant (embedding tq_cosine_ops)
+	WITH (
+		bits = 4,
+		lists = 0,
+		lanes = auto,
+		transform = 'hadamard',
+		normalized = true
+	);
+
+VACUUM (ANALYZE) tq_capability_docs;
+
+SELECT
+	meta #>> '{capabilities,index_only_scan}' AS index_only_scan,
+	meta #>> '{capabilities,multicolumn}' AS multicolumn,
+	meta #>> '{capabilities,include_columns}' AS include_columns,
+	meta #>> '{capabilities,bitmap_scan}' AS bitmap_scan
+FROM (SELECT tq_index_metadata('tq_capability_embedding_idx'::regclass) AS meta) AS s;
+
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+
+EXPLAIN (COSTS OFF)
+SELECT embedding
+FROM tq_capability_docs
+ORDER BY embedding <=> '[1,0,0,0]'::vector(4)
+LIMIT 2;
+
+CREATE INDEX tq_capability_multicol_idx
+	ON tq_capability_docs
+	USING turboquant (embedding tq_cosine_ops, category);
+
+CREATE INDEX tq_capability_include_idx
+	ON tq_capability_docs
+	USING turboquant (embedding tq_cosine_ops)
+	INCLUDE (payload);

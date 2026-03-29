@@ -1,0 +1,16 @@
+FROM postgres:16-bookworm
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    curl \
+    git \
+    perl \
+    postgresql-server-dev-16 \
+    libipc-run-perl \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace

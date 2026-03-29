@@ -1,0 +1,6 @@
+comment = 'pg_turboquant bootstrap extension'
+default_version = '0.1.4'
+module_pathname = '$libdir/pg_turboquant'
+relocatable = true
+requires = 'vector'
+superuser = true

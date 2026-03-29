@@ -1,0 +1,9 @@
+{
+  "campaign_kind": "comparative_rag",
+  "datasets": ["kilt_nq", "kilt_hotpotqa", "popqa"],
+  "generator_id": "fixed-debug-generator",
+  "execution": {
+    "mode": "fixture_payload",
+    "fixture_path": "toy_campaign_fixture.json"
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "harness": "beir",
+  "dataset_id": "beir_tiny_smoke",
+  "fixture_path": "benchmarks/rag/configs/regression/beir_tiny_smoke_fixture.json",
+  "top_k": 2,
+  "metric": "cosine"
+}

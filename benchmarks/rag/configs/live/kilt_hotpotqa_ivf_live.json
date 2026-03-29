@@ -1,0 +1,52 @@
+{
+  "dataset": {
+    "name": "kilt_hotpotqa_ivf_live",
+    "version": "2026-03-29",
+    "source_path": "hf://kilt_tasks/hotpotqa[validation][:10000]"
+  },
+  "embedding": {
+    "model": "BAAI/bge-small-en-v1.5",
+    "dimension": 384,
+    "normalized": false
+  },
+  "chunking": {
+    "strategy": "question_answer_seed",
+    "chunk_size": 1,
+    "chunk_overlap": 0
+  },
+  "schema": {
+    "documents_table": "rag_documents",
+    "passages_table": "rag_passages"
+  },
+  "backends": [
+    {
+      "kind": "pg_turboquant",
+      "index_name": "rag_passages_tq_idx",
+      "metric": "cosine",
+      "mode": "approx",
+      "options": {
+        "lists": 64,
+        "bits": 4
+      }
+    },
+    {
+      "kind": "pgvector_hnsw",
+      "index_name": "rag_passages_hnsw_idx",
+      "metric": "cosine",
+      "mode": "approx",
+      "options": {
+        "m": 16,
+        "ef_construction": 64
+      }
+    },
+    {
+      "kind": "pgvector_ivfflat",
+      "index_name": "rag_passages_ivf_idx",
+      "metric": "cosine",
+      "mode": "approx",
+      "options": {
+        "lists": 64
+      }
+    }
+  ]
+}

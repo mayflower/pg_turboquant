@@ -1,0 +1,20 @@
+DROP EXTENSION IF EXISTS pg_turboquant CASCADE;
+DROP EXTENSION IF EXISTS vector CASCADE;
+CREATE EXTENSION vector;
+CREATE EXTENSION pg_turboquant;
+SELECT amname, amtype
+FROM pg_am
+WHERE amname = 'turboquant';
+   amname   | amtype 
+------------+--------
+ turboquant | i
+(1 row)
+
+SELECT proname, pg_get_function_result(oid) AS result_type
+FROM pg_proc
+WHERE proname = 'turboquanthandler';
+      proname      |   result_type    
+-------------------+------------------
+ turboquanthandler | index_am_handler
+(1 row)
+

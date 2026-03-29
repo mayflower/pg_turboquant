@@ -1,0 +1,59 @@
+DROP EXTENSION IF EXISTS pg_turboquant CASCADE;
+NOTICE:  drop cascades to index tq_ivf_docs_embedding_tq_idx
+DROP EXTENSION IF EXISTS vector CASCADE;
+NOTICE:  drop cascades to column embedding of table tq_ivf_docs
+CREATE EXTENSION vector;
+CREATE EXTENSION pg_turboquant;
+CREATE TABLE tq_maintenance_docs (
+	id int4 PRIMARY KEY,
+	embedding vector(4)
+);
+INSERT INTO tq_maintenance_docs (id, embedding) VALUES
+	(1, '[1,0,0,0]'),
+	(2, '[0,1,0,0]'),
+	(3, '[0,0,1,0]');
+CREATE INDEX tq_maintenance_docs_embedding_tq_idx
+	ON tq_maintenance_docs
+	USING turboquant (embedding tq_cosine_ops)
+	WITH (
+		bits = 4,
+		lists = 0,
+		lanes = auto,
+		transform = 'hadamard',
+		normalized = true
+	);
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+INSERT INTO tq_maintenance_docs (id, embedding)
+VALUES (4, '[0,0,0,1]');
+SELECT id
+FROM tq_maintenance_docs
+ORDER BY embedding <=> '[0,0,0,1]'
+LIMIT 1;
+ id 
+----
+  4
+(1 row)
+
+DELETE FROM tq_maintenance_docs
+WHERE id = 1;
+VACUUM tq_maintenance_docs;
+SELECT id
+FROM tq_maintenance_docs
+ORDER BY embedding <=> '[0,0,0,1]'
+LIMIT 1;
+ id 
+----
+  4
+(1 row)
+
+REINDEX INDEX tq_maintenance_docs_embedding_tq_idx;
+SELECT id
+FROM tq_maintenance_docs
+ORDER BY embedding <=> '[0,0,0,1]'
+LIMIT 1;
+ id 
+----
+  4
+(1 row)
+

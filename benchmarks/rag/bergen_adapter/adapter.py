@@ -1,0 +1,162 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Callable, Mapping, Protocol, Sequence
+
+
+VALID_METRICS = frozenset({"cosine", "inner_product", "l2"})
+
+
+@dataclass(frozen=True)
+class PassageTable:
+    table_name: str
+    id_column: str
+    text_column: str
+    embedding_column: str
+    query_vector_cast: str = "vector"
+
+
+@dataclass(frozen=True)
+class RetrievalRequest:
+    query_vector: Sequence[float]
+    top_k: int
+    metric: str
+    ann: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class RetrievalPlan:
+    sql: str
+    params: tuple[Any, ...]
+    session_statements: list[tuple[str, tuple[Any, ...]]]
+
+
+class PostgresBackend(Protocol):
+    name: str
+
+    def build_plan(self, table: PassageTable, request: RetrievalRequest) -> RetrievalPlan:
+        ...
+
+
+def vector_literal(values: Sequence[float]) -> str:
+    return "[" + ",".join(str(value) for value in values) + "]"
+
+
+def render_session_statement(sql: str, params: Sequence[Any]) -> str:
+    rendered = sql
+    for value in params:
+        rendered = rendered.replace("%s", render_sql_literal(value), 1)
+    return rendered
+
+
+def render_sql_literal(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str):
+        return "'" + value.replace("'", "''") + "'"
+    raise TypeError(f"unsupported SQL literal type for session statement: {type(value).__name__}")
+
+
+@dataclass(frozen=True)
+class StaticAnnBackend:
+    name: str
+    metric_operators: Mapping[str, str]
+    ann_setting_gucs: Mapping[str, str] = field(default_factory=dict)
+
+    def build_plan(self, table: PassageTable, request: RetrievalRequest) -> RetrievalPlan:
+        metric = validate_metric(request.metric)
+        operator = self.metric_operators.get(metric)
+        if operator is None:
+            raise ValueError(f"backend {self.name} does not support metric: {metric}")
+        session_statements = []
+        for key, value in request.ann.items():
+            guc = self.ann_setting_gucs.get(key)
+            if guc is None or value is None:
+                continue
+            session_statements.append((f"SET LOCAL {guc} = %s", (value,)))
+
+        sql = (
+            f"WITH query_vector AS (SELECT %s::{table.query_vector_cast} AS embedding) "
+            f"SELECT {table.id_column} AS doc_id, "
+            f"{table.embedding_column} {operator} query_vector.embedding AS score, "
+            f"{table.text_column} AS passage_text "
+            f"FROM {table.table_name} "
+            f"CROSS JOIN query_vector "
+            f"ORDER BY {table.embedding_column} {operator} query_vector.embedding ASC "
+            f"LIMIT %s"
+        )
+        literal = vector_literal(request.query_vector)
+        return RetrievalPlan(
+            sql=sql,
+            params=(literal, request.top_k),
+            session_statements=session_statements,
+        )
+
+
+class ExactMetricBackend(StaticAnnBackend):
+    def __init__(self) -> None:
+        super().__init__(
+            name="exact_metric",
+            metric_operators={
+                "cosine": "<=>",
+                "inner_product": "<#>",
+                "l2": "<->",
+            },
+        )
+
+
+class PostgresRetrieverAdapter:
+    def __init__(
+        self,
+        *,
+        dsn: str,
+        table: PassageTable,
+        backend: PostgresBackend,
+        connect_fn: Callable[[str], Any],
+    ) -> None:
+        self.dsn = dsn
+        self.table = table
+        self.backend = backend
+        self.connect_fn = connect_fn
+
+    def build_plan(self, request: RetrievalRequest) -> RetrievalPlan:
+        return self.backend.build_plan(self.table, request)
+
+    def normalize_rows(self, rows: Sequence[Any]) -> list[dict[str, Any]]:
+        normalized = []
+        for row in rows:
+            if isinstance(row, Mapping):
+                doc_id = row["doc_id"]
+                score = row["score"]
+                text = row["passage_text"]
+            else:
+                doc_id, score, text = row
+
+            if isinstance(text, bytes):
+                text = text.decode("utf-8")
+
+            normalized.append(
+                {
+                    "id": str(doc_id),
+                    "score": float(score),
+                    "text": str(text),
+                }
+            )
+        return normalized
+
+    def retrieve(self, request: RetrievalRequest) -> list[dict[str, Any]]:
+        plan = self.build_plan(request)
+        with self.connect_fn(self.dsn) as connection:
+            with connection.cursor() as cursor:
+                for sql, params in plan.session_statements:
+                    cursor.execute(render_session_statement(sql, params))
+                cursor.execute(plan.sql, plan.params)
+                return self.normalize_rows(cursor.fetchall())
+
+
+def validate_metric(metric: str) -> str:
+    if metric not in VALID_METRICS:
+        raise ValueError(f"unsupported metric: {metric}")
+    return metric

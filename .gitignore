@@ -1,0 +1,61 @@
+# macOS and editor noise
+.DS_Store
+.idea/
+.vscode/
+
+# Python environments and caches
+.venv/
+**/.venv/
+__pycache__/
+**/__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.pyc
+*.pyo
+*.pyd
+
+# Build products
+*.o
+*.so
+*.dylib
+*.bc
+*.a
+
+# Logs and temporary output
+*.log
+*.tmp
+*.swp
+*.swo
+log/
+tmp_check/
+tmp_install/
+tmp_installcheck/
+results/
+regression.diffs
+
+# Local benchmark and run artifacts
+benchmarks/rag/results/
+benchmarks/rag/vendor/
+docs/corrections/
+
+# Downloaded or machine-local third party material
+third_party/perl5/
+third_party/pgvector/
+third_party/postgresql-source/
+
+# Local-only planning and agent files
+AGENTS.md
+prompts/
+.codex/
+.cursor/
+.claude/
+.aider*
+
+# Local developer state
+.env
+.env.*
+
+# Local test binaries
+tests/unit/test_smoke
+tests/unit/test_smoke.dSYM/

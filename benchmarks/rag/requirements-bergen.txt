@@ -1,0 +1,4 @@
+# Local entrypoint for the BERGEN benchmark environment.
+# The bootstrap script vendors BERGEN into benchmarks/rag/vendor/bergen
+# at the pinned upstream ref before this file is installed.
+-r vendor/bergen/requirements.txt

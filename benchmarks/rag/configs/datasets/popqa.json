@@ -1,0 +1,30 @@
+{
+  "dataset_id": "popqa",
+  "display_name": "PopQA",
+  "stress_focus": "entity_factual_retrieval",
+  "source": {
+    "kind": "bergen_dataset",
+    "dataset": "popqa",
+    "split": "test"
+  },
+  "retrieval_profile": {
+    "top_k_default": 15,
+    "rerank_top_k_default": 80
+  },
+  "evidence": {
+    "enabled": false,
+    "handling": "none"
+  },
+  "answer_metrics": [
+    "answer_exact_match",
+    "answer_f1"
+  ],
+  "stable_passage_id_fields": [
+    "subject_id",
+    "passage_id"
+  ],
+  "capabilities": [
+    "entity_factual_retrieval",
+    "popular_entity_recall"
+  ]
+}

@@ -1,0 +1,165 @@
+DO $$
+BEGIN
+	IF to_regclass('public.tq_admin_docs') IS NOT NULL THEN
+		EXECUTE 'DROP TABLE public.tq_admin_docs CASCADE';
+	END IF;
+END;
+$$;
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_turboquant;
+DROP EXTENSION IF EXISTS pg_turboquant CASCADE;
+DROP EXTENSION IF EXISTS vector CASCADE;
+RESET client_min_messages;
+CREATE EXTENSION vector;
+CREATE EXTENSION pg_turboquant;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+CREATE TABLE tq_query_helper_docs (
+	id int4 PRIMARY KEY,
+	embedding vector(4)
+);
+INSERT INTO tq_query_helper_docs (id, embedding) VALUES
+	(1, '[1,0,0,0]'),
+	(2, '[0.9,0.1,0,0]'),
+	(3, '[0.6,0.8,0,0]'),
+	(4, '[0,1,0,0]');
+CREATE INDEX tq_query_helper_docs_idx
+	ON tq_query_helper_docs
+	USING turboquant (embedding tq_cosine_ops)
+	WITH (
+		bits = 4,
+		lists = 0,
+		lanes = auto,
+		transform = 'hadamard',
+		normalized = true
+	);
+SELECT * FROM tq_recommended_query_knobs(24, 10);
+ probes | oversample_factor 
+--------+-------------------
+      3 |                 8
+(1 row)
+
+SELECT *
+FROM tq_approx_candidates(
+	'tq_query_helper_docs'::regclass,
+	'id',
+	'embedding',
+	'[1,0,0,0]'::vector(4),
+	'cosine',
+	3,
+	1,
+	4
+);
+ candidate_id | approximate_rank | approximate_distance 
+--------------+------------------+----------------------
+ 1            |                1 |                    0
+ 2            |                2 |             0.006116
+ 3            |                3 |                  0.4
+(3 rows)
+
+WITH approx AS MATERIALIZED (
+	SELECT
+		id::text AS candidate_id,
+		row_number() OVER (ORDER BY embedding <=> '[1,0,0,0]'::vector(4), id) AS approximate_rank,
+		round((embedding <=> '[1,0,0,0]'::vector(4))::numeric, 6)::float8 AS approximate_distance
+	FROM tq_query_helper_docs
+	ORDER BY embedding <=> '[1,0,0,0]'::vector(4), id
+	LIMIT 3
+)
+SELECT candidate_id, approximate_rank, approximate_distance
+FROM approx
+ORDER BY approximate_rank;
+ candidate_id | approximate_rank | approximate_distance 
+--------------+------------------+----------------------
+ 1            |                1 |                    0
+ 2            |                2 |             0.006116
+ 3            |                3 |                  0.4
+(3 rows)
+
+SELECT *
+FROM tq_rerank_candidates(
+	'tq_query_helper_docs'::regclass,
+	'id',
+	'embedding',
+	'[1,0,0,0]'::vector(4),
+	'cosine',
+	3,
+	2,
+	1,
+	4
+);
+ candidate_id | approximate_rank | approximate_distance | exact_rank | exact_distance 
+--------------+------------------+----------------------+------------+----------------
+ 1            |                1 |                    0 |          1 |              0
+ 2            |                2 |             0.006116 |          2 |       0.006116
+(2 rows)
+
+WITH approx AS MATERIALIZED (
+	SELECT
+		id::text AS candidate_id,
+		id AS candidate_key,
+		embedding AS candidate_embedding,
+		row_number() OVER (ORDER BY embedding <=> '[1,0,0,0]'::vector(4), id) AS approximate_rank,
+		round((embedding <=> '[1,0,0,0]'::vector(4))::numeric, 6)::float8 AS approximate_distance
+	FROM tq_query_helper_docs
+	ORDER BY embedding <=> '[1,0,0,0]'::vector(4), id
+	LIMIT 3
+), reranked AS (
+	SELECT
+		candidate_id,
+		approximate_rank,
+		approximate_distance,
+		row_number() OVER (ORDER BY candidate_embedding <=> '[1,0,0,0]'::vector(4), candidate_key) AS exact_rank,
+		round((candidate_embedding <=> '[1,0,0,0]'::vector(4))::numeric, 6)::float8 AS exact_distance
+	FROM approx
+)
+SELECT candidate_id, approximate_rank, approximate_distance, exact_rank, exact_distance
+FROM reranked
+WHERE exact_rank <= 2
+ORDER BY exact_rank;
+ candidate_id | approximate_rank | approximate_distance | exact_rank | exact_distance 
+--------------+------------------+----------------------+------------+----------------
+ 1            |                1 |                    0 |          1 |              0
+ 2            |                2 |             0.006116 |          2 |       0.006116
+(2 rows)
+
+SELECT * FROM tq_recommended_query_knobs(0, 1);
+ERROR:  invalid turboquant candidate_limit: 0
+HINT:  candidate_limit must be at least 1.
+CONTEXT:  PL/pgSQL function tq_resolve_query_knobs(integer,integer,integer,integer) line 4 at RAISE
+SQL function "tq_recommended_query_knobs" statement 1
+SELECT * FROM tq_recommended_query_knobs(4, 8);
+ERROR:  invalid turboquant limits: final_limit (8) exceeds candidate_limit (4)
+HINT:  final_limit must be less than or equal to candidate_limit.
+CONTEXT:  PL/pgSQL function tq_resolve_query_knobs(integer,integer,integer,integer) line 20 at RAISE
+SQL function "tq_recommended_query_knobs" statement 1
+SELECT *
+FROM tq_approx_candidates(
+	'tq_query_helper_docs'::regclass,
+	'id',
+	'embedding',
+	'[1,0,0,0]'::vector(4),
+	'angular',
+	3
+);
+ERROR:  invalid turboquant metric: angular
+HINT:  Use one of: cosine, ip, l2.
+CONTEXT:  PL/pgSQL function tq_metric_order_operator(text) line 11 at RAISE
+PL/pgSQL function tq_approx_candidates(regclass,name,name,vector,text,integer,integer,integer) line 8 at assignment
+SELECT *
+FROM tq_rerank_candidates(
+	'tq_query_helper_docs'::regclass,
+	'id',
+	'embedding',
+	'[1,0,0,0]'::vector(4),
+	'cosine',
+	2,
+	3
+);
+ERROR:  invalid turboquant limits: final_limit (3) exceeds candidate_limit (2)
+HINT:  final_limit must be less than or equal to candidate_limit.
+CONTEXT:  PL/pgSQL function tq_resolve_query_knobs(integer,integer,integer,integer) line 20 at RAISE
+SQL statement "SELECT knobs.probes, knobs.oversample_factor
+	                                           FROM tq_resolve_query_knobs(candidate_limit, final_limit, probes, oversample_factor) AS knobs"
+PL/pgSQL function tq_rerank_candidates(regclass,name,name,vector,text,integer,integer,integer,integer) line 10 at SQL statement

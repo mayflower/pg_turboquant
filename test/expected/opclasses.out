@@ -1,0 +1,140 @@
+SET client_min_messages = warning;
+DROP EXTENSION IF EXISTS pg_turboquant CASCADE;
+DROP EXTENSION IF EXISTS vector CASCADE;
+RESET client_min_messages;
+CREATE EXTENSION vector;
+CREATE EXTENSION pg_turboquant;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+CREATE TABLE tq_ip_docs (
+	id int4 PRIMARY KEY,
+	embedding vector(4)
+);
+INSERT INTO tq_ip_docs (id, embedding) VALUES
+	(1, '[1,0,0,0]'),
+	(2, '[0,1,0,0]'),
+	(3, '[0.70710678,0.70710678,0,0]');
+CREATE INDEX tq_ip_docs_embedding_tq_idx
+	ON tq_ip_docs
+	USING turboquant (embedding tq_ip_ops)
+	WITH (
+		bits = 4,
+		lists = 0,
+		lanes = auto,
+		transform = 'hadamard',
+		normalized = true
+	);
+EXPLAIN (COSTS OFF)
+SELECT id
+FROM tq_ip_docs
+ORDER BY embedding <#> '[1,0,0,0]'
+LIMIT 1;
+                            QUERY PLAN                            
+------------------------------------------------------------------
+ Limit
+   ->  Index Scan using tq_ip_docs_embedding_tq_idx on tq_ip_docs
+         Order By: (embedding <#> '[1,0,0,0]'::vector)
+(3 rows)
+
+SELECT id
+FROM tq_ip_docs
+ORDER BY embedding <#> '[1,0,0,0]'
+LIMIT 1;
+ id 
+----
+  1
+(1 row)
+
+WITH approx AS (
+	SELECT id, embedding
+	FROM tq_ip_docs
+	ORDER BY embedding <#> '[1,0,0,0]'
+	LIMIT 2
+)
+SELECT id
+FROM approx
+ORDER BY inner_product(embedding, '[1,0,0,0]') DESC
+LIMIT 1;
+ id 
+----
+  1
+(1 row)
+
+CREATE TABLE tq_l2_docs (
+	id int4 PRIMARY KEY,
+	embedding vector(4)
+);
+INSERT INTO tq_l2_docs (id, embedding) VALUES
+	(1, '[1,0,0,0]'),
+	(2, '[0,1,0,0]'),
+	(3, '[0,0,1,0]');
+CREATE INDEX tq_l2_docs_embedding_tq_idx
+	ON tq_l2_docs
+	USING turboquant (embedding tq_l2_ops)
+	WITH (
+		bits = 4,
+		lists = 0,
+		lanes = auto,
+		transform = 'hadamard',
+		normalized = true
+	);
+EXPLAIN (COSTS OFF)
+SELECT id
+FROM tq_l2_docs
+ORDER BY embedding <-> '[1,0,0,0]'
+LIMIT 1;
+                            QUERY PLAN                            
+------------------------------------------------------------------
+ Limit
+   ->  Index Scan using tq_l2_docs_embedding_tq_idx on tq_l2_docs
+         Order By: (embedding <-> '[1,0,0,0]'::vector)
+(3 rows)
+
+SELECT id
+FROM tq_l2_docs
+ORDER BY embedding <-> '[1,0,0,0]'
+LIMIT 1;
+ id 
+----
+  1
+(1 row)
+
+CREATE TABLE tq_halfvec_docs (
+	id int4 PRIMARY KEY,
+	embedding halfvec(4)
+);
+INSERT INTO tq_halfvec_docs (id, embedding) VALUES
+	(1, '[1,0,0,0]'),
+	(2, '[0,1,0,0]'),
+	(3, '[0.70710678,0.70710678,0,0]');
+CREATE INDEX tq_halfvec_docs_embedding_tq_idx
+	ON tq_halfvec_docs
+	USING turboquant (embedding tq_halfvec_cosine_ops)
+	WITH (
+		bits = 4,
+		lists = 0,
+		lanes = auto,
+		transform = 'hadamard',
+		normalized = true
+	);
+EXPLAIN (COSTS OFF)
+SELECT id
+FROM tq_halfvec_docs
+ORDER BY embedding <=> '[1,0,0,0]'::halfvec(4)
+LIMIT 1;
+                                 QUERY PLAN                                 
+----------------------------------------------------------------------------
+ Limit
+   ->  Index Scan using tq_halfvec_docs_embedding_tq_idx on tq_halfvec_docs
+         Order By: (embedding <=> '[1,0,0,0]'::halfvec(4))
+(3 rows)
+
+SELECT id
+FROM tq_halfvec_docs
+ORDER BY embedding <=> '[1,0,0,0]'::halfvec(4)
+LIMIT 1;
+ id 
+----
+  1
+(1 row)
+

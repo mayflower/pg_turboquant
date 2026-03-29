@@ -1,0 +1,31 @@
+{
+  "dataset_id": "asqa",
+  "display_name": "ASQA",
+  "stress_focus": "ambiguous_long_form_support",
+  "source": {
+    "kind": "bergen_dataset",
+    "dataset": "asqa",
+    "split": "dev"
+  },
+  "retrieval_profile": {
+    "top_k_default": 40,
+    "rerank_top_k_default": 150
+  },
+  "evidence": {
+    "enabled": true,
+    "handling": "context_support_coverage"
+  },
+  "answer_metrics": [
+    "answer_f1",
+    "answer_rouge_l",
+    "answer_str_em"
+  ],
+  "stable_passage_id_fields": [
+    "ambiguity_set_id",
+    "passage_id"
+  ],
+  "capabilities": [
+    "ambiguous_long_form_support",
+    "context_coverage"
+  ]
+}

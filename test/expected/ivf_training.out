@@ -1,0 +1,90 @@
+SET client_min_messages = warning;
+DROP EXTENSION IF EXISTS pg_turboquant CASCADE;
+DROP EXTENSION IF EXISTS vector CASCADE;
+CREATE EXTENSION vector;
+CREATE EXTENSION pg_turboquant;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET turboquant.probes = 2;
+CREATE TABLE tq_ivf_training_docs (
+	id int4 PRIMARY KEY,
+	embedding vector(2)
+);
+INSERT INTO tq_ivf_training_docs (id, embedding) VALUES
+	(1, '[1.0,0.0]'),
+	(2, '[0.98,0.02]'),
+	(3, '[0.0,1.0]'),
+	(4, '[0.02,0.98]'),
+	(5, '[-1.0,0.0]'),
+	(6, '[-0.98,0.02]'),
+	(7, '[0.0,-1.0]'),
+	(8, '[0.02,-0.98]');
+CREATE INDEX tq_ivf_training_idx
+	ON tq_ivf_training_docs
+	USING turboquant (embedding tq_cosine_ops)
+	WITH (
+		bits = 4,
+		lists = 4,
+		lanes = auto,
+		transform = 'hadamard',
+		normalized = true,
+		router_samples = 8,
+		router_iterations = 6,
+		router_seed = 7
+	);
+SELECT tq_debug_router_metadata('tq_ivf_training_idx'::regclass);
+                               tq_debug_router_metadata                               
+--------------------------------------------------------------------------------------
+ seed=7 sample_count=8 trained_vector_count=8 max_iterations=6 completed_iterations=2
+(1 row)
+
+SELECT array_agg(id) AS approx_clustered_ids
+FROM (
+	SELECT id
+	FROM tq_ivf_training_docs
+	ORDER BY embedding <=> '[1.0,0.0]'
+	LIMIT 4
+) ranked;
+ approx_clustered_ids 
+----------------------
+ {1,2,7,8}
+(1 row)
+
+CREATE TABLE tq_ivf_sparse_docs (
+	id int4 PRIMARY KEY,
+	embedding vector(2)
+);
+INSERT INTO tq_ivf_sparse_docs (id, embedding) VALUES
+	(1, '[1.0,0.0]'),
+	(2, '[0.0,1.0]');
+CREATE INDEX tq_ivf_sparse_idx
+	ON tq_ivf_sparse_docs
+	USING turboquant (embedding tq_cosine_ops)
+	WITH (
+		bits = 4,
+		lists = 4,
+		lanes = auto,
+		transform = 'hadamard',
+		normalized = true,
+		router_samples = 2,
+		router_iterations = 4,
+		router_seed = 11
+	);
+SELECT tq_debug_router_metadata('tq_ivf_sparse_idx'::regclass);
+                               tq_debug_router_metadata                                
+---------------------------------------------------------------------------------------
+ seed=11 sample_count=2 trained_vector_count=2 max_iterations=4 completed_iterations=2
+(1 row)
+
+SELECT array_agg(id) AS sparse_ids
+FROM (
+	SELECT id
+	FROM tq_ivf_sparse_docs
+	ORDER BY embedding <=> '[1.0,0.0]'
+	LIMIT 2
+) ranked;
+ sparse_ids 
+------------
+ {1}
+(1 row)
+

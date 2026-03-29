@@ -1,0 +1,30 @@
+{
+  "dataset_id": "kilt_triviaqa",
+  "display_name": "KILT TriviaQA",
+  "stress_focus": "factual_retrieval",
+  "source": {
+    "kind": "bergen_dataset",
+    "dataset": "kilt_triviaqa",
+    "split": "dev"
+  },
+  "retrieval_profile": {
+    "top_k_default": 20,
+    "rerank_top_k_default": 100
+  },
+  "evidence": {
+    "enabled": true,
+    "handling": "support_passage_match"
+  },
+  "answer_metrics": [
+    "answer_exact_match",
+    "answer_f1"
+  ],
+  "stable_passage_id_fields": [
+    "wikipedia_id",
+    "passage_id"
+  ],
+  "capabilities": [
+    "factual_retrieval",
+    "long_tail_entity_recall"
+  ]
+}

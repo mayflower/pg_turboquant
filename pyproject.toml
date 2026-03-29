@@ -1,0 +1,8 @@
+[project]
+name = "pg-turboquant"
+version = "0.0.0"
+description = "Repository-local Python tooling for pg_turboquant benchmarks and RAG harnesses"
+requires-python = ">=3.11"
+
+[tool.uv]
+package = false

@@ -1,0 +1,16 @@
+{
+  "queries": [
+    {
+      "query_id": "q1",
+      "query_text": "alpha",
+      "query_vector": [1.0, 0.0],
+      "relevant_ids": ["d1"]
+    },
+    {
+      "query_id": "q2",
+      "query_text": "beta",
+      "query_vector": [0.0, 1.0],
+      "relevant_ids": ["d2"]
+    }
+  ]
+}

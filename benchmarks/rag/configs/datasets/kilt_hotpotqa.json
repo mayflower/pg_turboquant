@@ -1,0 +1,31 @@
+{
+  "dataset_id": "kilt_hotpotqa",
+  "display_name": "KILT HotpotQA",
+  "stress_focus": "multi_hop_retrieval",
+  "source": {
+    "kind": "bergen_dataset",
+    "dataset": "kilt_hotpotqa",
+    "split": "dev"
+  },
+  "retrieval_profile": {
+    "top_k_default": 30,
+    "rerank_top_k_default": 120
+  },
+  "evidence": {
+    "enabled": true,
+    "handling": "supporting_fact_coverage"
+  },
+  "answer_metrics": [
+    "answer_exact_match",
+    "answer_f1",
+    "supporting_fact_f1"
+  ],
+  "stable_passage_id_fields": [
+    "wikipedia_id",
+    "passage_id"
+  ],
+  "capabilities": [
+    "multi_hop_retrieval",
+    "supporting_fact_alignment"
+  ]
+}

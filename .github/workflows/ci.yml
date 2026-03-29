@@ -1,0 +1,53 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        postgresql_version: [16, 17]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add PostgreSQL apt repository
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ca-certificates curl gnupg
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor -o /usr/share/keyrings/postgresql.gpg
+          echo "deb [signed-by=/usr/share/keyrings/postgresql.gpg] http://apt.postgresql.org/pub/repos/apt noble-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            perl \
+            postgresql-${{ matrix.postgresql_version }} \
+            postgresql-client-${{ matrix.postgresql_version }} \
+            postgresql-server-dev-${{ matrix.postgresql_version }} \
+            postgresql-contrib-${{ matrix.postgresql_version }} \
+            libipc-run-perl
+
+      - name: Bootstrap dependency
+        env:
+          PG_CONFIG: /usr/lib/postgresql/${{ matrix.postgresql_version }}/bin/pg_config
+        run: ./scripts/bootstrap_dev.sh
+
+      - name: Build and test
+        env:
+          PG_CONFIG: /usr/lib/postgresql/${{ matrix.postgresql_version }}/bin/pg_config
+        run: |
+          export PATH="/usr/lib/postgresql/${{ matrix.postgresql_version }}/bin:$PATH"
+          make
+          make install
+          make unitcheck
+          make installcheck
+          make tapcheck

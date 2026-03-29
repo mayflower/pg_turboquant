@@ -1,0 +1,61 @@
+CREATE EXTENSION IF NOT EXISTS vector;
+NOTICE:  extension "vector" already exists, skipping
+CREATE EXTENSION IF NOT EXISTS pg_turboquant;
+NOTICE:  extension "pg_turboquant" already exists, skipping
+CREATE TABLE tq_transform_contract_docs (
+	id int4 PRIMARY KEY,
+	embedding vector(5)
+);
+INSERT INTO tq_transform_contract_docs (id, embedding) VALUES
+	(1, '[1,0,0,0,0]'),
+	(2, '[0,1,0,0,0]'),
+	(3, '[0,0,1,0,0]'),
+	(4, '[0,0,0,1,0]'),
+	(5, '[0,0,0,0,1]');
+CREATE INDEX tq_transform_contract_idx
+ON tq_transform_contract_docs
+USING turboquant (embedding tq_cosine_ops)
+WITH (
+	bits = 4,
+	lists = 0,
+	lanes = auto,
+	transform = 'hadamard',
+	normalized = true
+);
+SELECT tq_debug_transform_metadata('tq_transform_contract_idx'::regclass);
+                   tq_debug_transform_metadata                   
+-----------------------------------------------------------------
+ transform_version=1 input_dimension=5 output_dimension=8 seed=0
+(1 row)
+
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT id
+FROM tq_transform_contract_docs
+ORDER BY embedding <=> '[1,0,0,0,0]'
+LIMIT 3;
+ id 
+----
+  1
+  2
+  3
+(3 rows)
+
+REINDEX INDEX tq_transform_contract_idx;
+SELECT tq_debug_transform_metadata('tq_transform_contract_idx'::regclass);
+                   tq_debug_transform_metadata                   
+-----------------------------------------------------------------
+ transform_version=1 input_dimension=5 output_dimension=8 seed=0
+(1 row)
+
+SELECT id
+FROM tq_transform_contract_docs
+ORDER BY embedding <=> '[1,0,0,0,0]'
+LIMIT 3;
+ id 
+----
+  1
+  2
+  3
+(3 rows)
+
