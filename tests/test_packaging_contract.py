@@ -10,16 +10,16 @@ SQL_DIR = ROOT / "sql"
 
 
 class PackagingContractTest(unittest.TestCase):
-    def test_control_declares_upgrade_target(self):
+    def test_control_declares_single_public_install_target(self):
         control = CONTROL.read_text(encoding="utf-8")
         default_match = re.search(r"^default_version\s*=\s*'([^']+)'", control, re.MULTILINE)
         self.assertIsNotNone(default_match)
         default_version = default_match.group(1)
 
-        self.assertNotEqual(
+        self.assertEqual(
             default_version,
             "0.1.0",
-            "default_version should move forward once upgrade scripts exist",
+            "first public release should expose a single install version",
         )
 
         install_script = SQL_DIR / f"pg_turboquant--{default_version}.sql"
@@ -28,22 +28,16 @@ class PackagingContractTest(unittest.TestCase):
             f"expected install script for default version {default_version}",
         )
 
-        self.assertTrue(
-            (SQL_DIR / "pg_turboquant--0.1.0--0.1.1.sql").exists(),
-            "expected an explicit upgrade script from 0.1.0 to 0.1.1",
+        install_scripts = sorted(SQL_DIR.glob("pg_turboquant--*.sql"))
+        upgrade_script_pattern = re.compile(r"^pg_turboquant--[^-]+--[^-]+\.sql$")
+        upgrade_scripts = [path for path in install_scripts if upgrade_script_pattern.match(path.name)]
+
+        self.assertEqual(
+            [path.name for path in install_scripts],
+            ["pg_turboquant--0.1.0.sql"],
+            "public release should ship one current install script",
         )
-        self.assertTrue(
-            (SQL_DIR / "pg_turboquant--0.1.1--0.1.2.sql").exists(),
-            "expected an explicit upgrade script from 0.1.1 to 0.1.2",
-        )
-        self.assertTrue(
-            (SQL_DIR / "pg_turboquant--0.1.2--0.1.3.sql").exists(),
-            "expected an explicit upgrade script from 0.1.2 to 0.1.3",
-        )
-        self.assertTrue(
-            (SQL_DIR / "pg_turboquant--0.1.3--0.1.4.sql").exists(),
-            "expected an explicit upgrade script from 0.1.3 to 0.1.4",
-        )
+        self.assertEqual(upgrade_scripts, [], "public release should not ship internal upgrade-history scripts")
 
     def test_ci_matrix_covers_pg16_and_pg17(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")

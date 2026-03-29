@@ -6,7 +6,8 @@ This documentation follows the Diataxis model so readers can choose the right le
 flowchart TD
     T["Tutorials"] --> T1["Getting Started"]
     H["How-to Guides"] --> H1["Install"]
-    H --> H2["Run Benchmarks"]
+    H --> H2["Install And Use In PostgreSQL"]
+    H --> H3["Run Benchmarks"]
     R["Reference"] --> R1["SQL API"]
     R --> R2["Index Options"]
     R --> R3["Benchmark Output"]
@@ -22,6 +23,7 @@ flowchart TD
 ## How-to guides
 
 - [Install the extension](how-to/install.md)
+- [Install and use it in PostgreSQL](how-to/install-and-use-in-postgres.md)
 - [Run the benchmark suite](how-to/run-benchmarks.md)
 
 ## Reference

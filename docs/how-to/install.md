@@ -30,6 +30,8 @@ CREATE EXTENSION vector;
 CREATE EXTENSION pg_turboquant;
 ```
 
+If you want a full PostgreSQL workflow with table DDL, index creation, and query examples, continue with [install-and-use-in-postgres.md](install-and-use-in-postgres.md).
+
 ## Validate the install
 
 ```sql
@@ -53,17 +55,6 @@ make unitcheck
 make installcheck
 make tapcheck
 ```
-
-## Upgrade path
-
-The repository currently carries a tested extension upgrade chain:
-
-- `0.1.0 -> 0.1.1`
-- `0.1.1 -> 0.1.2`
-- `0.1.2 -> 0.1.3`
-- `0.1.3 -> 0.1.4`
-
-Extension-version upgrades are separate from index page-format rebuild requirements. If you upgrade across a storage-format boundary, rebuild affected indexes with `REINDEX`.
 
 ## Common failure points
 

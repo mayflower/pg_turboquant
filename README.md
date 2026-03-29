@@ -72,17 +72,18 @@ FROM tq_rerank_candidates(
 
 ## Benchmark highlights
 
-The repository ships a benchmark harness and committed benchmark evidence. A few representative results from the checked-in artifacts:
+Representative checked-in retrieval results:
 
-- KILT NQ retrieval:
-  `pg_turboquant_approx` reached `recall@10 = 0.946667` with `1,277,952` bytes and `8.84 ms` p95 retrieval latency.
-  The same run recorded `5,079,040` bytes / `28.85 ms` for pgvector HNSW and `4,399,104` bytes / `49.49 ms` for pgvector IVFFlat at the same recall.
-- PopQA mini retrieval:
-  `pg_turboquant_rerank` used `24,576` bytes and `4.80 ms` p95 latency, versus `73,728` bytes / `5.41 ms` for pgvector HNSW rerank and `81,920` bytes / `5.98 ms` for pgvector IVFFlat rerank.
-- Planner tuning evidence:
-  a committed medium-profile IVF run recorded `candidate_slots_bound` rising from `4` to `16` and `recall_at_10` rising from `0.291667` to `0.733333` when `turboquant.probes` increased from `1` to `4`.
-- HotpotQA fixed-q50 retrieval:
-  TurboQuant kept the smallest footprint and matched top-line recall, but pgvector IVFFlat was materially faster on latency. The project does not claim universal latency wins.
+| Workload | Method | Recall@10 | P95 Latency (ms) | Footprint (bytes) |
+|---|---|---:|---:|---:|
+| KILT NQ | `pg_turboquant_approx` | 0.946667 | 8.836190 | 1,277,952 |
+| KILT NQ | `pgvector_hnsw_approx` | 0.946667 | 28.845381 | 5,079,040 |
+| KILT NQ | `pgvector_ivfflat_approx` | 0.946667 | 49.492140 | 4,399,104 |
+| PopQA mini | `pg_turboquant_rerank` | 1.000000 | 4.796433 | 24,576 |
+| PopQA mini | `pgvector_hnsw_rerank` | 1.000000 | 5.408724 | 73,728 |
+| PopQA mini | `pgvector_ivfflat_rerank` | 1.000000 | 5.975884 | 81,920 |
+| HotpotQA fixed-q50 | `pg_turboquant_approx` | 1.000000 | 64.991898 | 5,873,664 |
+| HotpotQA fixed-q50 | `pgvector_ivfflat_approx` | 1.000000 | 8.329492 | 17,563,648 |
 
 Those results are environment-specific. The benchmark harness keeps recall, latency, footprint, WAL, and concurrent-write measurements separate so tradeoffs remain visible instead of being collapsed into a single score.
 
@@ -93,6 +94,7 @@ The public docs follow Diataxis:
 - Tutorial: [docs/tutorials/getting-started.md](docs/tutorials/getting-started.md)
 - How-to:
   - [docs/how-to/install.md](docs/how-to/install.md)
+  - [docs/how-to/install-and-use-in-postgres.md](docs/how-to/install-and-use-in-postgres.md)
   - [docs/how-to/run-benchmarks.md](docs/how-to/run-benchmarks.md)
 - Reference:
   - [docs/reference/sql-api.md](docs/reference/sql-api.md)
@@ -110,7 +112,6 @@ The docs hub lives at [docs/README.md](docs/README.md).
 
 - PostgreSQL: 16 and 17
 - pgvector: required for `vector` and `halfvec`
-- Upgrade chain: `0.1.0 -> 0.1.1 -> 0.1.2 -> 0.1.3 -> 0.1.4`
 - Current support boundary:
   - single-column indexes only
   - no index-only scans

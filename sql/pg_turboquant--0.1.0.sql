@@ -33,6 +33,21 @@ RETURNS text
 LANGUAGE C STRICT
 AS 'MODULE_PATHNAME', 'tq_index_metadata_core';
 
+CREATE FUNCTION tq_runtime_simd_features_core()
+RETURNS text
+LANGUAGE C STRICT
+AS 'MODULE_PATHNAME', 'tq_runtime_simd_features_core';
+
+CREATE FUNCTION tq_runtime_simd_features()
+RETURNS jsonb
+LANGUAGE sql
+STABLE
+AS $$
+	SELECT tq_runtime_simd_features_core()::jsonb;
+$$;
+
+COMMENT ON FUNCTION tq_runtime_simd_features() IS 'Returns compile-time and runtime SIMD availability plus the preferred turboquant score kernel.';
+
 CREATE FUNCTION tq_index_metadata(indexed_index regclass)
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -67,12 +82,19 @@ BEGIN
 		'opclass', opclass_name,
 		'input_type', input_type,
 		'heap_relation', heap_relation::text,
-		'heap_live_rows', heap_live_rows
+		'heap_live_rows', heap_live_rows,
+		'capabilities', jsonb_build_object(
+			'ordered_scan', true,
+			'bitmap_scan', true,
+			'index_only_scan', false,
+			'multicolumn', false,
+			'include_columns', false
+		)
 	);
 END;
 $$;
 
-COMMENT ON FUNCTION tq_index_metadata(regclass) IS 'Returns stable JSON metadata and maintenance stats for a turboquant index.';
+COMMENT ON FUNCTION tq_index_metadata(regclass) IS 'Returns stable JSON metadata, capability flags, and maintenance stats for a turboquant index.';
 
 CREATE FUNCTION tq_metric_order_operator(metric text)
 RETURNS text
@@ -390,6 +412,53 @@ $$;
 COMMENT ON FUNCTION tq_rerank_candidates(regclass, name, name, vector, text, integer, integer, integer, integer) IS 'Returns approximate candidates reranked exactly within SQL over the candidate set.';
 COMMENT ON FUNCTION tq_rerank_candidates(regclass, name, name, halfvec, text, integer, integer, integer, integer) IS 'Returns approximate candidates reranked exactly within SQL over the candidate set.';
 
+CREATE FUNCTION tq_bitmap_cosine_filter(query_vector vector,
+										distance_threshold double precision)
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'tq_bitmap_cosine_filter'
+LANGUAGE C
+STRICT
+IMMUTABLE;
+
+CREATE FUNCTION tq_bitmap_cosine_filter(query_vector halfvec,
+										distance_threshold double precision)
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'tq_bitmap_cosine_filter_halfvec'
+LANGUAGE C
+STRICT
+IMMUTABLE;
+
+COMMENT ON FUNCTION tq_bitmap_cosine_filter(vector, double precision) IS 'Builds an internal turboquant cosine bitmap-filter payload.';
+COMMENT ON FUNCTION tq_bitmap_cosine_filter(halfvec, double precision) IS 'Builds an internal turboquant cosine bitmap-filter payload.';
+
+CREATE FUNCTION tq_bitmap_cosine_match(left_vector vector,
+									   filter bytea)
+RETURNS boolean
+AS 'MODULE_PATHNAME', 'tq_bitmap_cosine_match'
+LANGUAGE C
+STRICT
+IMMUTABLE;
+
+CREATE FUNCTION tq_bitmap_cosine_match(left_vector halfvec,
+									   filter bytea)
+RETURNS boolean
+AS 'MODULE_PATHNAME', 'tq_bitmap_cosine_match_halfvec'
+LANGUAGE C
+STRICT
+IMMUTABLE;
+
+CREATE OPERATOR <?=> (
+	LEFTARG = vector,
+	RIGHTARG = bytea,
+	PROCEDURE = tq_bitmap_cosine_match
+);
+
+CREATE OPERATOR <?=> (
+	LEFTARG = halfvec,
+	RIGHTARG = bytea,
+	PROCEDURE = tq_bitmap_cosine_match
+);
+
 CREATE FUNCTION turboquanthandler(internal)
 RETURNS index_am_handler
 AS 'MODULE_PATHNAME', 'turboquanthandler'
@@ -407,6 +476,7 @@ CREATE OPERATOR FAMILY tq_halfvec_l2_turboquant_ops USING turboquant;
 
 CREATE OPERATOR CLASS tq_cosine_ops
 DEFAULT FOR TYPE vector USING turboquant FAMILY tq_vector_cosine_turboquant_ops AS
+	OPERATOR 1 <?=> (vector, bytea),
 	OPERATOR 1 <=> (vector, vector) FOR ORDER BY float_ops,
 	FUNCTION 1 vector_negative_inner_product(vector, vector),
 	FUNCTION 2 vector_norm(vector);
@@ -423,6 +493,7 @@ FOR TYPE vector USING turboquant FAMILY tq_vector_l2_turboquant_ops AS
 
 CREATE OPERATOR CLASS tq_halfvec_cosine_ops
 DEFAULT FOR TYPE halfvec USING turboquant FAMILY tq_halfvec_cosine_turboquant_ops AS
+	OPERATOR 1 <?=> (halfvec, bytea),
 	OPERATOR 1 <=> (halfvec, halfvec) FOR ORDER BY float_ops,
 	FUNCTION 1 halfvec_negative_inner_product(halfvec, halfvec),
 	FUNCTION 2 l2_norm(halfvec);
