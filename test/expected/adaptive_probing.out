@@ -78,7 +78,7 @@ FROM (
 ) ranked;
  adaptive_on_ids 
 -----------------
- {14,15,16}
+ {100,101,102}
 (1 row)
 
 WITH stats AS (

@@ -208,7 +208,9 @@ class RagCampaignReportContractTest(unittest.TestCase):
             self.assertIn("router_balance_penalty", markdown)
             self.assertIn("max_list_size", markdown)
             self.assertIn("TurboQuant Outcome", report_html)
-            self.assertIn("Expected TurboQuant Profile", report_html)
+            self.assertIn("Measured Comparison Scope", report_html)
+            self.assertIn("Method Metrics", report_html)
+            self.assertIn("selected_page_count", report_html)
             self.assertIn("pgvector_hnsw_approx", report_html)
 
 

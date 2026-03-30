@@ -3,6 +3,7 @@
 #include <limits.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -22,6 +23,90 @@ tq_tuning_set_error(char *errmsg, size_t errmsg_len, const char *message)
 		return;
 
 	snprintf(errmsg, errmsg_len, "%s", message);
+}
+
+typedef struct TqProbeSelectionCandidate
+{
+	size_t		ranked_index;
+	double		score;
+	double		utility;
+	double		cost_fraction;
+	size_t		live_count;
+	size_t		page_count;
+} TqProbeSelectionCandidate;
+
+static double
+tq_probe_score_weight(double score, double best_score, double worst_score)
+{
+	double		span = best_score - worst_score;
+
+	if (!isfinite(score) || !isfinite(best_score) || !isfinite(worst_score))
+		return 1.0;
+
+	if (fabs(span) <= 1e-12)
+		return 1.0;
+
+	return 1.0 + ((score - worst_score) / span);
+}
+
+static double
+tq_probe_cost_fraction(size_t live_count,
+					   size_t page_count,
+					   size_t code_budget,
+					   size_t page_budget)
+{
+	double		fraction = 0.0;
+
+	if (code_budget > 0)
+		fraction = (double) live_count / (double) code_budget;
+
+	if (page_budget > 0)
+	{
+		double page_fraction = (double) page_count / (double) page_budget;
+
+		if (page_fraction > fraction)
+			fraction = page_fraction;
+	}
+
+	return fraction;
+}
+
+static int
+tq_probe_selection_candidate_compare(const void *left, const void *right)
+{
+	const TqProbeSelectionCandidate *lhs = (const TqProbeSelectionCandidate *) left;
+	const TqProbeSelectionCandidate *rhs = (const TqProbeSelectionCandidate *) right;
+
+	if (lhs->utility > rhs->utility)
+		return -1;
+	if (lhs->utility < rhs->utility)
+		return 1;
+	if (lhs->score > rhs->score)
+		return -1;
+	if (lhs->score < rhs->score)
+		return 1;
+	if (lhs->cost_fraction < rhs->cost_fraction)
+		return -1;
+	if (lhs->cost_fraction > rhs->cost_fraction)
+		return 1;
+	if (lhs->ranked_index < rhs->ranked_index)
+		return -1;
+	if (lhs->ranked_index > rhs->ranked_index)
+		return 1;
+	return 0;
+}
+
+static int
+tq_probe_selected_index_compare(const void *left, const void *right)
+{
+	const size_t *lhs = (const size_t *) left;
+	const size_t *rhs = (const size_t *) right;
+
+	if (*lhs < *rhs)
+		return -1;
+	if (*lhs > *rhs)
+		return 1;
+	return 0;
 }
 
 size_t
@@ -205,6 +290,171 @@ tq_choose_probe_budget(const uint32_t *ranked_live_counts,
 		result->effective_probe_count += 1;
 		result->selected_live_count += next_live;
 		result->selected_page_count += next_pages;
+	}
+
+	return true;
+}
+
+bool
+tq_select_cost_aware_probes(const double *ranked_scores,
+							const uint32_t *ranked_live_counts,
+							const uint32_t *ranked_page_counts,
+							size_t ranked_count,
+							int nominal_probes,
+							int max_visited_codes,
+							int max_visited_pages,
+							size_t *selected_indexes,
+							size_t selected_capacity,
+							size_t *selected_count,
+							TqProbeBudgetResult *result,
+							char *errmsg,
+							size_t errmsg_len)
+{
+	size_t nominal_count = 0;
+	size_t code_budget = 0;
+	size_t page_budget = 0;
+	size_t index = 0;
+	size_t chosen_count = 0;
+
+	if (ranked_live_counts == NULL
+		|| ranked_page_counts == NULL
+		|| selected_indexes == NULL
+		|| selected_count == NULL
+		|| result == NULL)
+	{
+		tq_tuning_set_error(errmsg, errmsg_len,
+							"invalid turboquant probe selection: counts, outputs, and result must be non-null");
+		return false;
+	}
+
+	if (nominal_probes <= 0)
+	{
+		tq_tuning_set_error(errmsg, errmsg_len,
+							"invalid turboquant probe selection: nominal probes must be positive");
+		return false;
+	}
+
+	if (max_visited_codes < 0 || max_visited_pages < 0)
+	{
+		tq_tuning_set_error(errmsg, errmsg_len,
+							"invalid turboquant probe selection: visit budgets must be non-negative");
+		return false;
+	}
+
+	memset(result, 0, sizeof(*result));
+	*selected_count = 0;
+	nominal_count = tq_positive_value(nominal_probes);
+	if (nominal_count > ranked_count)
+		nominal_count = ranked_count;
+	if (selected_capacity < nominal_count)
+	{
+		tq_tuning_set_error(errmsg, errmsg_len,
+							"invalid turboquant probe selection: selected index buffer is too small");
+		return false;
+	}
+
+	code_budget = (size_t) max_visited_codes;
+	page_budget = (size_t) max_visited_pages;
+	result->nominal_probe_count = nominal_count;
+	result->max_visited_codes = code_budget;
+	result->max_visited_pages = page_budget;
+	result->adaptive_enabled = tq_adaptive_probe_budget_enabled((unsigned int) ranked_count,
+																max_visited_codes,
+																max_visited_pages);
+
+	if (!result->adaptive_enabled || nominal_count == 0)
+	{
+		for (index = 0; index < nominal_count; index++)
+		{
+			selected_indexes[index] = index;
+			result->effective_probe_count += 1;
+			result->selected_live_count += (size_t) ranked_live_counts[index];
+			result->selected_page_count += (size_t) ranked_page_counts[index];
+		}
+		*selected_count = nominal_count;
+		return true;
+	}
+
+	if (ranked_scores == NULL)
+	{
+		tq_tuning_set_error(errmsg, errmsg_len,
+							"invalid turboquant probe selection: ranked scores are required when adaptive selection is enabled");
+		return false;
+	}
+
+	{
+		TqProbeSelectionCandidate *candidates = NULL;
+		double best_score = ranked_scores[0];
+		double worst_score = ranked_scores[0];
+		size_t selected_live = 0;
+		size_t selected_pages = 0;
+
+		candidates = (TqProbeSelectionCandidate *) calloc(ranked_count, sizeof(TqProbeSelectionCandidate));
+		if (candidates == NULL)
+		{
+			tq_tuning_set_error(errmsg, errmsg_len,
+								"invalid turboquant probe selection: out of memory");
+			return false;
+		}
+
+		for (index = 1; index < ranked_count; index++)
+		{
+			if (ranked_scores[index] > best_score)
+				best_score = ranked_scores[index];
+			if (ranked_scores[index] < worst_score)
+				worst_score = ranked_scores[index];
+		}
+
+		for (index = 0; index < ranked_count; index++)
+		{
+			double score_weight = tq_probe_score_weight(ranked_scores[index], best_score, worst_score);
+			double cost_fraction = tq_probe_cost_fraction((size_t) ranked_live_counts[index],
+														 (size_t) ranked_page_counts[index],
+														 code_budget,
+														 page_budget);
+
+			candidates[index].ranked_index = index;
+			candidates[index].score = ranked_scores[index];
+			candidates[index].cost_fraction = cost_fraction;
+			candidates[index].live_count = (size_t) ranked_live_counts[index];
+			candidates[index].page_count = (size_t) ranked_page_counts[index];
+			candidates[index].utility = score_weight / (1.0 + cost_fraction);
+		}
+
+		qsort(candidates, ranked_count, sizeof(candidates[0]), tq_probe_selection_candidate_compare);
+
+		for (index = 0; index < ranked_count && chosen_count < nominal_count; index++)
+		{
+			size_t next_live = candidates[index].live_count;
+			size_t next_pages = candidates[index].page_count;
+			bool fits_code = code_budget == 0 || selected_live + next_live <= code_budget;
+			bool fits_pages = page_budget == 0 || selected_pages + next_pages <= page_budget;
+
+			if (!fits_code || !fits_pages)
+				continue;
+
+			selected_indexes[chosen_count++] = candidates[index].ranked_index;
+			selected_live += next_live;
+			selected_pages += next_pages;
+		}
+
+		if (chosen_count == 0 && nominal_count > 0)
+		{
+			selected_indexes[0] = candidates[0].ranked_index;
+			chosen_count = 1;
+			selected_live = candidates[0].live_count;
+			selected_pages = candidates[0].page_count;
+		}
+
+		qsort(selected_indexes, chosen_count, sizeof(selected_indexes[0]), tq_probe_selected_index_compare);
+		for (index = 0; index < chosen_count; index++)
+		{
+			result->effective_probe_count += 1;
+			result->selected_live_count += (size_t) ranked_live_counts[selected_indexes[index]];
+			result->selected_page_count += (size_t) ranked_page_counts[selected_indexes[index]];
+		}
+		*selected_count = chosen_count;
+		free(candidates);
 	}
 
 	return true;

@@ -43,7 +43,7 @@ my $meta = decode_json(
 	$node->safe_psql('postgres', q{SELECT tq_index_metadata('tq_idx'::regclass)::text;})
 );
 
-is($meta->{format_version}, 6, 'extension exposes readable index metadata');
+is($meta->{format_version}, 8, 'extension exposes readable index metadata');
 ok(exists $meta->{capabilities}, 'extension exposes capability metadata');
 is($meta->{capabilities}{index_only_scan}, JSON::PP::false, 'capability metadata marks index-only scans unsupported');
 my $simd = decode_json(

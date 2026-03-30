@@ -6,8 +6,9 @@
 
 #define TQ_WAL_META_PAGE_HEADER_BYTES 108
 #define TQ_WAL_LIST_DIR_PAGE_HEADER_BYTES 16
-#define TQ_WAL_LIST_DIR_ENTRY_BYTES 24
+#define TQ_WAL_LIST_DIR_ENTRY_BYTES 32
 #define TQ_WAL_CENTROID_PAGE_HEADER_BYTES 20
+#define TQ_WAL_BATCH_SUMMARY_PAGE_HEADER_BYTES 20
 
 typedef bool (*TqWalMutator) (Page page, void *arg, char *errmsg, size_t errmsg_len);
 
@@ -46,6 +47,27 @@ typedef struct TqWalBatchInitArgs
 {
 	const TqBatchPageParams *params;
 } TqWalBatchInitArgs;
+
+typedef struct TqWalBatchSummaryPageInitArgs
+{
+	uint32_t	code_bytes;
+	uint16_t	entry_capacity;
+	uint32_t	next_block;
+} TqWalBatchSummaryPageInitArgs;
+
+typedef struct TqWalBatchSummaryPageNextBlockArgs
+{
+	uint32_t	next_block;
+} TqWalBatchSummaryPageNextBlockArgs;
+
+typedef struct TqWalBatchSummaryPageEntryArgs
+{
+	uint16_t	index;
+	uint32_t	block_number;
+	const TqBatchPageSummary *summary;
+	const uint8_t *representative_code;
+	size_t		code_len;
+} TqWalBatchSummaryPageEntryArgs;
 
 typedef struct TqWalBatchNextBlockArgs
 {
@@ -133,6 +155,18 @@ tq_wal_sync_page_bounds(Page page, char *errmsg, size_t errmsg_len)
 				+ ((size_t) centroid_header.centroid_count
 				   * (size_t) centroid_header.dimension
 				   * sizeof(float));
+			break;
+		}
+		case TQ_PAGE_KIND_BATCH_SUMMARY:
+		{
+			TqBatchSummaryPageHeaderView summary_header;
+
+			memset(&summary_header, 0, sizeof(summary_header));
+			if (!tq_batch_summary_page_read_header(payload, payload_size,
+												  &summary_header, errmsg, errmsg_len))
+				return false;
+			used_bytes = tq_batch_summary_page_required_bytes(summary_header.entry_count,
+															 summary_header.code_bytes);
 			break;
 		}
 		default:
@@ -237,6 +271,46 @@ tq_wal_mutate_centroid_set(Page page, void *arg, char *errmsg, size_t errmsg_len
 	if (!tq_centroid_page_set_centroid(tq_wal_payload(page), tq_wal_payload_size(page),
 									   args->index, args->centroid, args->dimension,
 									   errmsg, errmsg_len))
+		return false;
+
+	return tq_wal_sync_page_bounds(page, errmsg, errmsg_len);
+}
+
+static bool
+tq_wal_mutate_batch_summary_page_init(Page page, void *arg, char *errmsg, size_t errmsg_len)
+{
+	const TqWalBatchSummaryPageInitArgs *args = (const TqWalBatchSummaryPageInitArgs *) arg;
+
+	PageInit(page, BLCKSZ, 0);
+	if (!tq_batch_summary_page_init(tq_wal_payload(page), tq_wal_payload_size(page),
+									args->code_bytes, args->entry_capacity, args->next_block,
+									errmsg, errmsg_len))
+		return false;
+
+	return tq_wal_sync_page_bounds(page, errmsg, errmsg_len);
+}
+
+static bool
+tq_wal_mutate_batch_summary_page_next_block(Page page, void *arg, char *errmsg, size_t errmsg_len)
+{
+	const TqWalBatchSummaryPageNextBlockArgs *args = (const TqWalBatchSummaryPageNextBlockArgs *) arg;
+
+	if (!tq_batch_summary_page_set_next_block(tq_wal_payload(page), tq_wal_payload_size(page),
+											  args->next_block, errmsg, errmsg_len))
+		return false;
+
+	return tq_wal_sync_page_bounds(page, errmsg, errmsg_len);
+}
+
+static bool
+tq_wal_mutate_batch_summary_page_entry(Page page, void *arg, char *errmsg, size_t errmsg_len)
+{
+	const TqWalBatchSummaryPageEntryArgs *args = (const TqWalBatchSummaryPageEntryArgs *) arg;
+
+	if (!tq_batch_summary_page_set_entry(tq_wal_payload(page), tq_wal_payload_size(page),
+										 args->index, args->block_number, args->summary,
+										 args->representative_code, args->code_len,
+										 errmsg, errmsg_len))
 		return false;
 
 	return tq_wal_sync_page_bounds(page, errmsg, errmsg_len);
@@ -402,6 +476,61 @@ tq_wal_set_centroid(Relation relation,
 	args.dimension = dimension;
 	return tq_wal_apply(relation, buffer, 0,
 						tq_wal_mutate_centroid_set, &args, errmsg, errmsg_len);
+}
+
+bool
+tq_wal_init_batch_summary_page(Relation relation,
+							   Buffer buffer,
+							   uint32_t code_bytes,
+							   uint16_t entry_capacity,
+							   uint32_t next_block,
+							   char *errmsg,
+							   size_t errmsg_len)
+{
+	TqWalBatchSummaryPageInitArgs args;
+
+	args.code_bytes = code_bytes;
+	args.entry_capacity = entry_capacity;
+	args.next_block = next_block;
+	return tq_wal_apply(relation, buffer, GENERIC_XLOG_FULL_IMAGE,
+						tq_wal_mutate_batch_summary_page_init, &args, errmsg, errmsg_len);
+}
+
+bool
+tq_wal_set_batch_summary_next_block(Relation relation,
+									Buffer buffer,
+									uint32_t next_block,
+									char *errmsg,
+									size_t errmsg_len)
+{
+	TqWalBatchSummaryPageNextBlockArgs args;
+
+	args.next_block = next_block;
+	return tq_wal_apply(relation, buffer, 0,
+						tq_wal_mutate_batch_summary_page_next_block, &args, errmsg, errmsg_len);
+}
+
+bool
+tq_wal_set_batch_summary_entry(Relation relation,
+							   Buffer buffer,
+							   uint16_t index,
+							   uint32_t block_number,
+							   const TqBatchPageSummary *summary,
+							   const uint8_t *representative_code,
+							   size_t code_len,
+							   char *errmsg,
+							   size_t errmsg_len)
+{
+	TqWalBatchSummaryPageEntryArgs args;
+
+	memset(&args, 0, sizeof(args));
+	args.index = index;
+	args.block_number = block_number;
+	args.summary = summary;
+	args.representative_code = representative_code;
+	args.code_len = code_len;
+	return tq_wal_apply(relation, buffer, 0,
+						tq_wal_mutate_batch_summary_page_entry, &args, errmsg, errmsg_len);
 }
 
 bool

@@ -10,7 +10,7 @@ This validates the scenario matrix and output schema without requiring a live Po
 uv run python scripts/benchmark_suite.py \
   --dry-run \
   --profile tiny \
-  --corpus normalized_dense,clustered \
+  --corpus normalized_dense,clustered,hotpot_skewed \
   --methods turboquant_flat,turboquant_ivf,turboquant_bitmap,pgvector_ivfflat,pgvector_hnsw \
   --report \
   --output benchmark-suite.json
@@ -26,7 +26,7 @@ uv run python scripts/benchmark_suite.py \
   --port 5432 \
   --dbname postgres \
   --profile medium \
-  --corpus normalized_dense,clustered,mixed_live_dead \
+  --corpus normalized_dense,clustered,mixed_live_dead,hotpot_overlap \
   --methods turboquant_flat,turboquant_ivf,turboquant_bitmap,pgvector_ivfflat,pgvector_hnsw \
   --report \
   --output benchmark-suite.json
@@ -53,6 +53,7 @@ The suite records `turboquant.probes`, `turboquant.oversample_factor`, and the d
 - main JSON output
 - `benchmark-report.json`
 - `benchmark-report.md`
+- `benchmark-report.html`
 
 ```mermaid
 flowchart LR
@@ -65,6 +66,7 @@ flowchart LR
     F --> G
     G --> H["benchmark-report.json"]
     G --> I["benchmark-report.md"]
+    G --> J["benchmark-report.html"]
 ```
 
 ## What to look at first
@@ -72,10 +74,17 @@ flowchart LR
 - `metrics.recall_at_10`
 - `metrics.p95_ms`
 - `metrics.index_size_bytes`
+- `scan_stats.visited_code_count`
+- `scan_stats.visited_page_count`
+- `scan_stats.selected_live_count`
+- `scan_stats.selected_page_count`
+- `scan_stats.score_kernel`
 - `metrics.build_wal_bytes`
 - `metrics.concurrent_insert_rows_per_second`
 - `index_metadata.capabilities`
 - `simd.selected_kernel`
+
+The generated report is descriptive rather than normative. It states what was measured for the selected corpus/profile/knob matrix and keeps latency, scan work, and footprint separate instead of asserting unmeasured expectations such as "should be no slower".
 
 ## RAG benchmarks
 

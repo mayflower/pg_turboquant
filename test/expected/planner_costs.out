@@ -59,7 +59,7 @@ LIMIT 10;
                                                 QUERY PLAN                                                
 ----------------------------------------------------------------------------------------------------------
  Limit  (cost=4.61..4.97 rows=10 width=12)
-   ->  Index Scan using tq_planner_ivf_idx on tq_planner_ivf_docs  (cost=4.61..299.74 rows=8192 width=12)
+   ->  Index Scan using tq_planner_ivf_idx on tq_planner_ivf_docs  (cost=4.61..300.34 rows=8192 width=12)
          Order By: (embedding <=> '[1,0,0,0]'::vector)
 (3 rows)
 
@@ -73,8 +73,8 @@ ORDER BY embedding <=> '[1,0,0,0]'
 LIMIT 10;
                                                 QUERY PLAN                                                
 ----------------------------------------------------------------------------------------------------------
- Limit  (cost=4.70..5.62 rows=10 width=12)
-   ->  Index Scan using tq_planner_ivf_idx on tq_planner_ivf_docs  (cost=4.70..759.66 rows=8192 width=12)
+ Limit  (cost=4.70..5.63 rows=10 width=12)
+   ->  Index Scan using tq_planner_ivf_idx on tq_planner_ivf_docs  (cost=4.70..769.26 rows=8192 width=12)
          Order By: (embedding <=> '[1,0,0,0]'::vector)
 (3 rows)
 
@@ -87,7 +87,7 @@ LIMIT 10;
                                                 QUERY PLAN                                                
 ----------------------------------------------------------------------------------------------------------
  Limit  (cost=4.68..5.06 rows=10 width=12)
-   ->  Index Scan using tq_planner_ivf_idx on tq_planner_ivf_docs  (cost=4.68..312.42 rows=8192 width=12)
+   ->  Index Scan using tq_planner_ivf_idx on tq_planner_ivf_docs  (cost=4.68..313.02 rows=8192 width=12)
          Order By: (embedding <=> '[1,0,0,0]'::vector)
 (3 rows)
 
@@ -101,7 +101,7 @@ LIMIT 10;
                                                 QUERY PLAN                                                
 ----------------------------------------------------------------------------------------------------------
  Limit  (cost=4.68..5.06 rows=10 width=12)
-   ->  Index Scan using tq_planner_ivf_idx on tq_planner_ivf_docs  (cost=4.68..312.42 rows=8192 width=12)
+   ->  Index Scan using tq_planner_ivf_idx on tq_planner_ivf_docs  (cost=4.68..313.02 rows=8192 width=12)
          Order By: (embedding <=> '[1,0,0,0]'::vector)
 (3 rows)
 

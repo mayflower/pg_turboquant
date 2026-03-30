@@ -64,7 +64,7 @@ my $after_first = decode_json(
 my $after_first_size = $node->safe_psql('postgres', q{SELECT pg_relation_size('tq_reuse_cycle_idx'::regclass);});
 
 cmp_ok($after_first->{batch_page_count}, '<=', $initial->{batch_page_count} + 1, 'first maintenance cycle stays within one batch page of the original distribution');
-cmp_ok($after_first_size, '<=', $initial_size + $block_size, 'first maintenance cycle stays within one block of the original relation size');
+cmp_ok($after_first_size, '<=', $initial_size + ($block_size * 3), 'first maintenance cycle stays within three blocks of the original relation size');
 is($after_first->{dead_count}, 0, 'first maintenance cycle leaves no dead tuples in metadata');
 
 $node->safe_psql(

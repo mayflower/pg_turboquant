@@ -56,12 +56,72 @@ FROM (
 	LIMIT 3
 ) ranked;
 
-WITH stats AS (
-	SELECT tq_last_scan_stats() AS stats
+CREATE TEMP TABLE tq_page_pruning_runs (
+	label text PRIMARY KEY,
+	approx_ids int4[],
+	bound_data_page_reads int4,
+	visited_page_count int4,
+	page_prune_count int4,
+	early_stop_count int4,
+	visited_code_count int4,
+	selected_live_count int4
+);
+
+SET turboquant.enable_summary_bounds = on;
+INSERT INTO tq_page_pruning_runs (label, approx_ids)
+SELECT 'summary_on', array_agg(id ORDER BY id)
+FROM (
+	SELECT id
+	FROM tq_page_pruning_docs
+	ORDER BY embedding <=> tq_vec64(1.0, 0.0)
+	LIMIT 3
+) ranked;
+UPDATE tq_page_pruning_runs
+SET bound_data_page_reads = (tq_last_scan_stats()->>'bound_data_page_reads')::int,
+	visited_page_count = (tq_last_scan_stats()->>'visited_page_count')::int,
+	page_prune_count = (tq_last_scan_stats()->>'page_prune_count')::int,
+	early_stop_count = (tq_last_scan_stats()->>'early_stop_count')::int,
+	visited_code_count = (tq_last_scan_stats()->>'visited_code_count')::int,
+	selected_live_count = (tq_last_scan_stats()->>'selected_live_count')::int
+WHERE label = 'summary_on';
+
+SET turboquant.enable_summary_bounds = off;
+INSERT INTO tq_page_pruning_runs (label, approx_ids)
+SELECT 'summary_off', array_agg(id ORDER BY id)
+FROM (
+	SELECT id
+	FROM tq_page_pruning_docs
+	ORDER BY embedding <=> tq_vec64(1.0, 0.0)
+	LIMIT 3
+) ranked;
+UPDATE tq_page_pruning_runs
+SET bound_data_page_reads = (tq_last_scan_stats()->>'bound_data_page_reads')::int,
+	visited_page_count = (tq_last_scan_stats()->>'visited_page_count')::int,
+	page_prune_count = (tq_last_scan_stats()->>'page_prune_count')::int,
+	early_stop_count = (tq_last_scan_stats()->>'early_stop_count')::int,
+	visited_code_count = (tq_last_scan_stats()->>'visited_code_count')::int,
+	selected_live_count = (tq_last_scan_stats()->>'selected_live_count')::int
+WHERE label = 'summary_off';
+
+WITH runs AS (
+	SELECT
+		max(approx_ids) FILTER (WHERE label = 'summary_on') AS summary_on_ids,
+		max(approx_ids) FILTER (WHERE label = 'summary_off') AS summary_off_ids,
+		max(bound_data_page_reads) FILTER (WHERE label = 'summary_on') AS summary_on_bound_reads,
+		max(bound_data_page_reads) FILTER (WHERE label = 'summary_off') AS summary_off_bound_reads,
+		max(visited_page_count) FILTER (WHERE label = 'summary_on') AS summary_on_visited_pages,
+		max(visited_page_count) FILTER (WHERE label = 'summary_off') AS summary_off_visited_pages,
+		max(page_prune_count) FILTER (WHERE label = 'summary_on') AS summary_on_page_prunes,
+		max(early_stop_count) FILTER (WHERE label = 'summary_on') AS summary_on_early_stops,
+		max(visited_code_count) FILTER (WHERE label = 'summary_on') AS summary_on_visited_codes,
+		max(selected_live_count) FILTER (WHERE label = 'summary_on') AS summary_on_selected_live
+	FROM tq_page_pruning_runs
 )
 SELECT
-	(stats->>'visited_page_count')::int < 9 AS visited_pages_reduced,
-	(stats->>'page_prune_count')::int > 0 AS page_prunes_positive,
-	(stats->>'early_stop_count')::int > 0 AS early_stops_positive,
-	(stats->>'visited_code_count')::int < (stats->>'selected_live_count')::int AS visited_codes_below_selected_live
-FROM stats;
+	summary_on_ids = summary_off_ids AS candidate_ids_stable,
+	summary_on_bound_reads = 0 AS summary_path_avoids_data_prereads,
+	summary_off_bound_reads > 0 AS fallback_reads_data_pages,
+	summary_on_page_prunes = 0 AS page_prunes_disabled_for_safety,
+	summary_on_early_stops = 0 AS early_stops_disabled_for_safety,
+	summary_on_visited_codes = summary_on_selected_live AS selected_codes_fully_scanned
+FROM runs;

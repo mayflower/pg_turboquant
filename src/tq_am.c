@@ -30,6 +30,7 @@
 #include "src/tq_options.h"
 #include "src/tq_page.h"
 #include "src/tq_pgvector_compat.h"
+#include "src/tq_probe_input.h"
 #include "src/tq_query_tuning.h"
 #include "src/tq_reloptions.h"
 #include "src/tq_router.h"
@@ -92,6 +93,11 @@ typedef struct TqBoundedPageCandidate
 	float		optimistic_distance;
 } TqBoundedPageCandidate;
 
+typedef struct TqProbePageCountFallbackContext
+{
+	Relation	index_relation;
+} TqProbePageCountFallbackContext;
+
 static void tq_load_option_config(Relation index_relation, TqOptionConfig *config);
 static void tq_reset_scan_opaque(TqScanOpaque *opaque);
 static void tq_buildstate_reset(TqBuildState *state);
@@ -137,6 +143,18 @@ static bool tq_recompute_batch_page_summary(const TqProdCodecConfig *config,
 static bool tq_refresh_batch_page_summary(Relation index_relation,
 										  Buffer buffer,
 										  const TqProdCodecConfig *config,
+										  char *errmsg,
+										  size_t errmsg_len);
+static bool tq_capture_batch_page_side_summary(const void *page,
+											   size_t page_size,
+											   uint32_t expected_code_bytes,
+											   TqBatchPageSummary *summary,
+											   uint8_t *representative_code,
+											   char *errmsg,
+											   size_t errmsg_len);
+static bool tq_rebuild_list_summary_chain(Relation index_relation,
+										  const TqMetaPageFields *meta_fields,
+										  TqListDirEntry *entry,
 										  char *errmsg,
 										  size_t errmsg_len);
 static bool tq_load_router_model(Relation index_relation,
@@ -186,6 +204,14 @@ static bool tq_scan_batch_block(Relation index_relation,
 								TqScanOpaque *opaque,
 								char *errmsg,
 								size_t errmsg_len);
+static bool tq_collect_bounded_pages_for_list(Relation index_relation,
+											  const TqListDirEntry *entry,
+											  TqScanOpaque *opaque,
+											  TqBoundedPageCandidate *pages,
+											  size_t max_pages,
+											  size_t *page_count,
+											  char *errmsg,
+											  size_t errmsg_len);
 static bool tq_collect_bounded_pages_for_chain(Relation index_relation,
 											   BlockNumber head_block,
 											   TqScanOpaque *opaque,
@@ -199,6 +225,11 @@ static bool tq_count_batch_pages_for_chain(Relation index_relation,
 										   size_t *page_count,
 										   char *errmsg,
 										   size_t errmsg_len);
+static bool tq_probe_page_count_fallback(const TqListDirEntry *entry,
+										 uint32_t *page_count,
+										 void *context,
+										 char *errmsg,
+										 size_t errmsg_len);
 static bool tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque);
 static int64 tq_scan_all_live_tids_to_bitmap(Relation index_relation,
 											 TIDBitmap *tbm,
@@ -706,6 +737,252 @@ tq_refresh_batch_page_summary(Relation index_relation,
 }
 
 static void
+tq_free_block_array(BlockNumber *blocks)
+{
+	if (blocks != NULL)
+		pfree(blocks);
+}
+
+static bool
+tq_capture_batch_page_side_summary(const void *page,
+								   size_t page_size,
+								   uint32_t expected_code_bytes,
+								   TqBatchPageSummary *summary,
+								   uint8_t *representative_code,
+								   char *errmsg,
+								   size_t errmsg_len)
+{
+	TqBatchPageHeaderView header;
+
+	if (page == NULL || summary == NULL || representative_code == NULL)
+	{
+		snprintf(errmsg, errmsg_len,
+				 "invalid turboquant batch summary capture: page, summary, and code output must be non-null");
+		return false;
+	}
+
+	memset(&header, 0, sizeof(header));
+	memset(summary, 0, sizeof(*summary));
+	memset(representative_code, 0, expected_code_bytes);
+
+	if (!tq_batch_page_read_header(page, page_size, &header, errmsg, errmsg_len)
+		|| !tq_batch_page_get_summary(page, page_size, summary, errmsg, errmsg_len))
+		return false;
+
+	if (header.code_bytes != expected_code_bytes)
+	{
+		snprintf(errmsg, errmsg_len,
+				 "invalid turboquant batch summary capture: code bytes do not match summary layout");
+		return false;
+	}
+
+	if (summary->representative_lane == TQ_BATCH_PAGE_NO_REPRESENTATIVE)
+		return true;
+
+	return tq_batch_page_get_code(page, page_size, summary->representative_lane,
+								  representative_code, expected_code_bytes,
+								  errmsg, errmsg_len);
+}
+
+static bool
+tq_rebuild_list_summary_chain(Relation index_relation,
+							  const TqMetaPageFields *meta_fields,
+							  TqListDirEntry *entry,
+							  char *errmsg,
+							  size_t errmsg_len)
+{
+	TqProdCodecConfig config;
+	TqProdPackedLayout layout;
+	uint16_t entry_capacity = 0;
+	size_t needed_pages = 0;
+	BlockNumber *summary_blocks = NULL;
+	BlockNumber extra_head = TQ_INVALID_BLOCK_NUMBER;
+	BlockNumber old_summary_head = TQ_INVALID_BLOCK_NUMBER;
+	BlockNumber block_number = TQ_INVALID_BLOCK_NUMBER;
+	size_t existing_count = 0;
+	size_t page_index = 0;
+	size_t processed_pages = 0;
+	size_t summary_index = 0;
+	uint8_t *representative_code = NULL;
+
+	if (index_relation == NULL || meta_fields == NULL || entry == NULL)
+	{
+		snprintf(errmsg, errmsg_len,
+				 "invalid turboquant batch summary rebuild: relation, meta fields, and entry must be non-null");
+		return false;
+	}
+
+	old_summary_head = entry->summary_head_block;
+	entry->summary_head_block = TQ_INVALID_BLOCK_NUMBER;
+	if (entry->head_block == TQ_INVALID_BLOCK_NUMBER || entry->batch_page_count == 0)
+		return true;
+
+	memset(&config, 0, sizeof(config));
+	memset(&layout, 0, sizeof(layout));
+	config.dimension = meta_fields->transform_output_dimension;
+	config.bits = (uint8_t) meta_fields->bits;
+	if (!tq_prod_packed_layout(&config, &layout, errmsg, errmsg_len))
+		return false;
+
+	entry_capacity = tq_batch_summary_page_capacity(tq_relation_payload_size(),
+													(uint32_t) layout.total_bytes);
+	if (entry_capacity == 0)
+	{
+		snprintf(errmsg, errmsg_len,
+				 "invalid turboquant batch summary rebuild: summary page capacity is zero");
+		return false;
+	}
+
+	needed_pages = ((size_t) entry->batch_page_count + (size_t) entry_capacity - 1) / (size_t) entry_capacity;
+	summary_blocks = (BlockNumber *) palloc0(sizeof(BlockNumber) * needed_pages);
+
+	block_number = old_summary_head;
+	while (existing_count < needed_pages && block_number != TQ_INVALID_BLOCK_NUMBER)
+	{
+		Buffer buffer;
+		Page page;
+		TqBatchSummaryPageHeaderView header;
+
+		buffer = ReadBufferExtended(index_relation, MAIN_FORKNUM, block_number, RBM_NORMAL, NULL);
+		page = BufferGetPage(buffer);
+		memset(&header, 0, sizeof(header));
+		if (!tq_batch_summary_page_read_header(tq_page_payload(page), tq_page_payload_size(page),
+											   &header, errmsg, errmsg_len))
+		{
+			ReleaseBuffer(buffer);
+			tq_free_block_array(summary_blocks);
+			return false;
+		}
+		summary_blocks[existing_count++] = block_number;
+		block_number = header.next_block;
+		ReleaseBuffer(buffer);
+	}
+	extra_head = block_number;
+
+	for (page_index = existing_count; page_index < needed_pages; page_index++)
+	{
+		Buffer buffer = ReadBufferExtended(index_relation, MAIN_FORKNUM, P_NEW, RBM_NORMAL, NULL);
+
+		LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+		summary_blocks[page_index] = BufferGetBlockNumber(buffer);
+		if (!tq_wal_init_batch_summary_page(index_relation,
+											buffer,
+											(uint32_t) layout.total_bytes,
+											entry_capacity,
+											TQ_INVALID_BLOCK_NUMBER,
+											errmsg,
+											errmsg_len))
+		{
+			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+			ReleaseBuffer(buffer);
+			tq_free_block_array(summary_blocks);
+			return false;
+		}
+		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+		ReleaseBuffer(buffer);
+	}
+
+	entry->summary_head_block = summary_blocks[0];
+	for (page_index = 0; page_index < needed_pages; page_index++)
+	{
+		Buffer buffer = ReadBufferExtended(index_relation, MAIN_FORKNUM, summary_blocks[page_index], RBM_NORMAL, NULL);
+		uint32_t next_block = page_index + 1 < needed_pages ? summary_blocks[page_index + 1] : extra_head;
+
+		LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+		if (!tq_wal_init_batch_summary_page(index_relation,
+											buffer,
+											(uint32_t) layout.total_bytes,
+											entry_capacity,
+											next_block,
+											errmsg,
+											errmsg_len))
+		{
+			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+			ReleaseBuffer(buffer);
+			tq_free_block_array(summary_blocks);
+			return false;
+		}
+		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+		ReleaseBuffer(buffer);
+	}
+
+	representative_code = (uint8_t *) palloc0(layout.total_bytes);
+	block_number = entry->head_block;
+	while (block_number != TQ_INVALID_BLOCK_NUMBER && processed_pages < entry->batch_page_count)
+	{
+		Buffer batch_buffer;
+		Page batch_page;
+		TqBatchPageHeaderView batch_header;
+		TqBatchPageSummary summary;
+		Buffer summary_buffer;
+		BlockNumber summary_block = TQ_INVALID_BLOCK_NUMBER;
+		BlockNumber batch_block_number = block_number;
+		uint16_t local_index = (uint16_t) (summary_index % (size_t) entry_capacity);
+
+		batch_buffer = ReadBufferExtended(index_relation, MAIN_FORKNUM, block_number, RBM_NORMAL, NULL);
+		batch_page = BufferGetPage(batch_buffer);
+		memset(&batch_header, 0, sizeof(batch_header));
+		memset(&summary, 0, sizeof(summary));
+		if (!tq_batch_page_read_header(tq_page_payload(batch_page), tq_page_payload_size(batch_page),
+									   &batch_header, errmsg, errmsg_len)
+			|| !tq_capture_batch_page_side_summary(tq_page_payload(batch_page),
+												   tq_page_payload_size(batch_page),
+												   (uint32_t) layout.total_bytes,
+												   &summary,
+												   representative_code,
+												   errmsg,
+												   errmsg_len))
+		{
+			ReleaseBuffer(batch_buffer);
+			pfree(representative_code);
+			tq_free_block_array(summary_blocks);
+			return false;
+		}
+		block_number = batch_header.next_block;
+		ReleaseBuffer(batch_buffer);
+
+		summary_block = summary_blocks[summary_index / (size_t) entry_capacity];
+		summary_buffer = ReadBufferExtended(index_relation, MAIN_FORKNUM,
+											summary_block, RBM_NORMAL, NULL);
+		LockBuffer(summary_buffer, BUFFER_LOCK_EXCLUSIVE);
+		if (!tq_wal_set_batch_summary_entry(index_relation,
+											summary_buffer,
+											local_index,
+											batch_block_number,
+											&summary,
+											representative_code,
+											layout.total_bytes,
+											errmsg,
+											errmsg_len))
+		{
+			LockBuffer(summary_buffer, BUFFER_LOCK_UNLOCK);
+			ReleaseBuffer(summary_buffer);
+			pfree(representative_code);
+			tq_free_block_array(summary_blocks);
+			return false;
+		}
+		LockBuffer(summary_buffer, BUFFER_LOCK_UNLOCK);
+		ReleaseBuffer(summary_buffer);
+
+		summary_index += 1;
+		processed_pages += 1;
+	}
+
+	pfree(representative_code);
+	if (processed_pages != (size_t) entry->batch_page_count)
+	{
+		tq_free_block_array(summary_blocks);
+		snprintf(errmsg, errmsg_len,
+				 "invalid turboquant batch summary rebuild: expected %u batch pages but summarized %zu",
+				 entry->batch_page_count,
+				 processed_pages);
+		return false;
+	}
+	tq_free_block_array(summary_blocks);
+	return true;
+}
+
+static void
 tq_write_centroid_pages(Relation index_relation,
 						const TqRouterModel *model,
 						uint32_t *root_block)
@@ -911,6 +1188,7 @@ tq_write_batch_pages(TqBuildState *state,
 														entries[list_id].tail_block,
 														new_block);
 					entries[list_id].tail_block = new_block;
+					entries[list_id].batch_page_count += 1;
 				}
 
 				if (BufferIsValid(current_buffer))
@@ -947,6 +1225,16 @@ tq_write_batch_pages(TqBuildState *state,
 
 		if (BufferIsValid(current_buffer))
 			ReleaseBuffer(current_buffer);
+
+		if (entries != NULL && entries[list_id].head_block != TQ_INVALID_BLOCK_NUMBER)
+		{
+			if (!tq_rebuild_list_summary_chain(state->index_relation,
+											  &state->meta_fields,
+											  &entries[list_id],
+											  error_buf,
+											  sizeof(error_buf)))
+				elog(ERROR, "%s", error_buf);
+		}
 	}
 }
 
@@ -1012,6 +1300,7 @@ tq_buildstate_flush(TqBuildState *state)
 			entries[vector_index].list_id = (uint32_t) vector_index;
 			entries[vector_index].head_block = TQ_INVALID_BLOCK_NUMBER;
 			entries[vector_index].tail_block = TQ_INVALID_BLOCK_NUMBER;
+			entries[vector_index].summary_head_block = TQ_INVALID_BLOCK_NUMBER;
 		}
 
 		tq_write_centroid_pages(state->index_relation, &state->router_model,
@@ -1970,6 +2259,7 @@ tq_append_packed_tuple(Relation index_relation,
 			if (entry.tail_block != TQ_INVALID_BLOCK_NUMBER)
 				tq_update_batch_page_next_block(index_relation, entry.tail_block, detached_block);
 			entry.tail_block = detached_block;
+			entry.batch_page_count += 1;
 		}
 	}
 
@@ -2007,6 +2297,7 @@ tq_append_packed_tuple(Relation index_relation,
 			if (entry.head_block == TQ_INVALID_BLOCK_NUMBER)
 				entry.head_block = new_block;
 			entry.tail_block = new_block;
+			entry.batch_page_count += 1;
 		}
 	}
 
@@ -2031,6 +2322,12 @@ tq_append_packed_tuple(Relation index_relation,
 	{
 		entry.live_count += 1;
 		entry.free_lane_hint = 0;
+		if (!tq_rebuild_list_summary_chain(index_relation,
+										   meta_fields,
+										   &entry,
+										   error_buf,
+										   sizeof(error_buf)))
+			elog(ERROR, "%s", error_buf);
 		if (!tq_write_list_directory_entry(index_relation,
 										   meta_fields->directory_root_block,
 										   list_id,
@@ -2157,6 +2454,7 @@ tq_summarize_index(Relation index_relation,
 			BlockNumber block_number;
 			BlockNumber prev_block = TQ_INVALID_BLOCK_NUMBER;
 			double		list_live = 0.0;
+			uint32_t	list_page_count = 0;
 
 			memset(&entry, 0, sizeof(entry));
 			if (!tq_read_list_directory_entry(index_relation, meta_fields->directory_root_block,
@@ -2270,6 +2568,8 @@ tq_summarize_index(Relation index_relation,
 
 					if (entry.tail_block == block_number)
 						entry.tail_block = prev_block;
+					if (list_page_count > 0)
+						list_page_count -= 1;
 
 					if (!tq_wal_init_batch_page(index_relation, buffer, &params,
 											   error_buf, sizeof(error_buf)))
@@ -2288,6 +2588,7 @@ tq_summarize_index(Relation index_relation,
 				list_live += header.live_count;
 				if (should_reclaim)
 					summary->reclaimable_pages += 1;
+				list_page_count += 1;
 				prev_block = block_number;
 				block_number = next_block;
 				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
@@ -2296,7 +2597,14 @@ tq_summarize_index(Relation index_relation,
 
 			entry.live_count = (uint32_t) list_live;
 			entry.dead_count = 0;
+			entry.batch_page_count = list_page_count;
 			entry.free_lane_hint = 0;
+			if (!tq_rebuild_list_summary_chain(index_relation,
+											   meta_fields,
+											   &entry,
+											   error_buf,
+											   sizeof(error_buf)))
+				elog(ERROR, "%s", error_buf);
 			if (!tq_write_list_directory_entry(index_relation, meta_fields->directory_root_block,
 											   list_id, &entry, error_buf, sizeof(error_buf)))
 				elog(ERROR, "%s", error_buf);
@@ -2341,6 +2649,153 @@ tq_scan_batch_block(Relation index_relation,
 }
 
 static bool
+tq_collect_bounded_pages_for_list(Relation index_relation,
+								  const TqListDirEntry *entry,
+								  TqScanOpaque *opaque,
+								  TqBoundedPageCandidate *pages,
+								  size_t max_pages,
+								  size_t *page_count,
+								  char *errmsg,
+								  size_t errmsg_len)
+{
+	TqProdPackedLayout layout;
+	uint8_t *representative_code = NULL;
+	BlockNumber summary_block = TQ_INVALID_BLOCK_NUMBER;
+	size_t summarized_pages = 0;
+
+	if (entry == NULL || opaque == NULL || pages == NULL || page_count == NULL)
+	{
+		snprintf(errmsg, errmsg_len,
+				 "invalid turboquant scan: bounded page collection requires entry, scan state, page array, and count");
+		return false;
+	}
+
+	if (!tq_guc_enable_summary_bounds
+		|| entry->summary_head_block == TQ_INVALID_BLOCK_NUMBER
+		|| entry->batch_page_count == 0)
+	{
+		return tq_collect_bounded_pages_for_chain(index_relation,
+												  entry->head_block,
+												  opaque,
+												  pages,
+												  max_pages,
+												  page_count,
+												  errmsg,
+												  errmsg_len);
+	}
+
+	memset(&layout, 0, sizeof(layout));
+	if (!tq_prod_packed_layout(&opaque->prod_config, &layout, errmsg, errmsg_len))
+		return false;
+
+	representative_code = (uint8_t *) palloc0(layout.total_bytes);
+	summary_block = entry->summary_head_block;
+	while (summary_block != TQ_INVALID_BLOCK_NUMBER
+		   && summarized_pages < (size_t) entry->batch_page_count)
+	{
+		Buffer summary_buffer;
+		Page summary_page;
+		TqBatchSummaryPageHeaderView header;
+		uint16_t local_index = 0;
+		uint16_t local_limit = 0;
+
+		summary_buffer = ReadBufferExtended(index_relation, MAIN_FORKNUM, summary_block, RBM_NORMAL, NULL);
+		summary_page = BufferGetPage(summary_buffer);
+		memset(&header, 0, sizeof(header));
+		if (!tq_batch_summary_page_read_header(tq_page_payload(summary_page),
+											   tq_page_payload_size(summary_page),
+											   &header,
+											   errmsg,
+											   errmsg_len))
+		{
+			ReleaseBuffer(summary_buffer);
+			pfree(representative_code);
+			return false;
+		}
+
+		if (header.code_bytes != (uint32_t) layout.total_bytes)
+		{
+			ReleaseBuffer(summary_buffer);
+			pfree(representative_code);
+			snprintf(errmsg, errmsg_len,
+					 "invalid turboquant batch summary page: code bytes %u do not match expected %zu",
+					 header.code_bytes,
+					 layout.total_bytes);
+			return false;
+		}
+
+		local_limit = header.entry_count;
+		if ((size_t) local_limit > (size_t) entry->batch_page_count - summarized_pages)
+			local_limit = (uint16_t) ((size_t) entry->batch_page_count - summarized_pages);
+
+		for (local_index = 0; local_index < local_limit; local_index++)
+		{
+			TqBatchPageSummary summary;
+
+			if (*page_count >= max_pages)
+			{
+				ReleaseBuffer(summary_buffer);
+				pfree(representative_code);
+				snprintf(errmsg, errmsg_len,
+						 "invalid turboquant scan: bounded page array exceeded capacity");
+				return false;
+			}
+
+			memset(&summary, 0, sizeof(summary));
+			if (!tq_batch_summary_page_get_entry(tq_page_payload(summary_page),
+												 tq_page_payload_size(summary_page),
+												 local_index,
+												 &pages[*page_count].block_number,
+												 &summary,
+												 representative_code,
+												 layout.total_bytes,
+												 errmsg,
+												 errmsg_len))
+			{
+				ReleaseBuffer(summary_buffer);
+				pfree(representative_code);
+				return false;
+			}
+
+			if (!tq_scan_summary_optimistic_distance_bound(&opaque->prod_config,
+														   &opaque->lut,
+														   &summary,
+														   representative_code,
+														   layout.total_bytes,
+														   opaque->normalized,
+														   opaque->distance_kind,
+														   opaque->query_values,
+														   opaque->query_dimension,
+														   &pages[*page_count].optimistic_distance,
+														   errmsg,
+														   errmsg_len))
+			{
+				ReleaseBuffer(summary_buffer);
+				pfree(representative_code);
+				return false;
+			}
+			*page_count += 1;
+			summarized_pages += 1;
+		}
+
+		summary_block = header.next_block;
+		ReleaseBuffer(summary_buffer);
+	}
+
+	pfree(representative_code);
+	if (summarized_pages != (size_t) entry->batch_page_count)
+	{
+		snprintf(errmsg, errmsg_len,
+				 "invalid turboquant batch summary chain: expected %u page summaries but read %zu",
+				 entry->batch_page_count,
+				 summarized_pages);
+		return false;
+	}
+
+	return true;
+}
+
+static bool
 tq_collect_bounded_pages_for_chain(Relation index_relation,
 								   BlockNumber head_block,
 								   TqScanOpaque *opaque,
@@ -2359,6 +2814,7 @@ tq_collect_bounded_pages_for_chain(Relation index_relation,
 		TqBatchPageHeaderView header;
 
 		buffer = ReadBufferExtended(index_relation, MAIN_FORKNUM, block_number, RBM_NORMAL, NULL);
+		tq_scan_stats_record_bound_data_page_read();
 		page = BufferGetPage(buffer);
 		memset(&header, 0, sizeof(header));
 		if (!tq_batch_page_read_header(tq_page_payload(page), tq_page_payload_size(page),
@@ -2442,6 +2898,34 @@ tq_count_batch_pages_for_chain(Relation index_relation,
 		ReleaseBuffer(buffer);
 	}
 
+	return true;
+}
+
+static bool
+tq_probe_page_count_fallback(const TqListDirEntry *entry,
+							 uint32_t *page_count,
+							 void *context,
+							 char *errmsg,
+							 size_t errmsg_len)
+{
+	TqProbePageCountFallbackContext *fallback_context = (TqProbePageCountFallbackContext *) context;
+	size_t	chain_page_count = 0;
+
+	if (entry == NULL || page_count == NULL || fallback_context == NULL)
+	{
+		snprintf(errmsg, errmsg_len,
+				 "invalid turboquant scan: probe page count fallback requires entry, output, and context");
+		return false;
+	}
+
+	if (!tq_count_batch_pages_for_chain(fallback_context->index_relation,
+										entry->head_block,
+										&chain_page_count,
+										errmsg,
+										errmsg_len))
+		return false;
+
+	*page_count = (uint32_t) chain_page_count;
 	return true;
 }
 
@@ -2587,11 +3071,16 @@ tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque)
 	{
 		TqRouterModel router_model;
 		TqProbeBudgetResult probe_budget;
-		uint32_t   *selected_lists;
+		TqRouterProbeScore *ranked_probes;
+		TqListDirEntry *selected_entries = NULL;
+		double	   *ranked_scores = NULL;
 		uint32_t   *ranked_live_counts = NULL;
 		uint32_t   *ranked_page_counts = NULL;
+		size_t	   *selected_indexes = NULL;
 		TqBoundedPageCandidate *page_candidates = NULL;
-		uint32_t	selected_count = 0;
+		TqProbePageCountFallbackContext fallback_context;
+		size_t		ranked_count = 0;
+		size_t		selected_count = 0;
 		uint32_t	effective_count = 0;
 		uint32_t	index = 0;
 		size_t		page_count = 0;
@@ -2602,63 +3091,91 @@ tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque)
 								  error_buf, sizeof(error_buf)))
 			elog(ERROR, "%s", error_buf);
 
-		selected_lists = (uint32_t *) palloc(sizeof(uint32_t) * (size_t) meta_fields.list_count);
-		if (!tq_router_select_probes(&router_model, opaque->query_values,
-									 (uint32_t) tq_guc_probes,
-									 selected_lists,
-									 meta_fields.list_count,
-									 &selected_count,
-									 error_buf, sizeof(error_buf)))
+		ranked_count = (size_t) meta_fields.list_count;
+		ranked_probes = (TqRouterProbeScore *) palloc0(sizeof(TqRouterProbeScore) * ranked_count);
+		if (!tq_router_rank_probes(&router_model,
+								   opaque->query_values,
+								   ranked_probes,
+								   ranked_count,
+								   error_buf,
+								   sizeof(error_buf)))
 		{
 			tq_router_reset(&router_model);
 			elog(ERROR, "%s", error_buf);
 		}
 
-		ranked_live_counts = (uint32_t *) palloc0(sizeof(uint32_t) * (size_t) selected_count);
-		ranked_page_counts = (uint32_t *) palloc0(sizeof(uint32_t) * (size_t) selected_count);
+		ranked_scores = (double *) palloc0(sizeof(double) * ranked_count);
+		ranked_live_counts = (uint32_t *) palloc0(sizeof(uint32_t) * ranked_count);
+		ranked_page_counts = (uint32_t *) palloc0(sizeof(uint32_t) * ranked_count);
+		selected_entries = (TqListDirEntry *) palloc0(sizeof(TqListDirEntry) * ranked_count);
+		selected_indexes = (size_t *) palloc0(sizeof(size_t) * ranked_count);
+		memset(&fallback_context, 0, sizeof(fallback_context));
+		fallback_context.index_relation = scan->indexRelation;
 
-		for (index = 0; index < selected_count; index++)
+		for (index = 0; index < (uint32_t) ranked_count; index++)
 		{
-			TqListDirEntry entry;
-			size_t		list_page_count = 0;
+			TqListDirEntry *entry = &selected_entries[index];
 
-			memset(&entry, 0, sizeof(entry));
+			memset(entry, 0, sizeof(*entry));
+			ranked_scores[index] = (double) ranked_probes[index].score;
 			if (!tq_read_list_directory_entry(scan->indexRelation,
 											  meta_fields.directory_root_block,
-											  selected_lists[index],
-											  &entry,
-											  error_buf, sizeof(error_buf))
-				|| !tq_count_batch_pages_for_chain(scan->indexRelation,
-												   entry.head_block,
-												   &list_page_count,
+											  ranked_probes[index].list_id,
+											  entry,
 											  error_buf, sizeof(error_buf)))
 			{
 				tq_router_reset(&router_model);
+				pfree(selected_entries);
+				pfree(ranked_scores);
 				pfree(ranked_live_counts);
 				pfree(ranked_page_counts);
-				pfree(selected_lists);
+				pfree(selected_indexes);
+				pfree(ranked_probes);
 				elog(ERROR, "%s", error_buf);
 			}
+		}
 
-			ranked_live_counts[index] = entry.live_count;
-			ranked_page_counts[index] = (uint32_t) list_page_count;
+		if (!tq_build_probe_budget_inputs(selected_entries,
+										  ranked_count,
+										  ranked_live_counts,
+										  ranked_page_counts,
+										  tq_probe_page_count_fallback,
+										  &fallback_context,
+										  error_buf,
+										  sizeof(error_buf)))
+		{
+			tq_router_reset(&router_model);
+			pfree(selected_entries);
+			pfree(ranked_scores);
+			pfree(ranked_live_counts);
+			pfree(ranked_page_counts);
+			pfree(selected_indexes);
+			pfree(ranked_probes);
+			elog(ERROR, "%s", error_buf);
 		}
 
 		memset(&probe_budget, 0, sizeof(probe_budget));
-		if (!tq_choose_probe_budget(ranked_live_counts,
-									ranked_page_counts,
-									(size_t) selected_count,
-									tq_guc_probes,
-									tq_guc_max_visited_codes,
-									tq_guc_max_visited_pages,
-									&probe_budget,
-									error_buf,
-									sizeof(error_buf)))
+		if (!tq_select_cost_aware_probes(ranked_scores,
+										 ranked_live_counts,
+										 ranked_page_counts,
+										 ranked_count,
+										 tq_guc_probes,
+										 tq_guc_max_visited_codes,
+										 tq_guc_max_visited_pages,
+										 selected_indexes,
+										 ranked_count,
+										 &selected_count,
+										 &probe_budget,
+										 error_buf,
+										 sizeof(error_buf)))
 		{
 			tq_router_reset(&router_model);
+			pfree(selected_entries);
+			pfree(ranked_scores);
 			pfree(ranked_live_counts);
 			pfree(ranked_page_counts);
-			pfree(selected_lists);
+			pfree(selected_indexes);
+			pfree(ranked_probes);
 			elog(ERROR, "%s", error_buf);
 		}
 		effective_count = (uint32_t) probe_budget.effective_probe_count;
@@ -2669,8 +3186,11 @@ tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque)
 
 		for (index = 0; index < effective_count; index++)
 		{
-			total_live += ranked_live_counts[index];
-			tq_scan_stats_record_selected_list((size_t) ranked_live_counts[index]);
+			size_t ranked_index = selected_indexes[index];
+
+			total_live += ranked_live_counts[ranked_index];
+			tq_scan_stats_record_selected_list((size_t) ranked_live_counts[ranked_index],
+											  (size_t) ranked_page_counts[ranked_index]);
 		}
 
 		if (total_live > 0
@@ -2687,28 +3207,25 @@ tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque)
 
 		for (index = 0; index < effective_count; index++)
 		{
-			TqListDirEntry entry;
+			size_t ranked_index = selected_indexes[index];
 
-			memset(&entry, 0, sizeof(entry));
-			if (!tq_read_list_directory_entry(scan->indexRelation,
-											  meta_fields.directory_root_block,
-											  selected_lists[index],
-											  &entry,
-											  error_buf, sizeof(error_buf))
-				|| !tq_collect_bounded_pages_for_chain(scan->indexRelation,
-													   entry.head_block,
-													   opaque,
-													   page_candidates,
-													   max_pages,
-													   &page_count,
-													   error_buf,
-													   sizeof(error_buf)))
+			if (!tq_collect_bounded_pages_for_list(scan->indexRelation,
+												  &selected_entries[ranked_index],
+												  opaque,
+												  page_candidates,
+												  max_pages,
+												  &page_count,
+												  error_buf,
+												  sizeof(error_buf)))
 			{
 				tq_router_reset(&router_model);
+				pfree(selected_entries);
+				pfree(ranked_scores);
 				pfree(ranked_live_counts);
 				pfree(ranked_page_counts);
+				pfree(selected_indexes);
 				pfree(page_candidates);
-				pfree(selected_lists);
+				pfree(ranked_probes);
 				elog(ERROR, "%s", error_buf);
 			}
 		}
@@ -2716,21 +3233,26 @@ tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque)
 		qsort(page_candidates, page_count, sizeof(page_candidates[0]),
 			  tq_bounded_page_candidate_compare);
 
-		for (index = 0; index < page_count; index++)
-		{
-			bool should_prune = false;
-
-			if (!tq_scan_should_prune_page(&opaque->candidates,
-										   page_candidates[index].optimistic_distance,
-										   &should_prune,
-										   error_buf,
-										   sizeof(error_buf)))
+			for (index = 0; index < page_count; index++)
 			{
-				tq_router_reset(&router_model);
+				bool should_prune = false;
+
+				if (tq_scan_page_bounds_are_safe_for_pruning(opaque->normalized,
+															 opaque->distance_kind)
+					&& !tq_scan_should_prune_page(&opaque->candidates,
+												  page_candidates[index].optimistic_distance,
+												  &should_prune,
+												  error_buf,
+												  sizeof(error_buf)))
+				{
+					tq_router_reset(&router_model);
+					pfree(selected_entries);
+					pfree(ranked_scores);
 				pfree(ranked_live_counts);
 				pfree(ranked_page_counts);
+				pfree(selected_indexes);
 				pfree(page_candidates);
-				pfree(selected_lists);
+				pfree(ranked_probes);
 				elog(ERROR, "%s", error_buf);
 			}
 
@@ -2748,10 +3270,13 @@ tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque)
 									 sizeof(error_buf)))
 			{
 				tq_router_reset(&router_model);
+				pfree(selected_entries);
+				pfree(ranked_scores);
 				pfree(ranked_live_counts);
 				pfree(ranked_page_counts);
+				pfree(selected_indexes);
 				pfree(page_candidates);
-				pfree(selected_lists);
+				pfree(ranked_probes);
 				elog(ERROR, "%s", error_buf);
 			}
 		}
@@ -2760,10 +3285,13 @@ tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque)
 												 opaque->candidates.count);
 
 		tq_router_reset(&router_model);
+		pfree(selected_entries);
+		pfree(ranked_scores);
 		pfree(ranked_live_counts);
 		pfree(ranked_page_counts);
+		pfree(selected_indexes);
 		pfree(page_candidates);
-		pfree(selected_lists);
+		pfree(ranked_probes);
 	}
 
 	opaque->prepared = true;

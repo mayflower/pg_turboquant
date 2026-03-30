@@ -1,5 +1,6 @@
 #!/usr/bin/env -S uv run python
 import argparse
+import html
 import json
 import math
 import platform
@@ -168,6 +169,8 @@ def synthetic_code_domain_kernel(corpus: Corpus, spec: dict, simd_metadata: dict
         return "scalar"
     if simd_metadata.get("runtime_available", {}).get("avx2"):
         return "avx2"
+    if simd_metadata.get("runtime_available", {}).get("neon"):
+        return "neon"
     return "scalar"
 
 
@@ -947,11 +950,15 @@ def default_scan_stats(method: str) -> dict:
         "max_visited_pages": 0,
         "selected_list_count": 0,
         "selected_live_count": 0,
+        "selected_page_count": 0,
         "visited_page_count": 0,
         "visited_code_count": 0,
         "retained_candidate_count": 0,
         "candidate_heap_capacity": 0,
         "candidate_heap_count": 0,
+        "candidate_heap_insert_count": 0,
+        "candidate_heap_replace_count": 0,
+        "candidate_heap_reject_count": 0,
         "decoded_vector_count": 0,
         "page_prune_count": 0,
         "early_stop_count": 0,
@@ -970,11 +977,15 @@ def aggregate_scan_stats(scan_stats: list[dict], fallback_method: str) -> dict:
         "max_visited_pages",
         "selected_list_count",
         "selected_live_count",
+        "selected_page_count",
         "visited_page_count",
         "visited_code_count",
         "retained_candidate_count",
         "candidate_heap_capacity",
         "candidate_heap_count",
+        "candidate_heap_insert_count",
+        "candidate_heap_replace_count",
+        "candidate_heap_reject_count",
         "decoded_vector_count",
         "page_prune_count",
         "early_stop_count",
@@ -988,6 +999,74 @@ def aggregate_scan_stats(scan_stats: list[dict], fallback_method: str) -> dict:
         values = [float(item.get(key, 0)) for item in scan_stats]
         aggregated[key] = round(sum(values) / max(1, len(values)), 6)
     return aggregated
+
+
+def default_candidate_retention() -> dict:
+    return {
+        "avg_candidate_count": 0.0,
+        "avg_exact_top_10_retention": 0.0,
+        "avg_exact_top_100_retention": 0.0,
+        "avg_exact_top_100_miss_count": 0.0,
+        "worst_exact_top_100_retention": 0.0,
+    }
+
+
+def candidate_retention_for_query(exact_ids: list[int], approx_candidate_ids: list[int]) -> dict:
+    approx_set = set(approx_candidate_ids)
+    exact_top_10 = exact_ids[:10]
+    exact_top_100 = exact_ids[:100]
+    retained_top_10 = len(set(exact_top_10) & approx_set) / max(1, len(exact_top_10))
+    retained_top_100 = len(set(exact_top_100) & approx_set) / max(1, len(exact_top_100))
+    miss_count = len(set(exact_top_100) - approx_set)
+    return {
+        "candidate_count": float(len(approx_candidate_ids)),
+        "exact_top_10_retention": round(retained_top_10, 6),
+        "exact_top_100_retention": round(retained_top_100, 6),
+        "exact_top_100_miss_count": float(miss_count),
+    }
+
+
+def aggregate_candidate_retention(retention_stats: list[dict]) -> dict:
+    if not retention_stats:
+        return default_candidate_retention()
+
+    return {
+        "avg_candidate_count": round(
+            sum(float(item.get("candidate_count", 0.0)) for item in retention_stats) / len(retention_stats),
+            6,
+        ),
+        "avg_exact_top_10_retention": round(
+            sum(float(item.get("exact_top_10_retention", 0.0)) for item in retention_stats) / len(retention_stats),
+            6,
+        ),
+        "avg_exact_top_100_retention": round(
+            sum(float(item.get("exact_top_100_retention", 0.0)) for item in retention_stats) / len(retention_stats),
+            6,
+        ),
+        "avg_exact_top_100_miss_count": round(
+            sum(float(item.get("exact_top_100_miss_count", 0.0)) for item in retention_stats) / len(retention_stats),
+            6,
+        ),
+        "worst_exact_top_100_retention": round(
+            min(float(item.get("exact_top_100_retention", 0.0)) for item in retention_stats),
+            6,
+        ),
+    }
+
+
+def synthetic_skew_probe_regression() -> dict:
+    return {
+        "closest_centroid": {
+            "recall_at_10": 0.3,
+            "visited_code_count": 120,
+            "visited_page_count": 16,
+        },
+        "cost_aware": {
+            "recall_at_10": 1.0,
+            "visited_code_count": 72,
+            "visited_page_count": 9,
+        },
+    }
 
 
 def scenario_benchmark_metadata(index_metadata: dict) -> dict:
@@ -1036,6 +1115,114 @@ def query_turboquant_ordered_scan_stats(
     return json.loads(rows[1]) if len(rows) > 1 else default_scan_stats(method)
 
 
+def turboquant_rerank_ids_sql(
+    table_name: str,
+    query_vector: tuple[float, ...],
+    limit: int,
+    query_setup: list[str],
+    requested_candidate_limit: Optional[int],
+) -> str:
+    helper_candidate_limit = effective_candidate_limit(limit, requested_candidate_limit)
+    return ";\n".join(
+        query_setup
+        + [
+            (
+                "SELECT coalesce(json_agg(candidate_id::int ORDER BY exact_rank), '[]'::json)::text "
+                "FROM tq_rerank_candidates("
+                f"'{table_name}'::regclass, 'id', 'embedding', "
+                f"'{vector_literal(query_vector)}'::vector, 'cosine', "
+                f"{helper_candidate_limit}, {limit})"
+            )
+        ]
+    )
+
+
+def turboquant_single_batch_rerank_ids_sql(
+    table_name: str,
+    query_vector: tuple[float, ...],
+    limit: int,
+    query_setup: list[str],
+    requested_candidate_limit: Optional[int],
+) -> str:
+    helper_candidate_limit = effective_candidate_limit(limit, requested_candidate_limit)
+    query_literal = vector_literal(query_vector)
+    session_setup = [statement for statement in query_setup if not statement.startswith("SET LOCAL turboquant.")]
+    return ";\n".join(
+        ["BEGIN"]
+        + session_setup
+        + [
+            (
+                "DO $$ "
+                "DECLARE resolved record; "
+                "BEGIN "
+                "SELECT probes, oversample_factor, max_visited_codes, max_visited_pages "
+                "INTO resolved "
+                f"FROM tq_resolve_query_knobs({helper_candidate_limit}, {limit}, NULL, NULL); "
+                "PERFORM set_config('turboquant.probes', resolved.probes::text, true); "
+                "PERFORM set_config('turboquant.oversample_factor', resolved.oversample_factor::text, true); "
+                "PERFORM set_config('turboquant.max_visited_codes', resolved.max_visited_codes::text, true); "
+                "PERFORM set_config('turboquant.max_visited_pages', resolved.max_visited_pages::text, true); "
+                "END $$ LANGUAGE plpgsql"
+            ),
+            (
+                "WITH approx_scan AS MATERIALIZED ("
+                f"SELECT id, embedding, (embedding <=> '{query_literal}'::vector) AS approximate_distance "
+                f"FROM {table_name} "
+                f"ORDER BY embedding <=> '{query_literal}'::vector "
+                f"LIMIT {helper_candidate_limit}"
+                "), approx AS MATERIALIZED ("
+                "SELECT "
+                "id::text AS candidate_id, "
+                "id AS candidate_key, "
+                "embedding AS candidate_embedding, "
+                "row_number() OVER (ORDER BY approximate_distance, id)::integer AS approximate_rank, "
+                "round(approximate_distance::numeric, 6)::double precision AS approximate_distance "
+                "FROM approx_scan"
+                "), reranked AS ("
+                "SELECT "
+                "candidate_id, "
+                "row_number() OVER (ORDER BY candidate_embedding <=> "
+                f"'{query_literal}'::vector, candidate_key)::integer AS exact_rank "
+                "FROM approx"
+                ") "
+                "SELECT json_build_object("
+                "'reranked_ids', "
+                f"coalesce((SELECT json_agg(candidate_id::int ORDER BY exact_rank) FROM reranked WHERE exact_rank <= {limit}), '[]'::json), "
+                "'approx_candidate_ids', "
+                "coalesce((SELECT json_agg(candidate_key ORDER BY approximate_rank) FROM approx), '[]'::json)"
+                ")::text"
+            )
+        ]
+    )
+
+
+def query_turboquant_ordered_ids_and_scan_stats(
+    base_cmd: list[str],
+    table_name: str,
+    query_vector: tuple[float, ...],
+    limit: int,
+    query_setup: list[str],
+    requested_candidate_limit: Optional[int],
+    method: str = "turboquant_ivf",
+) -> tuple[list[int], dict, list[int]]:
+    query_sql = turboquant_single_batch_rerank_ids_sql(
+        table_name,
+        query_vector,
+        limit,
+        query_setup,
+        requested_candidate_limit,
+    )
+    rows = query_psql_commands(
+        base_cmd,
+        query_sql + ";\nSELECT tq_last_scan_stats()::text;\nCOMMIT;",
+    )
+    payload = json.loads(rows[0]) if rows else {}
+    query_ids = list(payload.get("reranked_ids", []))
+    approx_candidate_ids = list(payload.get("approx_candidate_ids", []))
+    scan_stats = json.loads(rows[1]) if len(rows) > 1 else default_scan_stats(method)
+    return query_ids, scan_stats, approx_candidate_ids
+
+
 def query_bitmap_ids_and_scan_stats(
     base_cmd: list[str],
     table_name: str,
@@ -1072,18 +1259,12 @@ def query_top_ids(
     query_setup: list[str],
     requested_candidate_limit: Optional[int],
 ) -> list[int]:
-    helper_candidate_limit = effective_candidate_limit(limit, requested_candidate_limit)
-    query_sql = ";\n".join(
-        query_setup
-        + [
-            (
-                "SELECT coalesce(json_agg(candidate_id::int ORDER BY exact_rank), '[]'::json)::text "
-                "FROM tq_rerank_candidates("
-                f"'{table_name}'::regclass, 'id', 'embedding', "
-                f"'{vector_literal(query_vector)}'::vector, 'cosine', "
-                f"{helper_candidate_limit}, {limit})"
-            )
-        ]
+    query_sql = turboquant_rerank_ids_sql(
+        table_name,
+        query_vector,
+        limit,
+        query_setup,
+        requested_candidate_limit,
     )
     raw = query_psql(base_cmd, query_sql)
     if not raw:
@@ -1126,11 +1307,72 @@ def comparison_pairs(methods: list[str]) -> list[tuple[str, str]]:
     return [(candidate, baseline) for candidate in candidates for baseline in baselines]
 
 
+def _report_method_row(scenario: dict) -> dict:
+    metrics = scenario["metrics"]
+    scan_stats = scenario.get("scan_stats", {})
+    query_api = scenario.get("query_api", {})
+    return {
+        "corpus": scenario["corpus"],
+        "method": scenario["method"],
+        "query_mode": scenario.get("query_mode"),
+        "query_helper": query_api.get("helper"),
+        "recall_at_10": metrics.get("recall_at_10", metrics.get("exact_match_fraction")),
+        "p50_ms": metrics.get("p50_ms"),
+        "p95_ms": metrics.get("p95_ms"),
+        "footprint_bytes": metrics.get("index_size_bytes"),
+        "visited_code_count": scan_stats.get("visited_code_count"),
+        "visited_page_count": scan_stats.get("visited_page_count"),
+        "selected_live_count": scan_stats.get("selected_live_count"),
+        "selected_page_count": scan_stats.get("selected_page_count"),
+        "score_kernel": scan_stats.get("score_kernel"),
+    }
+
+
+def _report_comparison_row(candidate: dict, baseline: dict) -> dict:
+    candidate_metrics = candidate["metrics"]
+    baseline_metrics = baseline["metrics"]
+    candidate_scan = candidate.get("scan_stats", {})
+    baseline_scan = baseline.get("scan_stats", {})
+    candidate_recall = candidate_metrics.get("recall_at_10", candidate_metrics.get("exact_match_fraction", 0.0))
+    baseline_recall = baseline_metrics.get("recall_at_10", baseline_metrics.get("exact_match_fraction", 0.0))
+    return {
+        "corpus": candidate["corpus"],
+        "candidate_method": candidate["method"],
+        "baseline_method": baseline["method"],
+        "candidate": _report_method_row(candidate),
+        "baseline": _report_method_row(baseline),
+        "metrics": {
+            "recall_at_10_delta": round(candidate_recall - baseline_recall, 6),
+            "p95_ms_delta": round(candidate_metrics["p95_ms"] - baseline_metrics["p95_ms"], 6),
+            "build_seconds_delta": round(candidate_metrics["build_seconds"] - baseline_metrics["build_seconds"], 6),
+            "index_size_bytes_delta": int(candidate_metrics["index_size_bytes"] - baseline_metrics["index_size_bytes"]),
+            "build_wal_bytes_delta": int(candidate_metrics["build_wal_bytes"] - baseline_metrics["build_wal_bytes"]),
+            "visited_code_count_delta": round(
+                float(candidate_scan.get("visited_code_count", 0.0)) - float(baseline_scan.get("visited_code_count", 0.0)),
+                6,
+            ),
+            "visited_page_count_delta": round(
+                float(candidate_scan.get("visited_page_count", 0.0)) - float(baseline_scan.get("visited_page_count", 0.0)),
+                6,
+            ),
+            "selected_live_count_delta": round(
+                float(candidate_scan.get("selected_live_count", 0.0)) - float(baseline_scan.get("selected_live_count", 0.0)),
+                6,
+            ),
+            "selected_page_count_delta": round(
+                float(candidate_scan.get("selected_page_count", 0.0)) - float(baseline_scan.get("selected_page_count", 0.0)),
+                6,
+            ),
+        },
+    }
+
+
 def generate_report(payload: dict) -> dict:
     scenarios = payload["scenarios"]
     methods = payload["methods"]
     corpora = payload["corpora"]
     grouped = {(scenario["corpus"], scenario["method"]): scenario for scenario in scenarios}
+    method_rows = [_report_method_row(scenario) for scenario in scenarios]
     comparisons = []
 
     for corpus in corpora:
@@ -1139,35 +1381,7 @@ def generate_report(payload: dict) -> dict:
             baseline = grouped.get((corpus, baseline_method))
             if candidate is None or baseline is None:
                 continue
-
-            candidate_metrics = candidate["metrics"]
-            baseline_metrics = baseline["metrics"]
-            candidate_recall = candidate_metrics.get(
-                "recall_at_10", candidate_metrics.get("exact_match_fraction", 0.0)
-            )
-            baseline_recall = baseline_metrics.get(
-                "recall_at_10", baseline_metrics.get("exact_match_fraction", 0.0)
-            )
-            comparisons.append(
-                {
-                    "corpus": corpus,
-                    "candidate_method": candidate_method,
-                    "baseline_method": baseline_method,
-                    "metrics": {
-                        "recall_at_10_delta": round(candidate_recall - baseline_recall, 6),
-                        "p95_ms_delta": round(candidate_metrics["p95_ms"] - baseline_metrics["p95_ms"], 6),
-                        "build_seconds_delta": round(
-                            candidate_metrics["build_seconds"] - baseline_metrics["build_seconds"], 6
-                        ),
-                        "index_size_bytes_delta": int(
-                            candidate_metrics["index_size_bytes"] - baseline_metrics["index_size_bytes"]
-                        ),
-                        "build_wal_bytes_delta": int(
-                            candidate_metrics["build_wal_bytes"] - baseline_metrics["build_wal_bytes"]
-                        ),
-                    },
-                }
-            )
+            comparisons.append(_report_comparison_row(candidate, baseline))
 
     leaderboards = {"best_recall_at_10": [], "best_p95_ms": []}
     for corpus in corpora:
@@ -1199,14 +1413,63 @@ def generate_report(payload: dict) -> dict:
             }
         )
 
+    measurement_notes = [
+        "TurboQuant ordered timing and tq_last_scan_stats() are captured from one SQL batch per repetition in this harness.",
+        "Ordered retrieval results are reported with the configured helper contract and candidate limit for each scenario.",
+        "Latency, scan work, and footprint are reported separately; this report only states what was measured for the listed corpus/profile/knob matrix.",
+    ]
+    conclusions = []
+    for corpus in corpora:
+        turboquant_rows = [row for row in method_rows if row["corpus"] == corpus and row["method"].startswith("turboquant_")]
+        baseline_rows = [row for row in method_rows if row["corpus"] == corpus and row["method"].startswith("pgvector_")]
+        if not turboquant_rows or not baseline_rows:
+            continue
+        turboquant_row = min(
+            turboquant_rows,
+            key=lambda row: row["p95_ms"] if row["p95_ms"] is not None else float("inf"),
+        )
+        fastest_baseline = min(
+            baseline_rows,
+            key=lambda row: row["p95_ms"] if row["p95_ms"] is not None else float("inf"),
+        )
+        smallest_baseline = min(
+            baseline_rows,
+            key=lambda row: row["footprint_bytes"] if row["footprint_bytes"] is not None else float("inf"),
+        )
+        conclusions.append(
+            {
+                "corpus": corpus,
+                "fairness": "This run uses the single-execution TurboQuant ordered timing path; it does not include the older double-execution benchmark path.",
+                "scan_work": (
+                    f"{turboquant_row['method']} visited {_report_fmt(turboquant_row['visited_code_count'])} codes "
+                    f"across {_report_fmt(turboquant_row['visited_page_count'])} pages with "
+                    f"{_report_fmt(turboquant_row['selected_live_count'])} selected lives and "
+                    f"{_report_fmt(turboquant_row['selected_page_count'])} selected pages "
+                    f"on score_kernel={turboquant_row['score_kernel'] or '-'}."
+                ),
+                "latency": (
+                    f"{turboquant_row['method']} p95={_report_fmt(turboquant_row['p95_ms'])} ms "
+                    f"vs fastest pgvector baseline {fastest_baseline['method']} p95={_report_fmt(fastest_baseline['p95_ms'])} ms."
+                ),
+                "footprint": (
+                    f"{turboquant_row['method']} footprint={_report_fmt(turboquant_row['footprint_bytes'])} B "
+                    f"vs smallest pgvector baseline {smallest_baseline['method']} footprint={_report_fmt(smallest_baseline['footprint_bytes'])} B."
+                ),
+            }
+        )
+
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "summary": {
             "scenario_count": len(scenarios),
             "methods": methods,
             "corpora": corpora,
+            "query_modes": sorted({scenario.get("query_mode", "ordered_rerank") for scenario in scenarios}),
         },
+        "method_rows": method_rows,
         "comparisons": comparisons,
+        "measurement_notes": measurement_notes,
+        "conclusions": conclusions,
         "leaderboards": leaderboards,
     }
 
@@ -1222,10 +1485,31 @@ def render_report_markdown(report: dict) -> str:
         f"- Scenarios: {report['summary']['scenario_count']}",
         f"- Methods: {', '.join(report['summary']['methods'])}",
         f"- Corpora: {', '.join(report['summary']['corpora'])}",
+        f"- Query modes: {', '.join(report['summary']['query_modes'])}",
         "",
-        "## Comparisons",
+        "## Measurement Notes",
         "",
     ]
+    lines.extend(f"- {note}" for note in report["measurement_notes"])
+    lines.extend(
+        [
+            "",
+            "## Method Metrics",
+            "",
+            "- Columns: corpus, method, recall_at_10, p50_ms, p95_ms, footprint_bytes, visited_code_count, visited_page_count, selected_live_count, selected_page_count, score_kernel, query_helper",
+            "",
+        ]
+    )
+    for row in report["method_rows"]:
+        lines.append(
+            f"- {row['corpus']} | {row['method']} | recall_at_10={_report_fmt(row['recall_at_10'])} | "
+            f"p50_ms={_report_fmt(row['p50_ms'])} | p95_ms={_report_fmt(row['p95_ms'])} | "
+            f"footprint_bytes={_report_fmt(row['footprint_bytes'])} | visited_code_count={_report_fmt(row['visited_code_count'])} | "
+            f"visited_page_count={_report_fmt(row['visited_page_count'])} | selected_live_count={_report_fmt(row['selected_live_count'])} | "
+            f"selected_page_count={_report_fmt(row['selected_page_count'])} | score_kernel={row['score_kernel']} | "
+            f"query_helper={row['query_helper']}"
+        )
+    lines.extend(["", "## Comparisons", ""])
 
     if not report["comparisons"]:
         lines.append("- No baseline comparisons available for the selected matrix.")
@@ -1236,10 +1520,216 @@ def render_report_markdown(report: dict) -> str:
                 f"- {comparison['corpus']}: {comparison['candidate_method']} vs {comparison['baseline_method']} "
                 f"(recall@10 delta={metrics['recall_at_10_delta']}, p95 delta={metrics['p95_ms_delta']} ms, "
                 f"build delta={metrics['build_seconds_delta']} s, size delta={metrics['index_size_bytes_delta']} B, "
-                f"WAL delta={metrics['build_wal_bytes_delta']} B)"
+                f"WAL delta={metrics['build_wal_bytes_delta']} B, visited_code_count delta={metrics['visited_code_count_delta']}, "
+                f"selected_page_count delta={metrics['selected_page_count_delta']})"
             )
 
+    lines.extend(["", "## Hotpot Conclusions", ""])
+    if not report["conclusions"]:
+        lines.append("- No corpus-specific conclusions were generated for the selected matrix.")
+    else:
+        for conclusion in report["conclusions"]:
+            lines.append(f"### {conclusion['corpus']}")
+            lines.append("")
+            lines.append(f"- Fairness: {conclusion['fairness']}")
+            lines.append(f"- Scan work: {conclusion['scan_work']}")
+            lines.append(f"- Latency: {conclusion['latency']}")
+            lines.append(f"- Footprint: {conclusion['footprint']}")
+            lines.append("")
+
     return "\n".join(lines) + "\n"
+
+
+def render_report_html(report: dict) -> str:
+    note_items = "".join(f"<li>{html.escape(note)}</li>" for note in report["measurement_notes"])
+    method_rows = "".join(_render_report_method_row(row) for row in report["method_rows"])
+    comparison_rows = "".join(_render_report_comparison_row(row) for row in report["comparisons"])
+    conclusion_blocks = "".join(
+        (
+            "<article class=\"card\">"
+            f"<h3>{html.escape(conclusion['corpus'])}</h3>"
+            f"<p><strong>Fairness:</strong> {html.escape(conclusion['fairness'])}</p>"
+            f"<p><strong>Scan work:</strong> {html.escape(conclusion['scan_work'])}</p>"
+            f"<p><strong>Latency:</strong> {html.escape(conclusion['latency'])}</p>"
+            f"<p><strong>Footprint:</strong> {html.escape(conclusion['footprint'])}</p>"
+            "</article>"
+        )
+        for conclusion in report["conclusions"]
+    )
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>pg_turboquant Benchmark Report</title>
+  <style>
+    :root {{
+      --bg: #f6f2ea;
+      --panel: #fffdfa;
+      --ink: #17261d;
+      --muted: #5f6f63;
+      --line: #d8d0c3;
+    }}
+    body {{
+      margin: 0;
+      font-family: "Iowan Old Style", "Palatino Linotype", serif;
+      background: radial-gradient(circle at top, #fff8ed 0%, var(--bg) 58%);
+      color: var(--ink);
+    }}
+    main {{
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 40px 24px 72px;
+    }}
+    .hero, .card, table {{
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      box-shadow: 0 10px 28px rgba(23, 38, 29, 0.05);
+    }}
+    .hero {{
+      padding: 28px;
+      margin-bottom: 24px;
+    }}
+    .grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 16px;
+    }}
+    .card {{
+      padding: 16px;
+    }}
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      overflow: hidden;
+      margin-top: 12px;
+    }}
+    th, td {{
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+      font-size: 0.95rem;
+    }}
+    th {{
+      background: rgba(23, 38, 29, 0.04);
+    }}
+    p, li {{
+      color: var(--muted);
+      line-height: 1.45;
+    }}
+    .mono {{
+      font-family: "SFMono-Regular", "Menlo", monospace;
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <section class="hero">
+      <h1>pg_turboquant Benchmark Report</h1>
+      <p>This report lists measured recall, latency, scan work, and footprint for the selected corpus/profile/knob matrix. It uses the current single-execution TurboQuant timing path and avoids blanket speed claims outside the measured scenarios.</p>
+      <div class="grid">
+        <div class="card"><strong>Scenarios</strong><br>{report['summary']['scenario_count']}</div>
+        <div class="card"><strong>Methods</strong><br>{html.escape(', '.join(report['summary']['methods']))}</div>
+        <div class="card"><strong>Corpora</strong><br>{html.escape(', '.join(report['summary']['corpora']))}</div>
+        <div class="card"><strong>Query modes</strong><br>{html.escape(', '.join(report['summary']['query_modes']))}</div>
+      </div>
+    </section>
+    <section>
+      <h2>Measurement Notes</h2>
+      <ul>{note_items}</ul>
+    </section>
+    <section>
+      <h2>Method Metrics</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>corpus</th>
+            <th>method</th>
+            <th>recall@10</th>
+            <th>p50_ms</th>
+            <th>p95_ms</th>
+            <th>footprint_bytes</th>
+            <th>visited_code_count</th>
+            <th>visited_page_count</th>
+            <th>selected_live_count</th>
+            <th>selected_page_count</th>
+            <th>score_kernel</th>
+          </tr>
+        </thead>
+        <tbody>{method_rows}</tbody>
+      </table>
+    </section>
+    <section>
+      <h2>Comparisons</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>corpus</th>
+            <th>candidate</th>
+            <th>baseline</th>
+            <th>recall@10 delta</th>
+            <th>p95_ms delta</th>
+            <th>footprint delta</th>
+            <th>visited_code_count delta</th>
+            <th>selected_page_count delta</th>
+          </tr>
+        </thead>
+        <tbody>{comparison_rows}</tbody>
+      </table>
+    </section>
+    <section>
+      <h2>Hotpot Conclusions</h2>
+      <div class="grid">{conclusion_blocks}</div>
+    </section>
+  </main>
+</body>
+</html>
+"""
+
+
+def _render_report_method_row(row: dict) -> str:
+    return (
+        "<tr>"
+        f"<td>{html.escape(str(row['corpus']))}</td>"
+        f"<td class=\"mono\">{html.escape(str(row['method']))}</td>"
+        f"<td>{_report_fmt(row['recall_at_10'])}</td>"
+        f"<td>{_report_fmt(row['p50_ms'])}</td>"
+        f"<td>{_report_fmt(row['p95_ms'])}</td>"
+        f"<td>{_report_fmt(row['footprint_bytes'])}</td>"
+        f"<td>{_report_fmt(row['visited_code_count'])}</td>"
+        f"<td>{_report_fmt(row['visited_page_count'])}</td>"
+        f"<td>{_report_fmt(row['selected_live_count'])}</td>"
+        f"<td>{_report_fmt(row['selected_page_count'])}</td>"
+        f"<td>{html.escape(str(row['score_kernel']))}</td>"
+        "</tr>"
+    )
+
+
+def _render_report_comparison_row(row: dict) -> str:
+    metrics = row["metrics"]
+    return (
+        "<tr>"
+        f"<td>{html.escape(str(row['corpus']))}</td>"
+        f"<td class=\"mono\">{html.escape(str(row['candidate_method']))}</td>"
+        f"<td class=\"mono\">{html.escape(str(row['baseline_method']))}</td>"
+        f"<td>{_report_fmt(metrics['recall_at_10_delta'])}</td>"
+        f"<td>{_report_fmt(metrics['p95_ms_delta'])}</td>"
+        f"<td>{_report_fmt(metrics['index_size_bytes_delta'])}</td>"
+        f"<td>{_report_fmt(metrics['visited_code_count_delta'])}</td>"
+        f"<td>{_report_fmt(metrics['selected_page_count_delta'])}</td>"
+        "</tr>"
+    )
+
+
+def _report_fmt(value: object) -> str:
+    if value is None:
+        return "-"
+    numeric = float(value)
+    if numeric.is_integer():
+        return f"{int(numeric):,}"
+    return f"{numeric:.4f}"
 
 
 def run_scenario(
@@ -1282,6 +1772,7 @@ def run_scenario(
     approx_results = []
     latencies_ms = []
     scan_stats_results = []
+    candidate_retention_results = []
 
     if spec.get("query_mode") == "bitmap_filter":
         exact_results = [
@@ -1323,28 +1814,22 @@ def run_scenario(
             latencies_ms.append(best_latency_ms or 0.0)
             scan_stats_results.append(best_scan_stats)
     else:
-        for query in corpus.queries:
+        for query_index, query in enumerate(corpus.queries):
             best_ids = []
             best_latency_ms = None
             best_scan_stats = default_scan_stats(method)
+            best_approx_candidate_ids = []
             for _ in range(repetitions):
                 started = time.perf_counter()
                 if spec["index_method"] == "turboquant":
-                    query_ids = query_top_ids(
+                    query_ids, query_scan_stats, approx_candidate_ids = query_turboquant_ordered_ids_and_scan_stats(
                         base_cmd,
                         table_name,
                         query,
                         TOP_K_VALUES[-1],
                         spec["query_setup"],
                         requested_rerank_candidate_limit,
-                    )
-                    query_scan_stats = query_turboquant_ordered_scan_stats(
-                        base_cmd,
-                        table_name,
-                        query,
-                        TOP_K_VALUES[-1],
-                        spec["query_setup"],
-                        method,
+                        method=method,
                     )
                 else:
                     query_ids = query_top_ids(
@@ -1356,14 +1841,20 @@ def run_scenario(
                         requested_rerank_candidate_limit,
                     )
                     query_scan_stats = default_scan_stats(method)
+                    approx_candidate_ids = []
                 elapsed_ms = (time.perf_counter() - started) * 1000.0
                 if best_latency_ms is None or elapsed_ms < best_latency_ms:
                     best_latency_ms = elapsed_ms
                     best_ids = query_ids
                     best_scan_stats = query_scan_stats
+                    best_approx_candidate_ids = approx_candidate_ids
             approx_results.append(best_ids)
             latencies_ms.append(best_latency_ms or 0.0)
             scan_stats_results.append(best_scan_stats)
+            if spec["index_method"] == "turboquant":
+                candidate_retention_results.append(
+                    candidate_retention_for_query(exact_results[query_index], best_approx_candidate_ids)
+                )
 
     insert_wal_bytes, inserted_rows = measure_insert_wal(base_cmd, table_name, corpus)
     concurrent_insert_rows_per_second, concurrent_insert_rows, concurrent_insert_workers = (
@@ -1419,6 +1910,8 @@ def run_scenario(
         "simd": simd_metadata,
         "scan_stats": aggregated_scan_stats,
     }
+    if spec.get("query_mode", "ordered_rerank") == "ordered_rerank" and spec["index_method"] == "turboquant":
+        scenario["candidate_retention"] = aggregate_candidate_retention(candidate_retention_results)
     if spec.get("query_mode") == "bitmap_filter":
         scenario["query_api"] = {
             "helper": "tq_bitmap_cosine_filter",
@@ -1521,6 +2014,8 @@ def dry_run_scenario(
         "simd": simd_metadata,
         "scan_stats": scan_stats,
     }
+    if spec.get("query_mode", "ordered_rerank") == "ordered_rerank" and spec["index_method"] == "turboquant":
+        scenario["candidate_retention"] = default_candidate_retention()
     if method == "turboquant_ivf":
         scenario["scan_stats"].update(
             {
@@ -1671,6 +2166,7 @@ def main() -> None:
         payload["artifacts"] = {
             "report_json": "benchmark-report.json",
             "report_markdown": "benchmark-report.md",
+            "report_html": "benchmark-report.html",
         }
 
     rendered = json.dumps(payload, indent=2, sort_keys=True)
@@ -1686,6 +2182,10 @@ def main() -> None:
             )
             (output_dir / payload["artifacts"]["report_markdown"]).write_text(
                 render_report_markdown(payload["report"]),
+                encoding="utf-8",
+            )
+            (output_dir / payload["artifacts"]["report_html"]).write_text(
+                render_report_html(payload["report"]),
                 encoding="utf-8",
             )
 

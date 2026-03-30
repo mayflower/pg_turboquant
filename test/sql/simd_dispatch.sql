@@ -57,9 +57,10 @@ stats AS (
 	SELECT tq_last_scan_stats() AS stats
 )
 SELECT
-	stats->>'score_kernel' IN ('scalar', 'avx2') AS supported_kernel_known,
+	stats->>'score_kernel' IN ('scalar', 'avx2', 'neon') AS supported_kernel_known,
 	CASE
 		WHEN (simd.meta #>> '{runtime_available,avx2}')::boolean THEN stats->>'score_kernel' = 'avx2'
+		WHEN (simd.meta #>> '{runtime_available,neon}')::boolean THEN stats->>'score_kernel' = 'neon'
 		ELSE stats->>'score_kernel' = 'scalar'
 	END AS supported_kernel_matches_runtime,
 	stats->>'score_mode' = 'code_domain' AS supported_mode_is_code_domain
@@ -78,7 +79,7 @@ INSERT INTO tq_simd_unsupported_docs (id, embedding) VALUES
 CREATE INDEX tq_simd_unsupported_idx
 	ON tq_simd_unsupported_docs
 	USING turboquant (embedding tq_cosine_ops)
-	WITH (bits = 4, lists = 0, lanes = auto, transform = 'hadamard', normalized = true);
+	WITH (bits = 3, lists = 0, lanes = auto, transform = 'hadamard', normalized = true);
 
 SELECT array_agg(id) AS unsupported_ids
 FROM (
@@ -91,3 +92,5 @@ FROM (
 SELECT
 	(tq_last_scan_stats()->>'score_kernel') = 'scalar' AS unsupported_kernel_scalar,
 	(tq_last_scan_stats()->>'score_mode') = 'code_domain' AS unsupported_mode_is_code_domain;
+
+RESET enable_seqscan;

@@ -63,6 +63,20 @@ compare_ranked_distance(const void *left, const void *right)
 	return 0;
 }
 
+static TqProdScoreKernel
+expected_code_domain_kernel(const TqProdCodecConfig *config)
+{
+	if (config == NULL || config->bits != 4 || config->dimension == 0
+		|| (config->dimension % 8u) != 0u)
+		return TQ_PROD_SCORE_SCALAR;
+
+	if (tq_simd_avx2_runtime_available())
+		return TQ_PROD_SCORE_AVX2;
+	if (tq_simd_neon_runtime_available())
+		return TQ_PROD_SCORE_NEON;
+	return TQ_PROD_SCORE_SCALAR;
+}
+
 static void
 test_supported_shape_matches_scalar_scores(void)
 {
@@ -103,6 +117,113 @@ test_supported_shape_matches_scalar_scores(void)
 	}
 
 	tq_prod_lut_reset(&lut);
+}
+
+static void
+test_supported_shape_avx2_matches_scalar_scores_for_multiple_dimensions_when_available(void)
+{
+	const uint32_t dimensions[] = {8u, 32u, 128u};
+	size_t config_index = 0;
+
+	if (!tq_simd_avx2_runtime_available())
+		return;
+
+	for (config_index = 0; config_index < (sizeof(dimensions) / sizeof(dimensions[0])); config_index++)
+	{
+		TqProdCodecConfig config = {.dimension = dimensions[config_index], .bits = 4};
+		TqProdPackedLayout layout;
+		TqProdLut lut;
+		uint8_t packed[512];
+		float query[128];
+		float input[128];
+		float scalar_score = 0.0f;
+		float avx2_score = 0.0f;
+		TqProdScoreKernel used_kernel = TQ_PROD_SCORE_SCALAR;
+		char errmsg[256];
+		uint32_t seed = 0;
+
+		memset(&layout, 0, sizeof(layout));
+		memset(&lut, 0, sizeof(lut));
+		memset(packed, 0, sizeof(packed));
+		memset(query, 0, sizeof(query));
+		memset(input, 0, sizeof(input));
+
+		seeded_unit_vector(1000u + dimensions[config_index], query, config.dimension);
+		assert(tq_prod_packed_layout(&config, &layout, errmsg, sizeof(errmsg)));
+		assert(layout.total_bytes <= sizeof(packed));
+		assert(tq_prod_lut_build(&config, query, &lut, errmsg, sizeof(errmsg)));
+
+		for (seed = 0; seed < 32u; seed++)
+		{
+			seeded_unit_vector(2000u + dimensions[config_index] + seed, input, config.dimension);
+			assert(tq_prod_encode(&config, input, packed, layout.total_bytes, errmsg, sizeof(errmsg)));
+			assert(tq_prod_score_code_from_lut(&config, &lut, packed, layout.total_bytes,
+											   &scalar_score, errmsg, sizeof(errmsg)));
+			assert(tq_prod_score_code_from_lut_dispatch(&config, &lut, packed, layout.total_bytes,
+														TQ_PROD_SCORE_AVX2, &avx2_score, &used_kernel,
+														errmsg, sizeof(errmsg)));
+			assert(used_kernel == TQ_PROD_SCORE_AVX2);
+			assert(fabsf(avx2_score - scalar_score) <= 1e-5f);
+		}
+
+		tq_prod_lut_reset(&lut);
+	}
+}
+
+static void
+test_supported_shape_neon_matches_scalar_scores_when_available(void)
+{
+	TqProdCodecConfig config = {.dimension = 8, .bits = 4};
+	TqProdPackedLayout layout;
+	TqProdLut lut;
+	uint8_t packed[64];
+	float query[8];
+	float scalar_score = 0.0f;
+	float neon_score = 0.0f;
+	TqProdScoreKernel used_kernel = TQ_PROD_SCORE_SCALAR;
+	char errmsg[256];
+	uint32_t seed = 0;
+
+	if (!tq_simd_neon_runtime_available())
+		return;
+
+	memset(&layout, 0, sizeof(layout));
+	memset(&lut, 0, sizeof(lut));
+	memset(packed, 0, sizeof(packed));
+	memset(query, 0, sizeof(query));
+
+	seeded_unit_vector(9u, query, 8);
+	assert(tq_prod_packed_layout(&config, &layout, errmsg, sizeof(errmsg)));
+	assert(tq_prod_lut_build(&config, query, &lut, errmsg, sizeof(errmsg)));
+
+	for (seed = 101u; seed < 117u; seed++)
+	{
+		float input[8];
+
+		memset(input, 0, sizeof(input));
+		seeded_unit_vector(seed, input, 8);
+		assert(tq_prod_encode(&config, input, packed, layout.total_bytes, errmsg, sizeof(errmsg)));
+		assert(tq_prod_score_code_from_lut(&config, &lut, packed, layout.total_bytes,
+										   &scalar_score, errmsg, sizeof(errmsg)));
+		assert(tq_prod_score_code_from_lut_dispatch(&config, &lut, packed, layout.total_bytes,
+													TQ_PROD_SCORE_NEON, &neon_score, &used_kernel,
+													errmsg, sizeof(errmsg)));
+		assert(used_kernel == TQ_PROD_SCORE_NEON);
+		assert(fabsf(neon_score - scalar_score) <= 1e-5f);
+	}
+
+	tq_prod_lut_reset(&lut);
+}
+
+static void
+test_preferred_kernel_matches_supported_runtime(void)
+{
+	TqProdCodecConfig supported_config = {.dimension = 8, .bits = 4};
+	TqProdCodecConfig unsupported_config = {.dimension = 6, .bits = 4};
+
+	assert(tq_prod_code_domain_preferred_kernel(&supported_config)
+		   == expected_code_domain_kernel(&supported_config));
+	assert(tq_prod_code_domain_preferred_kernel(&unsupported_config) == TQ_PROD_SCORE_SCALAR);
 }
 
 static void
@@ -232,6 +353,12 @@ test_dispatch_falls_back_to_scalar_for_unsupported_shape_or_disabled_runtime(voi
 													errmsg, sizeof(errmsg)));
 		assert(used_kernel == TQ_PROD_SCORE_SCALAR);
 		assert(fabsf(dispatch_score - scalar_score) <= 1e-5f);
+		assert(tq_prod_score_code_from_lut_dispatch(&unsupported_config, &unsupported_lut,
+													unsupported_packed, unsupported_layout.total_bytes,
+													TQ_PROD_SCORE_NEON, &dispatch_score, &used_kernel,
+													errmsg, sizeof(errmsg)));
+		assert(used_kernel == TQ_PROD_SCORE_SCALAR);
+		assert(fabsf(dispatch_score - scalar_score) <= 1e-5f);
 	}
 
 	assert(tq_prod_packed_layout(&supported_config, &supported_layout, errmsg, sizeof(errmsg)));
@@ -259,11 +386,47 @@ test_dispatch_falls_back_to_scalar_for_unsupported_shape_or_disabled_runtime(voi
 	tq_prod_lut_reset(&supported_lut);
 }
 
+static void
+test_malformed_packed_input_rejected_cleanly(void)
+{
+	TqProdCodecConfig config = {.dimension = 8, .bits = 4};
+	TqProdPackedLayout layout;
+	TqProdLut lut;
+	uint8_t packed[64];
+	float query[8];
+	float score = 0.0f;
+	TqProdScoreKernel used_kernel = TQ_PROD_SCORE_AUTO;
+	char errmsg[256];
+
+	memset(&layout, 0, sizeof(layout));
+	memset(&lut, 0, sizeof(lut));
+	memset(packed, 0, sizeof(packed));
+	memset(query, 0, sizeof(query));
+	memset(errmsg, 0, sizeof(errmsg));
+
+	seeded_unit_vector(77u, query, 8);
+	assert(tq_prod_packed_layout(&config, &layout, errmsg, sizeof(errmsg)));
+	assert(tq_prod_lut_build(&config, query, &lut, errmsg, sizeof(errmsg)));
+	assert(tq_prod_encode(&config, query, packed, layout.total_bytes, errmsg, sizeof(errmsg)));
+
+	assert(!tq_prod_score_code_from_lut_dispatch(&config, &lut, packed, layout.total_bytes - 1,
+												 TQ_PROD_SCORE_AUTO, &score, &used_kernel,
+												 errmsg, sizeof(errmsg)));
+	assert(strstr(errmsg, "too small") != NULL);
+	assert(used_kernel == expected_code_domain_kernel(&config));
+
+	tq_prod_lut_reset(&lut);
+}
+
 int
 main(void)
 {
 	test_supported_shape_matches_scalar_scores();
+	test_supported_shape_avx2_matches_scalar_scores_for_multiple_dimensions_when_available();
+	test_supported_shape_neon_matches_scalar_scores_when_available();
+	test_preferred_kernel_matches_supported_runtime();
 	test_ranking_equivalence_on_seeded_fixture();
 	test_dispatch_falls_back_to_scalar_for_unsupported_shape_or_disabled_runtime();
+	test_malformed_packed_input_rejected_cleanly();
 	return 0;
 }

@@ -43,6 +43,12 @@ typedef struct TqRouterModel
 	TqRouterTrainingMetadata metadata;
 } TqRouterModel;
 
+typedef struct TqRouterProbeScore
+{
+	uint32_t	list_id;
+	float		score;
+} TqRouterProbeScore;
+
 extern void tq_router_reset(TqRouterModel *model);
 extern bool tq_router_train_first(const float *vectors,
 								  size_t vector_count,
@@ -63,6 +69,12 @@ extern bool tq_router_assign_best(const TqRouterModel *model,
 								  const float *vector,
 								  uint32_t *list_id,
 								  float *score,
+								  char *errmsg,
+								  size_t errmsg_len);
+extern bool tq_router_rank_probes(const TqRouterModel *model,
+								  const float *query,
+								  TqRouterProbeScore *out_scores,
+								  size_t out_capacity,
 								  char *errmsg,
 								  size_t errmsg_len);
 extern bool tq_router_select_probes(const TqRouterModel *model,

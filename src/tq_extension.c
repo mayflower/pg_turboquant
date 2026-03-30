@@ -443,7 +443,7 @@ tq_append_list_metadata_json(StringInfo buf,
 
 		*total_live_count += aggregate.live_count;
 		*total_dead_count += aggregate.dead_count;
-		*batch_page_count += aggregate.batch_page_count;
+		*batch_page_count += entry.batch_page_count;
 		if (list_id == 0 || aggregate.live_count < min_live_count)
 			min_live_count = aggregate.live_count;
 		if (list_id == 0 || aggregate.live_count > max_live_count)
@@ -460,7 +460,7 @@ tq_append_list_metadata_json(StringInfo buf,
 						 entry.tail_block,
 						 (unsigned long long) aggregate.live_count,
 						 (unsigned long long) aggregate.dead_count,
-						 aggregate.batch_page_count);
+						 entry.batch_page_count);
 	}
 
 	avg_live_count /= (double) meta_fields->list_count;

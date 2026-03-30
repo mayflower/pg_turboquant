@@ -54,6 +54,7 @@ SELECT
 	stats->>'score_mode' AS score_mode,
 	(stats->>'visited_code_count')::int > 0 AS visited_codes_positive,
 	(stats->>'visited_page_count')::int > 0 AS visited_pages_positive,
+	(stats->>'bound_data_page_reads')::int = 0 AS bound_reads_avoided,
 	(stats->>'selected_list_count')::int <= 2 AS selected_lists_within_probes,
 	(stats->>'selected_live_count')::int > 0 AS selected_live_positive,
 	(stats->>'candidate_heap_capacity')::int >= (stats->>'candidate_heap_count')::int AS heap_bounded

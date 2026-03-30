@@ -11,6 +11,7 @@ int			tq_guc_probes = TQ_DEFAULT_PROBES;
 int			tq_guc_oversample_factor = TQ_DEFAULT_OVERSAMPLE_FACTOR;
 int			tq_guc_max_visited_codes = 0;
 int			tq_guc_max_visited_pages = 0;
+bool		tq_guc_enable_summary_bounds = true;
 
 void		_PG_init(void);
 
@@ -68,4 +69,15 @@ _PG_init(void)
 							NULL,
 							NULL,
 							NULL);
+
+	DefineCustomBoolVariable("turboquant.enable_summary_bounds",
+							 "Use persistent per-page summary side structures for IVF optimistic bounds.",
+							 "When enabled, TurboQuant derives bound ordering and pruning from persisted summary pages instead of pre-reading each selected batch data page.",
+							 &tq_guc_enable_summary_bounds,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
 }

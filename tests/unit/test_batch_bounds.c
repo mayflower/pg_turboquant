@@ -24,6 +24,22 @@ normalize(float *values, size_t len)
 		values[i] /= norm;
 }
 
+static float
+vector_l2_distance(const float *left, const float *right, size_t len)
+{
+	float sum = 0.0f;
+	size_t i = 0;
+
+	for (i = 0; i < len; i++)
+	{
+		float delta = left[i] - right[i];
+
+		sum += delta * delta;
+	}
+
+	return sqrtf(sum);
+}
+
 static void
 seeded_unit_vector(uint32_t seed, float *values, size_t len)
 {
@@ -60,6 +76,49 @@ append_encoded_lane(uint8_t *page,
 									 &lane, errmsg, sizeof(errmsg)));
 	assert(tq_batch_page_set_code(page, page_size, lane, packed, layout.total_bytes,
 								  errmsg, sizeof(errmsg)));
+}
+
+static float
+best_actual_page_distance(const uint8_t *page,
+						  size_t page_size,
+						  const TqProdCodecConfig *config,
+						  const TqProdLut *lut)
+{
+	TqBatchPageHeaderView header;
+	uint8_t code[64];
+	float best_distance = INFINITY;
+	uint16_t lane = 0;
+	char errmsg[256];
+
+	memset(&header, 0, sizeof(header));
+	memset(code, 0, sizeof(code));
+	assert(tq_batch_page_read_header(page, page_size, &header, errmsg, sizeof(errmsg)));
+	assert(header.code_bytes <= sizeof(code));
+
+	if (!tq_batch_page_next_live_lane(page, page_size, -1, &lane, errmsg, sizeof(errmsg)))
+		return INFINITY;
+
+	do
+	{
+		float ip_score = 0.0f;
+		float distance = 0.0f;
+
+		assert(tq_batch_page_get_code(page, page_size, lane, code, header.code_bytes,
+									  errmsg, sizeof(errmsg)));
+		assert(tq_prod_score_code_from_lut(config, lut, code, header.code_bytes,
+										   &ip_score, errmsg, sizeof(errmsg)));
+		assert(tq_metric_distance_from_ip_score(TQ_DISTANCE_COSINE,
+												ip_score,
+												&distance,
+												errmsg,
+												sizeof(errmsg)));
+		if (distance < best_distance)
+			best_distance = distance;
+	}
+	while (tq_batch_page_next_live_lane(page, page_size, (int) lane, &lane,
+										errmsg, sizeof(errmsg)));
+
+	return best_distance;
 }
 
 static void
@@ -100,6 +159,45 @@ test_page_summary_round_trip(void)
 	assert(tq_batch_page_get_summary(page, sizeof(page), &readback, errmsg, sizeof(errmsg)));
 	assert(readback.representative_lane == written.representative_lane);
 	assert(fabsf(readback.residual_radius - written.residual_radius) <= 1e-6f);
+}
+
+static void
+test_summary_side_page_round_trip(void)
+{
+	uint8_t page[TQ_DEFAULT_BLOCK_SIZE];
+	TqBatchPageSummary written = {
+		.representative_lane = 2,
+		.residual_radius = 0.1875f
+	};
+	TqBatchPageSummary readback;
+	uint8_t written_code[8] = {3, 1, 4, 1, 5, 9, 2, 6};
+	uint8_t readback_code[8];
+	uint32_t block_number = 0;
+	TqBatchSummaryPageHeaderView header;
+	char errmsg[256];
+
+	memset(page, 0, sizeof(page));
+	memset(&readback, 0, sizeof(readback));
+	memset(readback_code, 0, sizeof(readback_code));
+	memset(&header, 0, sizeof(header));
+
+	assert(tq_batch_summary_page_init(page, sizeof(page), sizeof(written_code), 4, 91,
+									  errmsg, sizeof(errmsg)));
+	assert(tq_batch_summary_page_set_entry(page, sizeof(page), 0, 77, &written,
+										   written_code, sizeof(written_code),
+										   errmsg, sizeof(errmsg)));
+	assert(tq_batch_summary_page_read_header(page, sizeof(page), &header,
+											errmsg, sizeof(errmsg)));
+	assert(header.code_bytes == sizeof(written_code));
+	assert(header.entry_count == 1);
+	assert(header.next_block == 91);
+	assert(tq_batch_summary_page_get_entry(page, sizeof(page), 0, &block_number, &readback,
+										   readback_code, sizeof(readback_code),
+										   errmsg, sizeof(errmsg)));
+	assert(block_number == 77);
+	assert(readback.representative_lane == written.representative_lane);
+	assert(fabsf(readback.residual_radius - written.residual_radius) <= 1e-6f);
+	assert(memcmp(readback_code, written_code, sizeof(written_code)) == 0);
 }
 
 static void
@@ -152,6 +250,61 @@ test_optimistic_bound_prefers_clearly_better_page(void)
 												  true, TQ_DISTANCE_COSINE, query, 8,
 												  &far_bound, errmsg, sizeof(errmsg)));
 	assert(near_bound < far_bound);
+
+	tq_prod_lut_reset(&lut);
+}
+
+static void
+test_summary_bound_matches_page_bound(void)
+{
+	TqProdCodecConfig config = {.dimension = 8, .bits = 4};
+	TqProdLut lut;
+	TqProdPackedLayout layout;
+	TqBatchPageSummary summary;
+	TqBatchPageParams params;
+	uint8_t page[TQ_DEFAULT_BLOCK_SIZE];
+	uint8_t representative_code[64];
+	float query[8];
+	float page_bound = 0.0f;
+	float summary_bound = 0.0f;
+	char errmsg[256];
+
+	memset(&lut, 0, sizeof(lut));
+	memset(&layout, 0, sizeof(layout));
+	memset(&summary, 0, sizeof(summary));
+	memset(&params, 0, sizeof(params));
+	memset(page, 0, sizeof(page));
+	memset(representative_code, 0, sizeof(representative_code));
+	memset(query, 0, sizeof(query));
+
+	seeded_unit_vector(21u, query, 8);
+	assert(tq_prod_packed_layout(&config, &layout, errmsg, sizeof(errmsg)));
+	assert(layout.total_bytes <= sizeof(representative_code));
+	assert(tq_prod_lut_build(&config, query, &lut, errmsg, sizeof(errmsg)));
+
+	params.lane_count = 4;
+	params.code_bytes = (uint32_t) layout.total_bytes;
+	params.list_id = 0;
+	params.next_block = TQ_INVALID_BLOCK_NUMBER;
+
+	assert(tq_batch_page_init(page, sizeof(page), &params, errmsg, sizeof(errmsg)));
+	append_encoded_lane(page, sizeof(page), &config, query, 1);
+	assert(tq_batch_page_set_summary(page, sizeof(page),
+									 &(TqBatchPageSummary){.representative_lane = 0, .residual_radius = 0.05f},
+									 errmsg, sizeof(errmsg)));
+	assert(tq_batch_page_get_summary(page, sizeof(page), &summary, errmsg, sizeof(errmsg)));
+	assert(tq_batch_page_get_code(page, sizeof(page), summary.representative_lane,
+								  representative_code, layout.total_bytes,
+								  errmsg, sizeof(errmsg)));
+	assert(tq_scan_page_optimistic_distance_bound(&config, &lut, page, sizeof(page),
+												  true, TQ_DISTANCE_COSINE, query, 8,
+												  &page_bound, errmsg, sizeof(errmsg)));
+	assert(tq_scan_summary_optimistic_distance_bound(&config, &lut, &summary,
+													 representative_code, layout.total_bytes,
+													 true, TQ_DISTANCE_COSINE, query, 8,
+													 &summary_bound, errmsg, sizeof(errmsg)));
+	assert(isfinite(summary_bound));
+	assert(fabsf(summary_bound - page_bound) <= 1e-6f);
 
 	tq_prod_lut_reset(&lut);
 }
@@ -229,13 +382,109 @@ test_full_heap_prunes_worse_page_bounds(void)
 	tq_candidate_heap_reset(&heap);
 }
 
+static void
+test_code_domain_page_bounds_are_not_pruning_safe(void)
+{
+	TqProdCodecConfig config = {.dimension = 8, .bits = 4};
+	TqProdLut lut;
+	TqProdPackedLayout layout;
+	TqBatchPageParams params;
+	uint8_t page[TQ_DEFAULT_BLOCK_SIZE];
+	float query[8];
+	float representative[8];
+	float lane_values[3][8];
+	uint8_t representative_code[64];
+	TqBatchPageSummary summary;
+	float optimistic_distance = 0.0f;
+	float best_distance = 0.0f;
+	float residual_radius = 0.0f;
+	uint32_t query_seed = 0;
+	bool saw_violation = false;
+	char errmsg[256];
+
+	memset(&lut, 0, sizeof(lut));
+	memset(&layout, 0, sizeof(layout));
+	memset(&params, 0, sizeof(params));
+	memset(page, 0, sizeof(page));
+	memset(query, 0, sizeof(query));
+	memset(representative, 0, sizeof(representative));
+	memset(lane_values, 0, sizeof(lane_values));
+	memset(representative_code, 0, sizeof(representative_code));
+	memset(&summary, 0, sizeof(summary));
+
+	assert(tq_prod_packed_layout(&config, &layout, errmsg, sizeof(errmsg)));
+	assert(layout.total_bytes <= sizeof(representative_code));
+	assert(!tq_scan_page_bounds_are_safe_for_pruning(true, TQ_DISTANCE_COSINE));
+
+	for (query_seed = 1; query_seed <= 256; query_seed++)
+	{
+		uint32_t lane_seed = 0;
+
+		memset(page, 0, sizeof(page));
+		memset(&summary, 0, sizeof(summary));
+		seeded_unit_vector(query_seed, query, 8);
+		seeded_unit_vector(query_seed * 17u + 3u, representative, 8);
+		assert(tq_prod_lut_build(&config, query, &lut, errmsg, sizeof(errmsg)));
+
+		params.lane_count = 4;
+		params.code_bytes = (uint32_t) layout.total_bytes;
+		params.list_id = 0;
+		params.next_block = TQ_INVALID_BLOCK_NUMBER;
+		assert(tq_batch_page_init(page, sizeof(page), &params, errmsg, sizeof(errmsg)));
+
+		append_encoded_lane(page, sizeof(page), &config, representative, 1);
+		for (lane_seed = 0; lane_seed < 3; lane_seed++)
+		{
+			seeded_unit_vector(query_seed * 31u + (lane_seed + 1u) * 101u,
+							   lane_values[lane_seed], 8);
+			append_encoded_lane(page, sizeof(page), &config, lane_values[lane_seed],
+								(uint16_t) (lane_seed + 2u));
+			if (vector_l2_distance(representative, lane_values[lane_seed], 8) > residual_radius)
+				residual_radius = vector_l2_distance(representative, lane_values[lane_seed], 8);
+		}
+
+		summary.representative_lane = 0;
+		summary.residual_radius = residual_radius;
+		assert(tq_batch_page_set_summary(page, sizeof(page), &summary, errmsg, sizeof(errmsg)));
+		assert(tq_batch_page_get_code(page, sizeof(page), summary.representative_lane,
+									  representative_code, layout.total_bytes,
+									  errmsg, sizeof(errmsg)));
+		assert(tq_scan_summary_optimistic_distance_bound(&config,
+														 &lut,
+														 &summary,
+														 representative_code,
+														 layout.total_bytes,
+														 true,
+														 TQ_DISTANCE_COSINE,
+														 query,
+														 8,
+														 &optimistic_distance,
+														 errmsg,
+														 sizeof(errmsg)));
+		best_distance = best_actual_page_distance(page, sizeof(page), &config, &lut);
+		if (optimistic_distance > best_distance + 1e-5f)
+		{
+			saw_violation = true;
+			tq_prod_lut_reset(&lut);
+			break;
+		}
+		tq_prod_lut_reset(&lut);
+		residual_radius = 0.0f;
+	}
+
+	assert(saw_violation);
+}
+
 int
 main(void)
 {
 	test_page_summary_round_trip();
+	test_summary_side_page_round_trip();
 	test_optimistic_bound_prefers_clearly_better_page();
+	test_summary_bound_matches_page_bound();
 	test_empty_page_bound_is_safe();
 	test_early_stop_requires_full_heap();
 	test_full_heap_prunes_worse_page_bounds();
+	test_code_domain_page_bounds_are_not_pruning_safe();
 	return 0;
 }

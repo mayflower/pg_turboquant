@@ -87,7 +87,7 @@ tq_validate_code_domain_inputs(const TqProdCodecConfig *config,
 }
 
 static bool
-tq_prod_code_domain_shape_supports_avx2(const TqProdCodecConfig *config)
+tq_prod_code_domain_shape_supports_vectorized(const TqProdCodecConfig *config)
 {
 	if (config == NULL)
 		return false;
@@ -109,25 +109,35 @@ tq_dot_product_scalar(const float *left, const float *right, size_t len)
 	return sum;
 }
 
-#if TQ_CAN_COMPILE_AVX2
 static uint32_t
-tq_unpack_bits_local(const uint8_t *packed, uint32_t bit_offset, uint32_t bit_count)
+tq_load_u24_le(const uint8_t *packed)
 {
-	uint32_t value = 0;
-	uint32_t bit = 0;
-
-	for (bit = 0; bit < bit_count; bit++)
-	{
-		uint32_t target_bit = bit_offset + bit;
-		uint32_t byte_index = target_bit / 8;
-		uint32_t byte_shift = target_bit % 8;
-
-		if ((packed[byte_index] >> byte_shift) & 1u)
-			value |= UINT32_C(1) << bit;
-	}
-
-	return value;
+	return ((uint32_t) packed[0])
+		| (((uint32_t) packed[1]) << 8)
+		| (((uint32_t) packed[2]) << 16);
 }
+
+static void
+tq_prod_unpack_code_domain_block8(const TqProdPackedLayout *layout,
+								  const uint8_t *packed,
+								  uint32_t dim_base,
+								  uint8_t idx_codes[8],
+								  uint8_t sign_bits[8])
+{
+	const uint8_t *idx_bytes = packed + ((size_t) dim_base * 3u / 8u);
+	const uint8_t *sign_bytes = packed + layout->idx_bytes + ((size_t) dim_base / 8u);
+	uint32_t idx_chunk = tq_load_u24_le(idx_bytes);
+	uint8_t sign_chunk = sign_bytes[0];
+	uint32_t lane = 0;
+
+	for (lane = 0; lane < 8; lane++)
+	{
+		idx_codes[lane] = (uint8_t) ((idx_chunk >> (lane * 3u)) & 0x7u);
+		sign_bits[lane] = (uint8_t) ((sign_chunk >> lane) & 0x1u);
+	}
+}
+
+#if TQ_CAN_COMPILE_AVX2
 
 __attribute__((target("avx2")))
 static float
@@ -283,7 +293,7 @@ tq_prod_score_code_from_lut_avx2_impl(const TqProdCodecConfig *config,
 	if (!tq_validate_code_domain_inputs(config, lut, packed, score, errmsg, errmsg_len))
 		return false;
 
-	if (!tq_prod_code_domain_shape_supports_avx2(config))
+	if (!tq_prod_code_domain_shape_supports_vectorized(config))
 	{
 		tq_set_error(errmsg, errmsg_len,
 					 "invalid turboquant code-domain dispatch: AVX2 shape requires bits=4 and dimension divisible by 8");
@@ -296,18 +306,20 @@ tq_prod_score_code_from_lut_avx2_impl(const TqProdCodecConfig *config,
 
 	for (dim = 0; dim < config->dimension; dim += 8)
 	{
+		uint8_t idx_codes[8];
+		uint8_t sign_bits[8];
 		int32_t gather_indices[8];
 		float qjl_scale[8];
 		uint32_t lane = 0;
 
+		tq_prod_unpack_code_domain_block8(&layout, packed, dim, idx_codes, sign_bits);
+
 		for (lane = 0; lane < 8; lane++)
 		{
 			uint32_t current_dim = dim + lane;
-			uint32_t idx_code = tq_unpack_bits_local(packed, current_dim * 3u, 3u);
-			uint32_t sign_bit = tq_unpack_bits_local(packed + layout.idx_bytes, current_dim, 1u);
 
-			gather_indices[lane] = (int32_t) (current_dim * lut->level_count + idx_code);
-			qjl_scale[lane] = (sign_bit == lut->query_signs[current_dim]) ? 2.0f : 0.0f;
+			gather_indices[lane] = (int32_t) (current_dim * lut->level_count + idx_codes[lane]);
+			qjl_scale[lane] = (sign_bits[lane] == lut->query_signs[current_dim]) ? 2.0f : 0.0f;
 		}
 
 		{
@@ -321,6 +333,103 @@ tq_prod_score_code_from_lut_avx2_impl(const TqProdCodecConfig *config,
 	}
 
 	*score = gamma * (tq_hsum_avx2(qjl_sum) - tq_hsum_avx2(base_sum));
+	return true;
+}
+#endif
+
+#if TQ_CAN_COMPILE_NEON
+static float
+tq_hsum_neon(float32x4_t vector)
+{
+	float lanes[4];
+	float total = 0.0f;
+	size_t i = 0;
+
+	vst1q_f32(lanes, vector);
+	for (i = 0; i < 4; i++)
+		total += lanes[i];
+
+	return total;
+}
+
+static bool
+tq_prod_score_code_from_lut_neon_impl(const TqProdCodecConfig *config,
+									  const TqProdLut *lut,
+									  const uint8_t *packed,
+									  size_t packed_len,
+									  float *score,
+									  char *errmsg,
+									  size_t errmsg_len)
+{
+	TqProdPackedLayout layout;
+	float gamma = 0.0f;
+	float32x4_t base_sum_lo = vdupq_n_f32(0.0f);
+	float32x4_t base_sum_hi = vdupq_n_f32(0.0f);
+	float32x4_t qjl_sum_lo = vdupq_n_f32(0.0f);
+	float32x4_t qjl_sum_hi = vdupq_n_f32(0.0f);
+	uint32_t dim = 0;
+
+	memset(&layout, 0, sizeof(layout));
+
+	if (!tq_validate_code_domain_inputs(config, lut, packed, score, errmsg, errmsg_len))
+		return false;
+
+	if (!tq_prod_code_domain_shape_supports_vectorized(config))
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant code-domain dispatch: NEON shape requires bits=4 and dimension divisible by 8");
+		return false;
+	}
+
+	if (!tq_prod_packed_layout(config, &layout, errmsg, errmsg_len)
+		|| !tq_prod_read_gamma(config, packed, packed_len, &gamma, errmsg, errmsg_len))
+		return false;
+
+	for (dim = 0; dim < config->dimension; dim += 8)
+	{
+		uint8_t idx_codes[8];
+		uint8_t sign_bits[8];
+		float weights_lo_lanes[4];
+		float weights_hi_lanes[4];
+		float qjl_scale_lo_lanes[4];
+		float qjl_scale_hi_lanes[4];
+		uint32_t lane = 0;
+
+		tq_prod_unpack_code_domain_block8(&layout, packed, dim, idx_codes, sign_bits);
+
+		for (lane = 0; lane < 8; lane++)
+		{
+			uint32_t current_dim = dim + lane;
+			float weight = lut->values[current_dim * lut->level_count + idx_codes[lane]];
+			float qjl_scale = (sign_bits[lane] == lut->query_signs[current_dim]) ? 2.0f : 0.0f;
+
+			if (lane < 4)
+			{
+				weights_lo_lanes[lane] = weight;
+				qjl_scale_lo_lanes[lane] = qjl_scale;
+			}
+			else
+			{
+				weights_hi_lanes[lane - 4] = weight;
+				qjl_scale_hi_lanes[lane - 4] = qjl_scale;
+			}
+		}
+
+		{
+			float32x4_t weights_lo = vld1q_f32(weights_lo_lanes);
+			float32x4_t weights_hi = vld1q_f32(weights_hi_lanes);
+			float32x4_t qjl_scale_lo = vld1q_f32(qjl_scale_lo_lanes);
+			float32x4_t qjl_scale_hi = vld1q_f32(qjl_scale_hi_lanes);
+
+			base_sum_lo = vaddq_f32(base_sum_lo, weights_lo);
+			base_sum_hi = vaddq_f32(base_sum_hi, weights_hi);
+			qjl_sum_lo = vmlaq_f32(qjl_sum_lo, weights_lo, qjl_scale_lo);
+			qjl_sum_hi = vmlaq_f32(qjl_sum_hi, weights_hi, qjl_scale_hi);
+		}
+	}
+
+	*score = gamma * ((tq_hsum_neon(qjl_sum_lo) + tq_hsum_neon(qjl_sum_hi))
+					  - (tq_hsum_neon(base_sum_lo) + tq_hsum_neon(base_sum_hi)));
 	return true;
 }
 #endif
@@ -583,8 +692,11 @@ TqProdScoreKernel
 tq_prod_code_domain_preferred_kernel(const TqProdCodecConfig *config)
 {
 	if (tq_simd_avx2_runtime_available()
-		&& tq_prod_code_domain_shape_supports_avx2(config))
+		&& tq_prod_code_domain_shape_supports_vectorized(config))
 		return TQ_PROD_SCORE_AVX2;
+	if (tq_simd_neon_runtime_available()
+		&& tq_prod_code_domain_shape_supports_vectorized(config))
+		return TQ_PROD_SCORE_NEON;
 
 	return TQ_PROD_SCORE_SCALAR;
 }
@@ -706,6 +818,11 @@ tq_prod_score_code_from_lut_dispatch(const TqProdCodecConfig *config,
 				? TQ_PROD_SCORE_AVX2
 				: TQ_PROD_SCORE_SCALAR;
 			break;
+		case TQ_PROD_SCORE_NEON:
+			resolved_kernel = tq_prod_code_domain_preferred_kernel(config) == TQ_PROD_SCORE_NEON
+				? TQ_PROD_SCORE_NEON
+				: TQ_PROD_SCORE_SCALAR;
+			break;
 		case TQ_PROD_SCORE_SCALAR:
 			resolved_kernel = TQ_PROD_SCORE_SCALAR;
 			break;
@@ -722,6 +839,17 @@ tq_prod_score_code_from_lut_dispatch(const TqProdCodecConfig *config,
 	{
 #if TQ_CAN_COMPILE_AVX2
 		return tq_prod_score_code_from_lut_avx2_impl(config, lut, packed, packed_len,
+													 score, errmsg, errmsg_len);
+#else
+		resolved_kernel = TQ_PROD_SCORE_SCALAR;
+		if (used_kernel != NULL)
+			*used_kernel = resolved_kernel;
+#endif
+	}
+	else if (resolved_kernel == TQ_PROD_SCORE_NEON)
+	{
+#if TQ_CAN_COMPILE_NEON
+		return tq_prod_score_code_from_lut_neon_impl(config, lut, packed, packed_len,
 													 score, errmsg, errmsg_len);
 #else
 		resolved_kernel = TQ_PROD_SCORE_SCALAR;

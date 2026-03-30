@@ -52,12 +52,17 @@ typedef struct TqScanStats
 	size_t		max_visited_pages;
 	size_t		selected_list_count;
 	size_t		selected_live_count;
+	size_t		selected_page_count;
 	size_t		visited_page_count;
 	size_t		visited_code_count;
 	size_t		retained_candidate_count;
 	size_t		candidate_heap_capacity;
 	size_t		candidate_heap_count;
+	size_t		candidate_heap_insert_count;
+	size_t		candidate_heap_replace_count;
+	size_t		candidate_heap_reject_count;
 	size_t		decoded_vector_count;
+	size_t		bound_data_page_reads;
 	size_t		page_prune_count;
 	size_t		early_stop_count;
 } TqScanStats;
@@ -86,6 +91,20 @@ extern bool tq_scan_page_optimistic_distance_bound(const TqProdCodecConfig *conf
 												   float *optimistic_distance,
 												   char *errmsg,
 												   size_t errmsg_len);
+extern bool tq_scan_summary_optimistic_distance_bound(const TqProdCodecConfig *config,
+														  const TqProdLut *lut,
+														  const TqBatchPageSummary *summary,
+														  const uint8_t *representative_code,
+													  size_t representative_code_len,
+													  bool normalized,
+													  TqDistanceKind distance,
+													  const float *query_values,
+													  size_t query_len,
+														  float *optimistic_distance,
+														  char *errmsg,
+														  size_t errmsg_len);
+extern bool tq_scan_page_bounds_are_safe_for_pruning(bool normalized,
+													 TqDistanceKind distance);
 extern bool tq_scan_should_prune_page(const TqCandidateHeap *heap,
 									  float optimistic_distance,
 									  bool *should_prune,
@@ -99,12 +118,17 @@ extern void tq_scan_stats_set_probe_budget(size_t nominal_probe_count,
 										   size_t effective_probe_count,
 										   size_t max_visited_codes,
 										   size_t max_visited_pages);
-extern void tq_scan_stats_record_selected_list(size_t live_count);
+extern void tq_scan_stats_record_selected_list(size_t live_count,
+											   size_t page_count);
 extern void tq_scan_stats_add_selected_live(size_t live_count);
 extern void tq_scan_stats_record_page_visit(void);
 extern void tq_scan_stats_record_code_visit(bool decoded_vector);
+extern void tq_scan_stats_record_bound_data_page_read(void);
 extern void tq_scan_stats_add_page_prunes(size_t count);
 extern void tq_scan_stats_add_early_stops(size_t count);
+extern void tq_scan_stats_record_candidate_heap_insert(void);
+extern void tq_scan_stats_record_candidate_heap_replace(void);
+extern void tq_scan_stats_record_candidate_heap_reject(void);
 extern void tq_scan_stats_set_candidate_heap_metrics(size_t capacity, size_t count);
 extern void tq_scan_stats_snapshot(TqScanStats *stats);
 extern bool tq_scan_stats_serialize_json(const TqScanStats *stats,

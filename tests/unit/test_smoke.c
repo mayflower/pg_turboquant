@@ -2423,6 +2423,8 @@ test_tq_list_dir_entry_roundtrip(void)
 		.tail_block = 109,
 		.live_count = 17,
 		.dead_count = 3,
+		.batch_page_count = 4,
+		.summary_head_block = 211,
 		.free_lane_hint = 5
 	};
 	TqListDirEntry readback;
@@ -2439,6 +2441,8 @@ test_tq_list_dir_entry_roundtrip(void)
 	assert(readback.tail_block == written.tail_block);
 	assert(readback.live_count == written.live_count);
 	assert(readback.dead_count == written.dead_count);
+	assert(readback.batch_page_count == written.batch_page_count);
+	assert(readback.summary_head_block == written.summary_head_block);
 	assert(readback.free_lane_hint == written.free_lane_hint);
 }
 

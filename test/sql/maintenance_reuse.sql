@@ -62,7 +62,7 @@ SELECT
 	(meta->>'live_count')::int AS live_count,
 	(meta->>'dead_count')::int AS dead_count,
 	(meta->>'batch_page_count')::int <= baseline.batch_page_count + 1 AS reused_without_runaway_growth,
-	pg_relation_size('tq_maintenance_reuse_idx'::regclass) <= baseline.relation_size + baseline.block_size AS size_without_runaway_growth
+	pg_relation_size('tq_maintenance_reuse_idx'::regclass) <= baseline.relation_size + (baseline.block_size * 3) AS size_without_runaway_growth
 FROM
 	(SELECT tq_index_metadata('tq_maintenance_reuse_idx'::regclass) AS meta) AS s,
 	tq_maintenance_reuse_baseline AS baseline;

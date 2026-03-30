@@ -12,9 +12,10 @@
 
 #define TQ_META_PAGE_HEADER_BYTES 108
 #define TQ_LIST_DIR_PAGE_HEADER_BYTES 16
-#define TQ_LIST_DIR_ENTRY_BYTES 24
+#define TQ_LIST_DIR_ENTRY_BYTES 32
 #define TQ_BATCH_PAGE_HEADER_BYTES 44
 #define TQ_CENTROID_PAGE_HEADER_BYTES 20
+#define TQ_BATCH_SUMMARY_PAGE_HEADER_BYTES 20
 #define TQ_TID_STORAGE_BYTES 6
 
 #define TQ_FLAG_NORMALIZED UINT16_C(0x0001)
@@ -73,6 +74,11 @@
 #define TQ_CENTROID_CAPACITY_OFFSET 12
 #define TQ_CENTROID_COUNT_OFFSET 14
 #define TQ_CENTROID_NEXT_BLOCK_OFFSET 16
+
+#define TQ_BATCH_SUMMARY_CODE_BYTES_OFFSET 8
+#define TQ_BATCH_SUMMARY_ENTRY_CAPACITY_OFFSET 12
+#define TQ_BATCH_SUMMARY_ENTRY_COUNT_OFFSET 14
+#define TQ_BATCH_SUMMARY_NEXT_BLOCK_OFFSET 16
 
 static void
 tq_set_error(char *errmsg, size_t errmsg_len, const char *message)
@@ -415,6 +421,60 @@ tq_centroid_validate_header(const uint8_t *page,
 	return true;
 }
 
+static size_t
+tq_batch_summary_entry_bytes(uint32_t code_bytes)
+{
+	return (size_t) 12 + (size_t) code_bytes;
+}
+
+static size_t
+tq_batch_summary_entry_offset(const uint8_t *page, uint16_t index)
+{
+	return (size_t) TQ_BATCH_SUMMARY_PAGE_HEADER_BYTES
+		+ ((size_t) index * tq_batch_summary_entry_bytes(tq_read_u32(page, TQ_BATCH_SUMMARY_CODE_BYTES_OFFSET)));
+}
+
+static bool
+tq_batch_summary_validate_header(const uint8_t *page,
+								 size_t page_size,
+								 char *errmsg,
+								 size_t errmsg_len)
+{
+	uint32_t	code_bytes = 0;
+	uint16_t	entry_capacity = 0;
+	size_t		required_bytes = 0;
+
+	if (!tq_validate_page_common(page, page_size, TQ_PAGE_KIND_BATCH_SUMMARY,
+								 TQ_BATCH_SUMMARY_PAGE_HEADER_BYTES, errmsg, errmsg_len))
+		return false;
+
+	code_bytes = tq_read_u32(page, TQ_BATCH_SUMMARY_CODE_BYTES_OFFSET);
+	entry_capacity = tq_read_u16(page, TQ_BATCH_SUMMARY_ENTRY_CAPACITY_OFFSET);
+	if (code_bytes == 0 || entry_capacity == 0)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant batch summary page: code bytes and capacity must be positive");
+		return false;
+	}
+
+	required_bytes = tq_batch_summary_page_required_bytes(entry_capacity, code_bytes);
+	if (required_bytes > page_size)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant batch summary page: layout exceeds page size");
+		return false;
+	}
+
+	if (tq_read_u16(page, TQ_BATCH_SUMMARY_ENTRY_COUNT_OFFSET) > entry_capacity)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant batch summary page: entry count exceeds capacity");
+		return false;
+	}
+
+	return true;
+}
+
 static uint8_t *
 tq_batch_bitmap(uint8_t *page)
 {
@@ -531,6 +591,23 @@ tq_centroid_page_capacity(size_t page_size, uint32_t dimension)
 
 	return (uint16_t) ((page_size - TQ_CENTROID_PAGE_HEADER_BYTES)
 					   / ((size_t) dimension * sizeof(float)));
+}
+
+size_t
+tq_batch_summary_page_required_bytes(uint16_t entry_capacity, uint32_t code_bytes)
+{
+	return (size_t) TQ_BATCH_SUMMARY_PAGE_HEADER_BYTES
+		+ ((size_t) entry_capacity * tq_batch_summary_entry_bytes(code_bytes));
+}
+
+uint16_t
+tq_batch_summary_page_capacity(size_t page_size, uint32_t code_bytes)
+{
+	if (code_bytes == 0 || page_size <= TQ_BATCH_SUMMARY_PAGE_HEADER_BYTES)
+		return 0;
+
+	return (uint16_t) ((page_size - TQ_BATCH_SUMMARY_PAGE_HEADER_BYTES)
+					   / tq_batch_summary_entry_bytes(code_bytes));
 }
 
 bool
@@ -762,8 +839,10 @@ tq_list_dir_page_set_entry(void *page,
 	tq_write_u32(bytes, offset + 8, entry->tail_block);
 	tq_write_u32(bytes, offset + 12, entry->live_count);
 	tq_write_u32(bytes, offset + 16, entry->dead_count);
-	tq_write_u16(bytes, offset + 20, entry->free_lane_hint);
-	tq_write_u16(bytes, offset + 22, 0);
+	tq_write_u32(bytes, offset + 20, entry->batch_page_count);
+	tq_write_u32(bytes, offset + 24, entry->summary_head_block);
+	tq_write_u16(bytes, offset + 28, entry->free_lane_hint);
+	tq_write_u16(bytes, offset + 30, 0);
 
 	entry_count = tq_read_u16(bytes, TQ_LIST_DIR_ENTRY_COUNT_OFFSET);
 	if (index >= entry_count)
@@ -806,7 +885,9 @@ tq_list_dir_page_get_entry(const void *page,
 	entry->tail_block = tq_read_u32(bytes, offset + 8);
 	entry->live_count = tq_read_u32(bytes, offset + 12);
 	entry->dead_count = tq_read_u32(bytes, offset + 16);
-	entry->free_lane_hint = tq_read_u16(bytes, offset + 20);
+	entry->batch_page_count = tq_read_u32(bytes, offset + 20);
+	entry->summary_head_block = tq_read_u32(bytes, offset + 24);
+	entry->free_lane_hint = tq_read_u16(bytes, offset + 28);
 	return true;
 }
 
@@ -961,6 +1042,193 @@ tq_centroid_page_get_centroid(const void *page,
 
 	offset = tq_centroid_offset(bytes, index);
 	memcpy(values, bytes + offset, sizeof(float) * (size_t) dimension);
+	return true;
+}
+
+bool
+tq_batch_summary_page_init(void *page,
+						   size_t page_size,
+						   uint32_t code_bytes,
+						   uint16_t entry_capacity,
+						   uint32_t next_block,
+						   char *errmsg,
+						   size_t errmsg_len)
+{
+	uint8_t *bytes = (uint8_t *) page;
+	size_t required_bytes = 0;
+
+	if (page == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant batch summary page: page must be non-null");
+		return false;
+	}
+
+	required_bytes = tq_batch_summary_page_required_bytes(entry_capacity, code_bytes);
+	if (code_bytes == 0 || entry_capacity == 0 || required_bytes > page_size)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant batch summary page: requested layout does not fit on the page");
+		return false;
+	}
+
+	memset(page, 0, page_size);
+	tq_write_page_common(bytes, TQ_PAGE_KIND_BATCH_SUMMARY, TQ_BATCH_SUMMARY_PAGE_HEADER_BYTES);
+	tq_write_u32(bytes, TQ_BATCH_SUMMARY_CODE_BYTES_OFFSET, code_bytes);
+	tq_write_u16(bytes, TQ_BATCH_SUMMARY_ENTRY_CAPACITY_OFFSET, entry_capacity);
+	tq_write_u16(bytes, TQ_BATCH_SUMMARY_ENTRY_COUNT_OFFSET, 0);
+	tq_write_u32(bytes, TQ_BATCH_SUMMARY_NEXT_BLOCK_OFFSET, next_block);
+	return true;
+}
+
+bool
+tq_batch_summary_page_read_header(const void *page,
+								  size_t page_size,
+								  TqBatchSummaryPageHeaderView *header,
+								  char *errmsg,
+								  size_t errmsg_len)
+{
+	const uint8_t *bytes = (const uint8_t *) page;
+
+	if (page == NULL || header == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant batch summary page: page and header must be non-null");
+		return false;
+	}
+
+	if (!tq_batch_summary_validate_header(bytes, page_size, errmsg, errmsg_len))
+		return false;
+
+	header->code_bytes = tq_read_u32(bytes, TQ_BATCH_SUMMARY_CODE_BYTES_OFFSET);
+	header->entry_capacity = tq_read_u16(bytes, TQ_BATCH_SUMMARY_ENTRY_CAPACITY_OFFSET);
+	header->entry_count = tq_read_u16(bytes, TQ_BATCH_SUMMARY_ENTRY_COUNT_OFFSET);
+	header->next_block = tq_read_u32(bytes, TQ_BATCH_SUMMARY_NEXT_BLOCK_OFFSET);
+	return true;
+}
+
+bool
+tq_batch_summary_page_set_next_block(void *page,
+									 size_t page_size,
+									 uint32_t next_block,
+									 char *errmsg,
+									 size_t errmsg_len)
+{
+	uint8_t *bytes = (uint8_t *) page;
+
+	if (page == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant batch summary page: page must be non-null");
+		return false;
+	}
+
+	if (!tq_batch_summary_validate_header(bytes, page_size, errmsg, errmsg_len))
+		return false;
+
+	tq_write_u32(bytes, TQ_BATCH_SUMMARY_NEXT_BLOCK_OFFSET, next_block);
+	return true;
+}
+
+bool
+tq_batch_summary_page_set_entry(void *page,
+								size_t page_size,
+								uint16_t index,
+								uint32_t block_number,
+								const TqBatchPageSummary *summary,
+								const uint8_t *representative_code,
+								size_t code_len,
+								char *errmsg,
+								size_t errmsg_len)
+{
+	uint8_t *bytes = (uint8_t *) page;
+	uint32_t code_bytes = 0;
+	uint16_t entry_count = 0;
+	size_t offset = 0;
+
+	if (page == NULL || summary == NULL || representative_code == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant batch summary page: page, summary, and code must be non-null");
+		return false;
+	}
+
+	if (!tq_batch_summary_validate_header(bytes, page_size, errmsg, errmsg_len))
+		return false;
+
+	code_bytes = tq_read_u32(bytes, TQ_BATCH_SUMMARY_CODE_BYTES_OFFSET);
+	if (code_len != (size_t) code_bytes)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant batch summary page: representative code length does not match layout");
+		return false;
+	}
+
+	if (index >= tq_read_u16(bytes, TQ_BATCH_SUMMARY_ENTRY_CAPACITY_OFFSET))
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant batch summary page: entry index out of range");
+		return false;
+	}
+
+	offset = tq_batch_summary_entry_offset(bytes, index);
+	tq_write_u32(bytes, offset + 0, block_number);
+	tq_write_u16(bytes, offset + 4, summary->representative_lane);
+	tq_write_u16(bytes, offset + 6, 0);
+	tq_write_float32(bytes, offset + 8, summary->residual_radius);
+	memcpy(bytes + offset + 12, representative_code, code_len);
+
+	entry_count = tq_read_u16(bytes, TQ_BATCH_SUMMARY_ENTRY_COUNT_OFFSET);
+	if (index >= entry_count)
+		tq_write_u16(bytes, TQ_BATCH_SUMMARY_ENTRY_COUNT_OFFSET, (uint16_t) (index + 1));
+	return true;
+}
+
+bool
+tq_batch_summary_page_get_entry(const void *page,
+								size_t page_size,
+								uint16_t index,
+								uint32_t *block_number,
+								TqBatchPageSummary *summary,
+								uint8_t *representative_code,
+								size_t code_len,
+								char *errmsg,
+								size_t errmsg_len)
+{
+	const uint8_t *bytes = (const uint8_t *) page;
+	uint32_t code_bytes = 0;
+	size_t offset = 0;
+
+	if (page == NULL || block_number == NULL || summary == NULL || representative_code == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant batch summary page: page, outputs, and code buffer must be non-null");
+		return false;
+	}
+
+	if (!tq_batch_summary_validate_header(bytes, page_size, errmsg, errmsg_len))
+		return false;
+
+	if (index >= tq_read_u16(bytes, TQ_BATCH_SUMMARY_ENTRY_COUNT_OFFSET))
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant batch summary page: entry has not been initialized");
+		return false;
+	}
+
+	code_bytes = tq_read_u32(bytes, TQ_BATCH_SUMMARY_CODE_BYTES_OFFSET);
+	if (code_len < (size_t) code_bytes)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant batch summary page: code buffer is too small");
+		return false;
+	}
+
+	offset = tq_batch_summary_entry_offset(bytes, index);
+	*block_number = tq_read_u32(bytes, offset + 0);
+	summary->representative_lane = tq_read_u16(bytes, offset + 4);
+	summary->residual_radius = tq_read_float32(bytes, offset + 8);
+	memcpy(representative_code, bytes + offset + 12, (size_t) code_bytes);
 	return true;
 }
 

@@ -9,7 +9,7 @@
 #include "src/tq_transform.h"
 
 #define TQ_PAGE_MAGIC UINT32_C(0x54515047)
-#define TQ_PAGE_FORMAT_VERSION 6
+#define TQ_PAGE_FORMAT_VERSION 8
 #define TQ_INVALID_BLOCK_NUMBER UINT32_MAX
 #define TQ_DETACHED_FREE_LIST_ID UINT32_MAX
 #define TQ_BATCH_PAGE_NO_REPRESENTATIVE UINT16_MAX
@@ -19,7 +19,8 @@ typedef enum TqPageKind
 	TQ_PAGE_KIND_META = 1,
 	TQ_PAGE_KIND_LIST_DIRECTORY = 2,
 	TQ_PAGE_KIND_BATCH = 3,
-	TQ_PAGE_KIND_CENTROID = 4
+	TQ_PAGE_KIND_CENTROID = 4,
+	TQ_PAGE_KIND_BATCH_SUMMARY = 5
 } TqPageKind;
 
 typedef enum TqDistanceKind
@@ -72,6 +73,8 @@ typedef struct TqListDirEntry
 	uint32_t	tail_block;
 	uint32_t	live_count;
 	uint32_t	dead_count;
+	uint32_t	batch_page_count;
+	uint32_t	summary_head_block;
 	uint16_t	free_lane_hint;
 } TqListDirEntry;
 
@@ -116,6 +119,14 @@ typedef struct TqCentroidPageHeaderView
 	uint32_t	next_block;
 } TqCentroidPageHeaderView;
 
+typedef struct TqBatchSummaryPageHeaderView
+{
+	uint32_t	code_bytes;
+	uint16_t	entry_capacity;
+	uint16_t	entry_count;
+	uint32_t	next_block;
+} TqBatchSummaryPageHeaderView;
+
 extern size_t tq_bitmap_bytes_for_lanes(uint16_t lane_count);
 extern size_t tq_batch_page_required_bytes(uint16_t lane_count, uint32_t code_bytes);
 extern bool tq_batch_page_can_fit(size_t page_size, uint16_t lane_count, uint32_t code_bytes);
@@ -127,6 +138,8 @@ extern bool tq_batch_page_used_bytes(const void *page,
 extern uint16_t tq_list_dir_page_capacity(size_t page_size);
 extern size_t tq_centroid_page_required_bytes(uint32_t dimension, uint16_t centroid_capacity);
 extern uint16_t tq_centroid_page_capacity(size_t page_size, uint32_t dimension);
+extern size_t tq_batch_summary_page_required_bytes(uint16_t entry_capacity, uint32_t code_bytes);
+extern uint16_t tq_batch_summary_page_capacity(size_t page_size, uint32_t code_bytes);
 
 extern bool tq_meta_page_init(void *page,
 							  size_t page_size,
@@ -193,6 +206,41 @@ extern bool tq_centroid_page_get_centroid(const void *page,
 										  size_t value_count,
 										  char *errmsg,
 										  size_t errmsg_len);
+extern bool tq_batch_summary_page_init(void *page,
+									   size_t page_size,
+									   uint32_t code_bytes,
+									   uint16_t entry_capacity,
+									   uint32_t next_block,
+									   char *errmsg,
+									   size_t errmsg_len);
+extern bool tq_batch_summary_page_read_header(const void *page,
+											  size_t page_size,
+											  TqBatchSummaryPageHeaderView *header,
+											  char *errmsg,
+											  size_t errmsg_len);
+extern bool tq_batch_summary_page_set_next_block(void *page,
+												 size_t page_size,
+												 uint32_t next_block,
+												 char *errmsg,
+												 size_t errmsg_len);
+extern bool tq_batch_summary_page_set_entry(void *page,
+											size_t page_size,
+											uint16_t index,
+											uint32_t block_number,
+											const TqBatchPageSummary *summary,
+											const uint8_t *representative_code,
+											size_t code_len,
+											char *errmsg,
+											size_t errmsg_len);
+extern bool tq_batch_summary_page_get_entry(const void *page,
+											size_t page_size,
+											uint16_t index,
+											uint32_t *block_number,
+											TqBatchPageSummary *summary,
+											uint8_t *representative_code,
+											size_t code_len,
+											char *errmsg,
+											size_t errmsg_len);
 
 extern bool tq_batch_page_init(void *page,
 							   size_t page_size,

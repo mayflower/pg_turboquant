@@ -307,10 +307,11 @@ tq_scan_stats_set_probe_budget(size_t nominal_probe_count,
 }
 
 void
-tq_scan_stats_record_selected_list(size_t live_count)
+tq_scan_stats_record_selected_list(size_t live_count, size_t page_count)
 {
 	tq_last_scan_stats.selected_list_count += 1;
 	tq_last_scan_stats.selected_live_count += live_count;
+	tq_last_scan_stats.selected_page_count += page_count;
 }
 
 void
@@ -334,6 +335,12 @@ tq_scan_stats_record_code_visit(bool decoded_vector)
 }
 
 void
+tq_scan_stats_record_bound_data_page_read(void)
+{
+	tq_last_scan_stats.bound_data_page_reads += 1;
+}
+
+void
 tq_scan_stats_add_page_prunes(size_t count)
 {
 	tq_last_scan_stats.page_prune_count += count;
@@ -343,6 +350,24 @@ void
 tq_scan_stats_add_early_stops(size_t count)
 {
 	tq_last_scan_stats.early_stop_count += count;
+}
+
+void
+tq_scan_stats_record_candidate_heap_insert(void)
+{
+	tq_last_scan_stats.candidate_heap_insert_count += 1;
+}
+
+void
+tq_scan_stats_record_candidate_heap_replace(void)
+{
+	tq_last_scan_stats.candidate_heap_replace_count += 1;
+}
+
+void
+tq_scan_stats_record_candidate_heap_reject(void)
+{
+	tq_last_scan_stats.candidate_heap_reject_count += 1;
 }
 
 void
@@ -376,10 +401,13 @@ tq_scan_stats_serialize_json(const TqScanStats *stats, char *buffer, size_t buff
 		"{\"mode\":\"%s\",\"score_mode\":\"%s\",\"score_kernel\":\"%s\",\"configured_probe_count\":%zu,"
 		"\"nominal_probe_count\":%zu,\"effective_probe_count\":%zu,"
 		"\"max_visited_codes\":%zu,\"max_visited_pages\":%zu,"
-		"\"selected_list_count\":%zu,\"selected_live_count\":%zu,"
+		"\"selected_list_count\":%zu,\"selected_live_count\":%zu,\"selected_page_count\":%zu,"
 		"\"visited_page_count\":%zu,\"visited_code_count\":%zu,"
 		"\"retained_candidate_count\":%zu,\"candidate_heap_capacity\":%zu,"
-		"\"candidate_heap_count\":%zu,\"decoded_vector_count\":%zu,"
+		"\"candidate_heap_count\":%zu,\"candidate_heap_insert_count\":%zu,"
+		"\"candidate_heap_replace_count\":%zu,\"candidate_heap_reject_count\":%zu,"
+		"\"decoded_vector_count\":%zu,"
+		"\"bound_data_page_reads\":%zu,"
 		"\"page_prune_count\":%zu,\"early_stop_count\":%zu}",
 		tq_scan_mode_name(stats->mode),
 		tq_scan_score_mode_name(stats->score_mode),
@@ -391,12 +419,17 @@ tq_scan_stats_serialize_json(const TqScanStats *stats, char *buffer, size_t buff
 		stats->max_visited_pages,
 		stats->selected_list_count,
 		stats->selected_live_count,
+		stats->selected_page_count,
 		stats->visited_page_count,
 		stats->visited_code_count,
 		stats->retained_candidate_count,
 		stats->candidate_heap_capacity,
 		stats->candidate_heap_count,
+		stats->candidate_heap_insert_count,
+		stats->candidate_heap_replace_count,
+		stats->candidate_heap_reject_count,
 		stats->decoded_vector_count,
+		stats->bound_data_page_reads,
 		stats->page_prune_count,
 		stats->early_stop_count
 	);
@@ -450,15 +483,20 @@ tq_candidate_heap_push(TqCandidateHeap *heap,
 		tq_candidate_sift_up(heap, heap->count);
 		heap->count++;
 		heap->sorted = false;
+		tq_scan_stats_record_candidate_heap_insert();
 		return true;
 	}
 
 	if (tq_candidate_compare_worst(&entry, &heap->entries[0]) >= 0)
+	{
+		tq_scan_stats_record_candidate_heap_reject();
 		return true;
+	}
 
 	heap->entries[0] = entry;
 	tq_candidate_sift_down(heap, 0);
 	heap->sorted = false;
+	tq_scan_stats_record_candidate_heap_replace();
 	return true;
 }
 
@@ -542,6 +580,81 @@ tq_scan_should_prune_page(const TqCandidateHeap *heap,
 }
 
 bool
+tq_scan_page_bounds_are_safe_for_pruning(bool normalized, TqDistanceKind distance)
+{
+	/*
+	 * Current page summaries are only a page-ordering heuristic. Their
+	 * representative score is computed in the code domain while the residual
+	 * radius is tracked in decoded-vector space, so the resulting key is not a
+	 * proven lower bound for any active scan score path.
+	 */
+	(void) normalized;
+	(void) distance;
+	return false;
+}
+
+bool
+tq_scan_summary_optimistic_distance_bound(const TqProdCodecConfig *config,
+										  const TqProdLut *lut,
+										  const TqBatchPageSummary *summary,
+										  const uint8_t *representative_code,
+										  size_t representative_code_len,
+										  bool normalized,
+										  TqDistanceKind distance,
+										  const float *query_values,
+										  size_t query_len,
+										  float *optimistic_distance,
+										  char *errmsg,
+										  size_t errmsg_len)
+{
+	float rep_ip = 0.0f;
+	float query_norm = 0.0f;
+	float optimistic_ip = 0.0f;
+
+	if (config == NULL || lut == NULL || summary == NULL
+		|| representative_code == NULL || optimistic_distance == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant scan: summary bound scorer requires codec, lut, summary, code, and output");
+		return false;
+	}
+
+	if (!normalized || !tq_scan_can_use_prod_code_domain(normalized, distance))
+	{
+		*optimistic_distance = -INFINITY;
+		return true;
+	}
+
+	if (query_values == NULL || query_len != config->dimension)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant scan: bound scorer requires query values matching codec dimension");
+		return false;
+	}
+
+	if (summary->representative_lane == TQ_BATCH_PAGE_NO_REPRESENTATIVE)
+	{
+		*optimistic_distance = INFINITY;
+		return true;
+	}
+
+	if (!tq_prod_score_code_from_lut(config, lut, representative_code,
+									 representative_code_len, &rep_ip,
+									 errmsg, errmsg_len))
+		return false;
+
+	query_norm = sqrtf(tq_norm_squared_scalar(query_values, query_len));
+	optimistic_ip = rep_ip + (query_norm * summary->residual_radius);
+	if (optimistic_ip > 1.0f)
+		optimistic_ip = 1.0f;
+	if (optimistic_ip < -1.0f)
+		optimistic_ip = -1.0f;
+
+	return tq_metric_distance_from_ip_score(distance, optimistic_ip,
+											optimistic_distance, errmsg, errmsg_len);
+}
+
+bool
 tq_scan_page_optimistic_distance_bound(const TqProdCodecConfig *config,
 									   const TqProdLut *lut,
 									   const void *page,
@@ -557,9 +670,6 @@ tq_scan_page_optimistic_distance_bound(const TqProdCodecConfig *config,
 	TqBatchPageHeaderView header;
 	TqBatchPageSummary summary;
 	uint8_t *code = NULL;
-	float rep_ip = 0.0f;
-	float query_norm = 0.0f;
-	float optimistic_ip = 0.0f;
 	bool ok = false;
 
 	if (config == NULL || lut == NULL || page == NULL || optimistic_distance == NULL)
@@ -604,23 +714,28 @@ tq_scan_page_optimistic_distance_bound(const TqProdCodecConfig *config,
 	}
 
 	ok = tq_batch_page_get_code(page, page_size, summary.representative_lane, code,
-								header.code_bytes, errmsg, errmsg_len)
-		&& tq_prod_score_code_from_lut(config, lut, code, header.code_bytes,
-									   &rep_ip, errmsg, errmsg_len);
+								header.code_bytes, errmsg, errmsg_len);
+	if (!ok)
+	{
+		free(code);
+		return false;
+	}
+
+	ok = tq_scan_summary_optimistic_distance_bound(config,
+												   lut,
+												   &summary,
+												   code,
+												   header.code_bytes,
+												   normalized,
+												   distance,
+												   query_values,
+												   query_len,
+												   optimistic_distance,
+												   errmsg,
+												   errmsg_len);
 	free(code);
 
-	if (!ok)
-		return false;
-
-	query_norm = sqrtf(tq_norm_squared_scalar(query_values, query_len));
-	optimistic_ip = rep_ip + (query_norm * summary.residual_radius);
-	if (optimistic_ip > 1.0f)
-		optimistic_ip = 1.0f;
-	if (optimistic_ip < -1.0f)
-		optimistic_ip = -1.0f;
-
-	return tq_metric_distance_from_ip_score(distance, optimistic_ip,
-											optimistic_distance, errmsg, errmsg_len);
+	return ok;
 }
 
 bool

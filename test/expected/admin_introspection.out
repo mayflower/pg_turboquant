@@ -51,7 +51,7 @@ SELECT
 FROM (SELECT tq_index_metadata('tq_admin_flat_idx'::regclass) AS meta) AS s;
  format_version | metric |    opclass    | list_count | live_count | dead_count | heap_live_rows | transform_kind | transform_version 
 ----------------+--------+---------------+------------+------------+------------+----------------+----------------+-------------------
-              6 | cosine | tq_cosine_ops |          0 |          4 |          0 |              4 | hadamard       |                 1
+              8 | cosine | tq_cosine_ops |          0 |          4 |          0 |              4 | hadamard       |                 1
 (1 row)
 
 INSERT INTO tq_admin_docs (id, embedding) VALUES

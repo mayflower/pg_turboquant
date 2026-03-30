@@ -5,12 +5,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-typedef struct TqRouterProbeScore
-{
-	uint32_t	list_id;
-	float		score;
-} TqRouterProbeScore;
-
 typedef struct TqRouterObjective
 {
 	float		mean_distortion;
@@ -788,6 +782,50 @@ tq_router_assign_best(const TqRouterModel *model,
 }
 
 bool
+tq_router_rank_probes(const TqRouterModel *model,
+					  const float *query,
+					  TqRouterProbeScore *out_scores,
+					  size_t out_capacity,
+					  char *errmsg,
+					  size_t errmsg_len)
+{
+	uint32_t	i = 0;
+
+	if (model == NULL || query == NULL || out_scores == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant router: model, query, and output scores must be non-null");
+		return false;
+	}
+
+	if (model->dimension == 0 || model->list_count == 0 || model->centroids == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant router: model must be initialized");
+		return false;
+	}
+
+	if (out_capacity < model->list_count)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant router: output buffer is too small");
+		return false;
+	}
+
+	for (i = 0; i < model->list_count; i++)
+	{
+		out_scores[i].list_id = i;
+		out_scores[i].score = -tq_router_squared_l2_distance(
+			query,
+			model->centroids + (i * (size_t) model->dimension),
+			model->dimension);
+	}
+
+	qsort(out_scores, model->list_count, sizeof(TqRouterProbeScore), tq_router_probe_compare);
+	return true;
+}
+
+bool
 tq_router_select_probes(const TqRouterModel *model,
 						const float *query,
 						uint32_t probes,
@@ -831,16 +869,11 @@ tq_router_select_probes(const TqRouterModel *model,
 		return false;
 	}
 
-	for (i = 0; i < model->list_count; i++)
+	if (!tq_router_rank_probes(model, query, scores, model->list_count, errmsg, errmsg_len))
 	{
-		scores[i].list_id = i;
-		scores[i].score = -tq_router_squared_l2_distance(
-			query,
-			model->centroids + (i * (size_t) model->dimension),
-			model->dimension);
+		free(scores);
+		return false;
 	}
-
-	qsort(scores, model->list_count, sizeof(TqRouterProbeScore), tq_router_probe_compare);
 
 	for (i = 0; i < count; i++)
 		out_list_ids[i] = scores[i].list_id;
