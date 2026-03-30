@@ -13,50 +13,15 @@ if __package__ in {None, ""}:
 
     if "--apply" in sys.argv:
         maybe_reexec_into_bergen_venv(script_path=Path(__file__).resolve())
-    from benchmarks.rag.ingestion_pipeline import hf_auth_kwargs, load_campaign_config, manifest_payload, run_hf_ingestion
+    from benchmarks.rag.ingestion_pipeline import (
+        build_embedder,
+        hf_auth_kwargs,
+        load_campaign_config,
+        manifest_payload,
+        run_hf_ingestion,
+    )
 else:
-    from .ingestion_pipeline import hf_auth_kwargs, load_campaign_config, manifest_payload, run_hf_ingestion
-
-
-def build_embedder(model_name: str, normalized: bool):
-    import torch  # type: ignore
-    import torch.nn.functional as F  # type: ignore
-    from transformers import AutoModel, AutoTokenizer  # type: ignore
-
-    auth_kwargs = hf_auth_kwargs()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, **auth_kwargs)
-    model = AutoModel.from_pretrained(
-        model_name,
-        torch_dtype=torch_dtype,
-        trust_remote_code=True,
-        **auth_kwargs,
-    ).to(device)
-    model.eval()
-
-    def embed(texts):
-        vectors = []
-        batch_size = 32
-        with torch.no_grad():
-            for start in range(0, len(texts), batch_size):
-                chunk = list(texts[start : start + batch_size])
-                batch = tokenizer(
-                    chunk,
-                    padding="longest",
-                    truncation=True,
-                    max_length=256,
-                    return_tensors="pt",
-                )
-                batch = {key: value.to(device) for key, value in batch.items()}
-                outputs = model(**batch)
-                embeddings = outputs[0][:, 0]
-                if normalized:
-                    embeddings = F.normalize(embeddings, p=2, dim=1)
-                vectors.extend(embeddings.detach().cpu().float().tolist())
-        return vectors
-
-    return embed
+    from .ingestion_pipeline import build_embedder, hf_auth_kwargs, load_campaign_config, manifest_payload, run_hf_ingestion
 
 
 def main() -> int:

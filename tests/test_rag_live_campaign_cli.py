@@ -1,5 +1,7 @@
 import json
+import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -62,9 +64,7 @@ class RagLiveCampaignCliContractTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             result = subprocess.run(
                 [
-                    "uv",
-                    "run",
-                    "python",
+                    sys.executable,
                     str(SCRIPT),
                     "--output-dir",
                     tmpdir,

@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import importlib
 import json
 import os
 import re
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Sequence
@@ -27,6 +28,7 @@ from .bergen_adapter.turboquant_backend import (
 from .campaign_report import build_comparative_campaign_plan, run_comparative_campaign
 from .dataset_pack import load_primary_dataset_pack
 from .end_to_end import export_end_to_end_run
+from .ingestion_pipeline import CampaignConfig, build_embedder, load_campaign_config, run_hf_ingestion
 from .operational_metrics import QueryOperationalMetrics
 from .rerank_eval import export_two_stage_retrieval_run
 from .retrieval_eval import QueryEvaluation, compute_retrieval_metrics, export_retrieval_run
@@ -43,6 +45,11 @@ DEFAULT_HNSW_EF_SEARCH = 80
 DEFAULT_IVFFLAT_PROBES = 8
 DEFAULT_GENERATION_TOP_K = 5
 BACKEND_FAMILIES = ("pg_turboquant", "pgvector_hnsw", "pgvector_ivfflat")
+LIVE_CONFIG_PATHS = {
+    "kilt_nq": Path(__file__).resolve().parent / "configs" / "live" / "kilt_nq_small_live.json",
+    "kilt_hotpotqa": Path(__file__).resolve().parent / "configs" / "live" / "kilt_hotpotqa_ivf_live.json",
+    "popqa": Path(__file__).resolve().parent / "configs" / "live" / "popqa_small_live.json",
+}
 
 
 @dataclass(frozen=True)
@@ -185,35 +192,41 @@ def run_live_campaign(
         embedding_column=embedding_column,
         query_vector_cast=query_vector_cast,
     )
-    isolation_layout = (
-        _prepare_backend_isolated_layout(
-            dsn=dsn,
-            connect_fn=connect_fn,
-            source_table=passage_table,
-            output_dir=output_dir,
-            turboquant_index_name=turboquant_index_name,
-            hnsw_index_name=hnsw_index_name,
-            ivfflat_index_name=ivfflat_index_name,
-        )
-        if backend_isolation
-        else {}
-    )
-    if isolation_layout:
-        run_config["backend_isolation_layout"] = isolation_layout
-        (output_dir / "live-campaign-config.json").write_text(
-            json.dumps(run_config, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
 
     answer_metrics_fn = _build_answer_metrics_computer(bergen_root)
     retrieval_payloads: dict[tuple[str, str], dict[str, object]] = {}
     end_to_end_payloads: dict[tuple[str, str], dict[str, object]] = {}
+    dataset_source_layouts: dict[str, dict[str, object]] = {}
 
     for dataset_id in plan["datasets"]:
         dataset_config = dataset_configs[dataset_id]
         dataset_samples = dataset_loader(dataset_id, dataset_config, query_limit)
         if not dataset_samples:
             raise ValueError(f"dataset loader returned no queries for dataset: {dataset_id}")
+
+        dataset_layout = _prepare_dataset_source_layout(
+            dataset_id=dataset_id,
+            output_dir=output_dir,
+            dsn=dsn,
+            connect_fn=connect_fn,
+            metric=metric,
+            query_vector_cast=query_vector_cast,
+            passage_table=passage_table,
+        )
+        dataset_source_layouts[dataset_id] = _serialize_dataset_source_layout(dataset_layout)
+        isolation_layout = (
+            _prepare_backend_isolated_layout(
+                dsn=dsn,
+                connect_fn=connect_fn,
+                source_table=dataset_layout["passage_table"],
+                output_dir=output_dir / dataset_id,
+                turboquant_index_name=dataset_layout["index_names"]["pg_turboquant"],
+                hnsw_index_name=dataset_layout["index_names"]["pgvector_hnsw"],
+                ivfflat_index_name=dataset_layout["index_names"]["pgvector_ivfflat"],
+            )
+            if backend_isolation
+            else {}
+        )
 
         dataset_top_k = int(dataset_config["retrieval_profile"]["top_k_default"])
         rerank_top_k = int(dataset_config["retrieval_profile"].get("rerank_top_k_default") or dataset_top_k)
@@ -222,12 +235,14 @@ def run_live_campaign(
         for variant in plan["method_variants"]:
             method_id = str(variant["method_id"])
             backend_family = str(variant["backend_family"])
-            scenario_table = _resolve_scenario_passage_table(passage_table, isolation_layout, backend_family)
+            scenario_table = _resolve_scenario_passage_table(
+                dataset_layout["passage_table"], isolation_layout, backend_family
+            )
             scenario_index_names = _resolve_scenario_index_names(
                 isolation_layout=isolation_layout,
-                turboquant_index_name=turboquant_index_name,
-                hnsw_index_name=hnsw_index_name,
-                ivfflat_index_name=ivfflat_index_name,
+                turboquant_index_name=dataset_layout["index_names"]["pg_turboquant"],
+                hnsw_index_name=dataset_layout["index_names"]["pgvector_hnsw"],
+                ivfflat_index_name=dataset_layout["index_names"]["pgvector_ivfflat"],
             )
             scenario_root = output_dir / "scenarios" / dataset_id / method_id
             retrieval_root = scenario_root / "retrieval"
@@ -274,6 +289,13 @@ def run_live_campaign(
             )
             end_to_end_payloads[(dataset_id, method_id)] = end_to_end_result
 
+    if dataset_source_layouts:
+        run_config["dataset_source_layouts"] = dataset_source_layouts
+    (output_dir / "live-campaign-config.json").write_text(
+        json.dumps(run_config, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
     artifacts = run_comparative_campaign(
         output_dir=output_dir,
         plan=plan,
@@ -313,6 +335,89 @@ def _resolve_scenario_index_names(
         "pg_turboquant": isolation_layout.get("pg_turboquant", {}).get("index_name", turboquant_index_name),
         "pgvector_hnsw": isolation_layout.get("pgvector_hnsw", {}).get("index_name", hnsw_index_name),
         "pgvector_ivfflat": isolation_layout.get("pgvector_ivfflat", {}).get("index_name", ivfflat_index_name),
+    }
+
+
+def _prepare_dataset_source_layout(
+    *,
+    dataset_id: str,
+    output_dir: Path,
+    dsn: str,
+    connect_fn: Callable[[str], Any],
+    metric: str,
+    query_vector_cast: str,
+    passage_table: PassageTable,
+) -> dict[str, object]:
+    live_config_path = LIVE_CONFIG_PATHS.get(dataset_id)
+    if live_config_path is None:
+        raise ValueError(f"missing live ingestion config for dataset: {dataset_id}")
+
+    source_config = load_campaign_config(live_config_path)
+    suffix = output_dir.name.replace("-", "_")
+    dataset_suffix = f"{dataset_id}_source"
+    documents_table = _isolated_relation_name(source_config.schema["documents_table"], dataset_suffix, suffix)
+    passages_table = _isolated_relation_name(source_config.schema["passages_table"], dataset_suffix, suffix)
+
+    backend_index_names: dict[str, str] = {}
+    rewritten_backends: list[dict[str, Any]] = []
+    for backend in source_config.backends:
+        backend_family = str(backend["kind"])
+        index_name = _isolated_relation_name(
+            str(backend["index_name"]),
+            f"{dataset_id}_{backend_family}_source_idx",
+            suffix,
+        )
+        rewritten = dict(backend)
+        rewritten["index_name"] = index_name
+        rewritten["metric"] = metric
+        rewritten_backends.append(rewritten)
+        backend_index_names[backend_family] = index_name
+
+    prepared_config = CampaignConfig(
+        dataset=replace(source_config.dataset, name=f"{source_config.dataset.name}__{suffix}"),
+        embedding=source_config.embedding,
+        chunking=source_config.chunking,
+        schema={"documents_table": documents_table, "passages_table": passages_table},
+        backends=rewritten_backends,
+        regression_gate=source_config.regression_gate,
+    )
+
+    embedder = build_embedder(prepared_config.embedding.model, prepared_config.embedding.normalized)
+    with connect_fn(dsn) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            cursor.execute("CREATE EXTENSION IF NOT EXISTS pg_turboquant")
+            cursor.execute(f"DROP TABLE IF EXISTS {passages_table} CASCADE")
+            cursor.execute(f"DROP TABLE IF EXISTS {documents_table} CASCADE")
+        manifest = run_hf_ingestion(connection, prepared_config, embedder=embedder)
+
+    return {
+        "passage_table": PassageTable(
+            table_name=passages_table,
+            id_column=passage_table.id_column,
+            text_column=passage_table.text_column,
+            embedding_column=passage_table.embedding_column,
+            query_vector_cast=query_vector_cast,
+        ),
+        "index_names": {
+            "pg_turboquant": backend_index_names["pg_turboquant"],
+            "pgvector_hnsw": backend_index_names["pgvector_hnsw"],
+            "pgvector_ivfflat": backend_index_names["pgvector_ivfflat"],
+        },
+        "manifest": manifest,
+    }
+
+
+def _serialize_dataset_source_layout(layout: dict[str, object]) -> dict[str, object]:
+    passage_table = layout["passage_table"]
+    if isinstance(passage_table, PassageTable):
+        serialized_table = asdict(passage_table)
+    else:
+        serialized_table = dict(passage_table)
+    return {
+        "passage_table": serialized_table,
+        "index_names": dict(layout["index_names"]),
+        "manifest": dict(layout["manifest"]),
     }
 
 
@@ -373,7 +478,11 @@ def _prepare_backend_isolated_layout(
 def _isolated_relation_name(base_name: str, backend_family: str, suffix: str) -> str:
     stem = base_name.split(".")[-1]
     sanitized = re.sub(r"[^a-zA-Z0-9_]+", "_", f"{stem}__{suffix}__{backend_family}").strip("_")
-    return sanitized[:63]
+    if len(sanitized) <= 63:
+        return sanitized
+    digest = hashlib.sha1(sanitized.encode("utf-8")).hexdigest()[:8]
+    head = sanitized[: 63 - len(digest) - 2].rstrip("_")
+    return f"{head}__{digest}"
 
 
 def _rewrite_indexdef_for_clone(indexdef: str, *, new_table_name: str, new_index_name: str) -> str:

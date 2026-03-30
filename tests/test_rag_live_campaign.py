@@ -4,9 +4,13 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from benchmarks.rag.ingestion_pipeline import CampaignConfig, ChunkingConfig, DatasetConfig, EmbeddingConfig
+from benchmarks.rag.bergen_adapter import PassageTable
 from benchmarks.rag.live_campaign import (
     QuerySample,
     _build_default_generator_runner,
+    _isolated_relation_name,
+    _prepare_dataset_source_layout,
     _rewrite_indexdef_for_clone,
     build_live_campaign_runtime,
     run_live_campaign,
@@ -61,6 +65,82 @@ class FakeConnection:
 
 
 class RagLiveCampaignContractTest(unittest.TestCase):
+    def test_prepare_dataset_source_layout_rebuilds_a_dataset_specific_live_corpus(self):
+        fake_config = CampaignConfig(
+            dataset=DatasetConfig(
+                name="kilt_nq_small_live",
+                version="2026-03-29",
+                source_path="hf://kilt_tasks/nq[validation][:10000]",
+            ),
+            embedding=EmbeddingConfig(model="BAAI/bge-small-en-v1.5", dimension=384, normalized=False),
+            chunking=ChunkingConfig(strategy="question_answer_seed", chunk_size=1, chunk_overlap=0),
+            schema={"documents_table": "rag_documents", "passages_table": "rag_passages"},
+            backends=[
+                {
+                    "kind": "pg_turboquant",
+                    "index_name": "rag_passages_tq_idx",
+                    "metric": "cosine",
+                    "mode": "approx",
+                    "options": {"lists": 0, "bits": 4},
+                },
+                {
+                    "kind": "pgvector_hnsw",
+                    "index_name": "rag_passages_hnsw_idx",
+                    "metric": "cosine",
+                    "mode": "approx",
+                    "options": {"m": 16, "ef_construction": 64},
+                },
+                {
+                    "kind": "pgvector_ivfflat",
+                    "index_name": "rag_passages_ivf_idx",
+                    "metric": "cosine",
+                    "mode": "approx",
+                    "options": {"lists": 64},
+                },
+            ],
+        )
+
+        connection = FakeConnection()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with mock.patch(
+                "benchmarks.rag.live_campaign.load_campaign_config",
+                return_value=fake_config,
+            ), mock.patch(
+                "benchmarks.rag.live_campaign.build_embedder",
+                return_value=lambda texts: [[1.0, 0.0] for _ in texts],
+            ) as build_embedder_mock, mock.patch(
+                "benchmarks.rag.live_campaign.run_hf_ingestion",
+                return_value={"dataset_name": "kilt_nq_small_live"},
+            ) as run_hf_ingestion_mock:
+                layout = _prepare_dataset_source_layout(
+                    dataset_id="kilt_nq",
+                    output_dir=Path(tmpdir),
+                    dsn="postgresql://fake",
+                    connect_fn=lambda _dsn: connection,
+                    metric="cosine",
+                    query_vector_cast="vector",
+                    passage_table=PassageTable(
+                        table_name="rag_passages",
+                        id_column="passage_id",
+                        text_column="passage_text",
+                        embedding_column="embedding",
+                        query_vector_cast="vector",
+                    ),
+                )
+
+        self.assertEqual(layout["passage_table"].id_column, "passage_id")
+        self.assertIn("kilt_nq", layout["passage_table"].table_name)
+        self.assertIn("kilt_nq", layout["index_names"]["pg_turboquant"])
+        self.assertEqual(layout["manifest"]["dataset_name"], "kilt_nq_small_live")
+        build_embedder_mock.assert_called_once_with("BAAI/bge-small-en-v1.5", False)
+        self.assertEqual(run_hf_ingestion_mock.call_count, 1)
+
+        executed_sql = "\n".join(sql for cursor in connection.cursors for sql, _ in cursor.executed)
+        self.assertIn("CREATE EXTENSION IF NOT EXISTS vector", executed_sql)
+        self.assertIn("CREATE EXTENSION IF NOT EXISTS pg_turboquant", executed_sql)
+        self.assertIn("DROP TABLE IF EXISTS", executed_sql)
+
     def test_default_generator_runner_supports_oracle_answer_without_hitting_abstract_base(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             bergen_root = Path(tmpdir)
@@ -126,6 +206,22 @@ class RagLiveCampaignContractTest(unittest.TestCase):
             "CREATE INDEX rag_passages__cmp__hnsw_idx ON rag_passages__cmp__hnsw USING hnsw (embedding vector_cosine_ops) WITH (m='16', ef_construction='64')",
         )
 
+    def test_isolated_relation_name_stays_unique_when_long_inputs_truncate(self):
+        source_name = _isolated_relation_name(
+            "rag_passages_tq_idx__live_rag_e2e_20260330_fair__kilt_nq_source",
+            "pg_turboquant",
+            "kilt_nq",
+        )
+        clone_name = _isolated_relation_name(
+            "rag_passages_tq_idx__live_rag_e2e_20260330_fair__kilt_nq_source",
+            "pg_turboquant_idx",
+            "kilt_nq",
+        )
+
+        self.assertNotEqual(source_name, clone_name)
+        self.assertLessEqual(len(source_name), 63)
+        self.assertLessEqual(len(clone_name), 63)
+
     def test_live_runner_smoke_emits_per_scenario_and_campaign_artifacts_with_fakes(self):
         runtime = build_live_campaign_runtime(
             dataset_ids=["kilt_nq"],
@@ -160,27 +256,49 @@ class RagLiveCampaignContractTest(unittest.TestCase):
                 "answer": query_sample.answers[0],
             }
 
+        def fake_prepare_dataset_source_layout(**kwargs):
+            self.assertEqual(kwargs["dataset_id"], "kilt_nq")
+            return {
+                "passage_table": kwargs["passage_table"].__class__(
+                    table_name="rag_passages__kilt_nq_source",
+                    id_column="passage_id",
+                    text_column="passage_text",
+                    embedding_column="embedding",
+                    query_vector_cast="vector",
+                ),
+                "index_names": {
+                    "pg_turboquant": "rag_passages__kilt_nq_tq_idx",
+                    "pgvector_hnsw": "rag_passages__kilt_nq_hnsw_idx",
+                    "pgvector_ivfflat": "rag_passages__kilt_nq_ivf_idx",
+                },
+                "manifest": {"dataset_name": "kilt_nq_small_live"},
+            }
+
         with tempfile.TemporaryDirectory() as tmpdir:
-            result = run_live_campaign(
-                output_dir=Path(tmpdir),
-                runtime=runtime,
-                dsn="postgresql://fake",
-                table_name="rag_passages",
-                id_column="passage_id",
-                text_column="passage_text",
-                embedding_column="embedding",
-                metric="cosine",
-                turboquant_index_name="rag_passages_tq_idx",
-                hnsw_index_name="rag_passages_hnsw_idx",
-                ivfflat_index_name="rag_passages_ivf_idx",
-                query_limit=1,
-                generation_top_k=1,
-                backend_isolation=False,
-                connect_fn=fake_connect,
-                dataset_loader=fake_dataset_loader,
-                query_encoder=fake_query_encoder,
-                generator_runner=fake_generator_runner,
-            )
+            with mock.patch(
+                "benchmarks.rag.live_campaign._prepare_dataset_source_layout",
+                side_effect=fake_prepare_dataset_source_layout,
+            ):
+                result = run_live_campaign(
+                    output_dir=Path(tmpdir),
+                    runtime=runtime,
+                    dsn="postgresql://fake",
+                    table_name="rag_passages",
+                    id_column="passage_id",
+                    text_column="passage_text",
+                    embedding_column="embedding",
+                    metric="cosine",
+                    turboquant_index_name="rag_passages_tq_idx",
+                    hnsw_index_name="rag_passages_hnsw_idx",
+                    ivfflat_index_name="rag_passages_ivf_idx",
+                    query_limit=1,
+                    generation_top_k=1,
+                    backend_isolation=False,
+                    connect_fn=fake_connect,
+                    dataset_loader=fake_dataset_loader,
+                    query_encoder=fake_query_encoder,
+                    generator_runner=fake_generator_runner,
+                )
 
             self.assertIn("artifacts", result)
             campaign_json = Path(tmpdir) / result["artifacts"]["campaign_json"]
@@ -224,6 +342,16 @@ class RagLiveCampaignContractTest(unittest.TestCase):
             self.assertTrue(rerank_path.exists())
             self.assertTrue(end_to_end_path.exists())
             self.assertTrue(run_config_path.exists())
+
+            run_config = json.loads(run_config_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                run_config["dataset_source_layouts"]["kilt_nq"]["passage_table"]["table_name"],
+                "rag_passages__kilt_nq_source",
+            )
+            self.assertEqual(
+                run_config["dataset_source_layouts"]["kilt_nq"]["manifest"]["dataset_name"],
+                "kilt_nq_small_live",
+            )
 
 
 if __name__ == "__main__":
