@@ -9,10 +9,15 @@
 #include "src/tq_transform.h"
 
 #define TQ_PAGE_MAGIC UINT32_C(0x54515047)
-#define TQ_PAGE_FORMAT_VERSION 8
+#define TQ_PAGE_FORMAT_VERSION 12
 #define TQ_INVALID_BLOCK_NUMBER UINT32_MAX
 #define TQ_DETACHED_FREE_LIST_ID UINT32_MAX
 #define TQ_BATCH_PAGE_NO_REPRESENTATIVE UINT16_MAX
+
+#define TQ_ALGORITHM_VERSION 3
+#define TQ_QUANTIZER_VERSION 2
+#define TQ_RESIDUAL_SKETCH_VERSION 2
+#define TQ_ESTIMATOR_VERSION 2
 
 typedef enum TqPageKind
 {
@@ -64,6 +69,12 @@ typedef struct TqMetaPageFields
 	float			router_coeff_var;
 	float			router_balance_penalty;
 	float			router_selection_score;
+	uint16_t		algorithm_version;
+	uint16_t		quantizer_version;
+	uint16_t		residual_sketch_version;
+	uint16_t		residual_bits_per_dimension;
+	uint32_t		residual_sketch_dimension;
+	uint16_t		estimator_version;
 } TqMetaPageFields;
 
 typedef struct TqListDirEntry

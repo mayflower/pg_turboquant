@@ -6,16 +6,21 @@
 - Primary implementation language: C with SQL migration files and test harnesses
 - Target development workflow: Codex CLI driving small, test-first increments
 
+## Rewrite note
+
+As of 2026-03-30, the primary codec contract is being rewritten around faithful TurboQuant `v2` semantics for normalized cosine and inner-product retrieval. ADR-0012 supersedes the earlier product assumption that the main packed path could remain a merely TurboQuant-inspired `tq_prod`/`tq_mse` split. This PRD remains the repository baseline for PostgreSQL boundaries, testing, and maintenance policy, but the packed algorithm contract should now be read through ADR-0012.
+
 ## 1. Executive summary
 
-`pg_turboquant` is a PostgreSQL extension that introduces a new index access method, `turboquant`, for approximate nearest-neighbor retrieval over `vector` and `halfvec` embeddings stored in PostgreSQL. The index is inspired by TurboQuant-style compression and is designed for **high storage density**, **cache-friendly scoring**, and **orderable ANN scans** that fit PostgreSQL's execution and MVCC model.
+`pg_turboquant` is a PostgreSQL extension that introduces a new index access method, `turboquant`, for approximate nearest-neighbor retrieval over `vector` and `halfvec` embeddings stored in PostgreSQL. The current rewrite targets a faithful TurboQuant `v2` packed path for normalized cosine and inner-product retrieval while preserving the surrounding PostgreSQL execution model, maintenance story, and access-method boundaries.
 
 The core v1 product thesis is:
 
-1. **A dedicated access method is required.** A TurboQuant-style compressed layout cannot be expressed cleanly as an opclass bolted onto `ivfflat` or `hnsw`.
+1. **A dedicated access method is required.** A faithful TurboQuant `v2` compressed layout cannot be expressed cleanly as an opclass bolted onto `ivfflat` or `hnsw`.
 2. **The physical layout must respect PostgreSQL's page model.** On default builds the effective lane count is small, often 8 for realistic embedding sizes and bit widths.
 3. **Exact reranking belongs outside the access method.** The access method returns candidate TIDs in approximate distance order; SQL or the executor does any exact second-stage reranking.
 4. **The index format must stay production-safe.** v1 uses structured transforms only, append-only page mutation patterns, dead bitmaps for deletes, immutable IVF routing after build, and rebuilds via `REINDEX` when maintenance requires it.
+5. **Faithfulness is narrow and explicit.** Normalized cosine and inner product are the primary faithful fast path; L2 and non-normalized retrieval stay available as compatibility fallbacks until separately redesigned.
 
 The result should be a compact, PostgreSQL-native ANN index that offers materially better code density than a per-tuple float representation while preserving correctness boundaries imposed by PostgreSQL.
 

@@ -8,7 +8,9 @@
 typedef struct TqProdCodecConfig
 {
 	uint32_t	dimension;
+	uint32_t	qjl_dimension;
 	uint8_t		bits;
+	uint64_t	qjl_seed;
 } TqProdCodecConfig;
 
 typedef struct TqProdPackedLayout
@@ -22,9 +24,11 @@ typedef struct TqProdPackedLayout
 typedef struct TqProdLut
 {
 	uint32_t	dimension;
+	uint32_t	qjl_dimension;
 	uint32_t	level_count;
 	float	   *values;
-	uint8_t	   *query_signs;
+	float	   *qjl_values;
+	float		feature_weight_norm;
 } TqProdLut;
 
 extern bool tq_prod_packed_layout(const TqProdCodecConfig *config,
@@ -37,6 +41,32 @@ extern bool tq_prod_encode(const TqProdCodecConfig *config,
 						   size_t packed_len,
 						   char *errmsg,
 						   size_t errmsg_len);
+extern bool tq_prod_qjl_project(const TqProdCodecConfig *config,
+								const float *input,
+								float *output,
+								size_t output_len,
+								char *errmsg,
+								size_t errmsg_len);
+extern bool tq_prod_qjl_backproject_signs(const TqProdCodecConfig *config,
+										  const uint8_t *packed_signs,
+										  size_t packed_signs_len,
+										  float *output,
+										  size_t output_len,
+										  char *errmsg,
+										  size_t errmsg_len);
+extern bool tq_prod_feature_distance(const TqProdCodecConfig *config,
+									 const uint8_t *left_packed,
+									 size_t left_packed_len,
+									 const uint8_t *right_packed,
+									 size_t right_packed_len,
+									 float *distance,
+									 char *errmsg,
+									 size_t errmsg_len);
+extern bool tq_prod_query_weight_l2_norm(const TqProdCodecConfig *config,
+										 const TqProdLut *lut,
+										 float *norm,
+										 char *errmsg,
+										 size_t errmsg_len);
 extern bool tq_prod_read_gamma(const TqProdCodecConfig *config,
 							   const uint8_t *packed,
 							   size_t packed_len,

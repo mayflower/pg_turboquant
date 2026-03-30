@@ -50,6 +50,10 @@ static const char *tq_distance_kind_name(TqDistanceKind distance_kind);
 static const char *tq_codec_kind_name(TqCodecKind codec_kind);
 static const char *tq_transform_kind_name(TqTransformKind transform_kind);
 static const char *tq_router_algorithm_name(TqRouterAlgorithmKind algorithm_kind);
+static const char *tq_quantizer_family_name(uint16_t version);
+static const char *tq_residual_sketch_kind_name(uint16_t version);
+static const char *tq_estimator_mode_name(uint16_t version);
+static const char *tq_page_summary_mode_name(const TqMetaPageFields *meta_fields);
 static void tq_json_append_string(StringInfo buf, const char *value);
 static int tq_u64_compare(const void *left, const void *right);
 static bool tq_read_meta_fields(Relation index_relation,
@@ -136,6 +140,47 @@ tq_router_algorithm_name(TqRouterAlgorithmKind algorithm_kind)
 	}
 
 	return "unknown";
+}
+
+static const char *
+tq_quantizer_family_name(uint16_t version)
+{
+	if (version == TQ_QUANTIZER_VERSION)
+		return "beta_lloyd_max";
+	return "unknown";
+}
+
+static const char *
+tq_residual_sketch_kind_name(uint16_t version)
+{
+	if (version == TQ_RESIDUAL_SKETCH_VERSION)
+		return "1bit_qjl";
+	return "unknown";
+}
+
+static const char *
+tq_estimator_mode_name(uint16_t version)
+{
+	if (version == TQ_ESTIMATOR_VERSION)
+		return "qprod_unbiased_ip";
+	return "unknown";
+}
+
+static const char *
+tq_page_summary_mode_name(const TqMetaPageFields *meta_fields)
+{
+	if (meta_fields == NULL || meta_fields->list_count == 0)
+		return "disabled";
+
+	if (meta_fields->normalized
+		&& meta_fields->codec == TQ_CODEC_PROD
+		&& (meta_fields->distance == TQ_DISTANCE_COSINE
+			|| meta_fields->distance == TQ_DISTANCE_IP))
+		return "safe_summary_pruning";
+
+	if (meta_fields->list_count > 0)
+		return "ordering_only";
+	return "disabled";
 }
 
 static void
@@ -676,6 +721,34 @@ tq_index_metadata_core(PG_FUNCTION_ARGS)
 	appendStringInfoString(&buf, "\"codec\":");
 	tq_json_append_string(&buf, tq_codec_kind_name(meta_fields.codec));
 	appendStringInfoChar(&buf, ',');
+	appendStringInfo(&buf, "\"algorithm_version\":%u,", (unsigned int) meta_fields.algorithm_version);
+	appendStringInfoString(&buf, "\"faithful_fast_path\":");
+	appendStringInfoString(&buf,
+						   (meta_fields.normalized
+							&& (meta_fields.distance == TQ_DISTANCE_COSINE
+								|| meta_fields.distance == TQ_DISTANCE_IP))
+						   ? "true"
+						   : "false");
+	appendStringInfoChar(&buf, ',');
+	appendStringInfoString(&buf, "\"compatibility_fallback_only\":");
+	appendStringInfoString(&buf,
+						   (meta_fields.normalized
+							&& (meta_fields.distance == TQ_DISTANCE_COSINE
+								|| meta_fields.distance == TQ_DISTANCE_IP))
+						   ? "false"
+						   : "true");
+	appendStringInfoChar(&buf, ',');
+	appendStringInfoString(&buf, "\"page_summary\":{");
+	appendStringInfoString(&buf, "\"mode\":");
+	tq_json_append_string(&buf, tq_page_summary_mode_name(&meta_fields));
+	appendStringInfo(&buf,
+					 ",\"safe_pruning\":%s},",
+					 (meta_fields.list_count > 0
+					  && meta_fields.normalized
+					  && meta_fields.codec == TQ_CODEC_PROD
+					  && (meta_fields.distance == TQ_DISTANCE_COSINE
+						  || meta_fields.distance == TQ_DISTANCE_IP))
+					 ? "true" : "false");
 	appendStringInfoString(&buf, "\"normalized\":");
 	appendStringInfoString(&buf, meta_fields.normalized ? "true" : "false");
 	appendStringInfo(&buf,
@@ -694,6 +767,24 @@ tq_index_metadata_core(PG_FUNCTION_ARGS)
 					 meta_fields.dimension,
 					 meta_fields.transform_output_dimension,
 					 (unsigned long long) meta_fields.transform_seed);
+	appendStringInfoString(&buf, "\"quantizer\":{");
+	appendStringInfoString(&buf, "\"family\":");
+	tq_json_append_string(&buf, tq_quantizer_family_name(meta_fields.quantizer_version));
+	appendStringInfo(&buf, ",\"version\":%u},", (unsigned int) meta_fields.quantizer_version);
+	appendStringInfoString(&buf, "\"residual_sketch\":{");
+	appendStringInfoString(&buf, "\"kind\":");
+	tq_json_append_string(&buf, tq_residual_sketch_kind_name(meta_fields.residual_sketch_version));
+	appendStringInfo(&buf,
+					 ",\"version\":%u,\"bits_per_dimension\":%u,\"projected_dimension\":%u,\"bit_budget\":%u},",
+					 (unsigned int) meta_fields.residual_sketch_version,
+					 (unsigned int) meta_fields.residual_bits_per_dimension,
+					 (unsigned int) meta_fields.residual_sketch_dimension,
+					 (unsigned int) (meta_fields.residual_sketch_dimension
+									 * meta_fields.residual_bits_per_dimension));
+	appendStringInfoString(&buf, "\"estimator\":{");
+	appendStringInfoString(&buf, "\"mode\":");
+	tq_json_append_string(&buf, tq_estimator_mode_name(meta_fields.estimator_version));
+	appendStringInfo(&buf, ",\"version\":%u},", (unsigned int) meta_fields.estimator_version);
 	appendStringInfoString(&buf, "\"router\":{");
 	appendStringInfoString(&buf, "\"algorithm\":");
 	tq_json_append_string(&buf, tq_router_algorithm_name(meta_fields.router_algorithm));
@@ -749,7 +840,7 @@ Datum
 tq_last_scan_stats_core(PG_FUNCTION_ARGS)
 {
 	TqScanStats stats;
-	char		json[1024];
+	char		json[2048];
 
 	memset(&stats, 0, sizeof(stats));
 	memset(json, 0, sizeof(json));

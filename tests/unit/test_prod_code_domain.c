@@ -74,6 +74,140 @@ seeded_unit_vector(uint32_t seed, float *values, size_t len)
 	normalize(values, len);
 }
 
+static float
+qjl_scale(uint32_t sketch_dimension)
+{
+	return 1.253314137315500251f / (float) sketch_dimension;
+}
+
+static void
+test_qjl_structured_projection_is_deterministic_and_seeded(void)
+{
+	TqProdCodecConfig first = {.dimension = 6, .bits = 4, .qjl_seed = 17u, .qjl_dimension = 4};
+	TqProdCodecConfig second = {.dimension = 6, .bits = 4, .qjl_seed = 23u, .qjl_dimension = 4};
+	float input[6];
+	float left[4];
+	float right[4];
+	float alternate[4];
+	bool any_difference = false;
+	size_t i = 0;
+	char errmsg[256];
+
+	memset(input, 0, sizeof(input));
+	memset(left, 0, sizeof(left));
+	memset(right, 0, sizeof(right));
+	memset(alternate, 0, sizeof(alternate));
+
+	seeded_unit_vector(41u, input, 6);
+	assert(tq_prod_qjl_project(&first, input, left, 4, errmsg, sizeof(errmsg)));
+	assert(tq_prod_qjl_project(&first, input, right, 4, errmsg, sizeof(errmsg)));
+	assert(tq_prod_qjl_project(&second, input, alternate, 4, errmsg, sizeof(errmsg)));
+
+	for (i = 0; i < 4; i++)
+		assert(fabsf(left[i] - right[i]) <= 1e-6f);
+
+	for (i = 0; i < 4; i++)
+	{
+		if (fabsf(left[i] - alternate[i]) > 1e-4f)
+		{
+			any_difference = true;
+			break;
+		}
+	}
+
+	assert(any_difference);
+}
+
+static void
+test_qjl_lut_matches_structured_projection(void)
+{
+	TqProdCodecConfig config = {.dimension = 6, .bits = 4, .qjl_seed = 99u, .qjl_dimension = 4};
+	TqProdLut lut;
+	float query[6];
+	float projection[4];
+	uint32_t dim = 0;
+	char errmsg[256];
+
+	memset(&lut, 0, sizeof(lut));
+	memset(query, 0, sizeof(query));
+	memset(projection, 0, sizeof(projection));
+
+	seeded_unit_vector(57u, query, 6);
+	assert(tq_prod_lut_build(&config, query, &lut, errmsg, sizeof(errmsg)));
+	assert(tq_prod_qjl_project(&config, query, projection, 4, errmsg, sizeof(errmsg)));
+
+	for (dim = 0; dim < config.qjl_dimension; dim++)
+		assert(fabsf(lut.qjl_values[dim] - (qjl_scale(config.qjl_dimension) * projection[dim])) <= 1e-6f);
+
+	tq_prod_lut_reset(&lut);
+}
+
+static void
+test_qjl_backprojection_matches_decode_residual_component(void)
+{
+	TqProdCodecConfig config = {.dimension = 6, .bits = 4, .qjl_seed = 7u, .qjl_dimension = 4};
+	TqProdPackedLayout layout;
+	uint8_t packed[64];
+	uint8_t stage1_only[64];
+	float input[6];
+	float decoded[6];
+	float stage1_decoded[6];
+	float residual_component[6];
+	float reconstructed[6];
+	float gamma = 0.0f;
+	uint32_t dim = 0;
+	char errmsg[256];
+
+	memset(&layout, 0, sizeof(layout));
+	memset(packed, 0, sizeof(packed));
+	memset(stage1_only, 0, sizeof(stage1_only));
+	memset(input, 0, sizeof(input));
+	memset(decoded, 0, sizeof(decoded));
+	memset(stage1_decoded, 0, sizeof(stage1_decoded));
+	memset(residual_component, 0, sizeof(residual_component));
+	memset(reconstructed, 0, sizeof(reconstructed));
+
+	seeded_unit_vector(73u, input, 6);
+	assert(tq_prod_packed_layout(&config, &layout, errmsg, sizeof(errmsg)));
+	assert(layout.total_bytes <= sizeof(packed));
+	assert(tq_prod_encode(&config, input, packed, layout.total_bytes, errmsg, sizeof(errmsg)));
+	assert(tq_prod_read_gamma(&config, packed, layout.total_bytes, &gamma, errmsg, sizeof(errmsg)));
+	assert(tq_prod_decode(&config, packed, layout.total_bytes, decoded, 6, errmsg, sizeof(errmsg)));
+
+	memcpy(stage1_only, packed, layout.total_bytes);
+	memset(stage1_only + layout.idx_bytes, 0, layout.qjl_bytes + layout.gamma_bytes);
+	assert(tq_prod_decode(&config, stage1_only, layout.total_bytes, stage1_decoded, 6, errmsg, sizeof(errmsg)));
+	assert(tq_prod_qjl_backproject_signs(&config,
+										 packed + layout.idx_bytes,
+										 layout.qjl_bytes,
+										 reconstructed,
+										 6,
+										 errmsg,
+										 sizeof(errmsg)));
+
+	for (dim = 0; dim < config.dimension; dim++)
+	{
+		residual_component[dim] = decoded[dim] - stage1_decoded[dim];
+		assert(fabsf(residual_component[dim]
+					 - (gamma * qjl_scale(config.qjl_dimension) * reconstructed[dim])) <= 1e-5f);
+	}
+}
+
+static void
+test_qjl_sketch_dimension_controls_packed_layout(void)
+{
+	TqProdCodecConfig config = {.dimension = 17, .bits = 4, .qjl_seed = 101u, .qjl_dimension = 9};
+	TqProdPackedLayout layout;
+	char errmsg[256];
+
+	memset(&layout, 0, sizeof(layout));
+	assert(tq_prod_packed_layout(&config, &layout, errmsg, sizeof(errmsg)));
+	assert(layout.idx_bytes == 7);
+	assert(layout.qjl_bytes == 2);
+	assert(layout.gamma_bytes == 4);
+	assert(layout.total_bytes == 13);
+}
+
 static void
 test_code_domain_score_matches_decode_baseline(void)
 {
@@ -300,6 +434,10 @@ test_force_decode_diagnostics_switches_active_scoring_path(void)
 int
 main(void)
 {
+	test_qjl_structured_projection_is_deterministic_and_seeded();
+	test_qjl_lut_matches_structured_projection();
+	test_qjl_backprojection_matches_decode_residual_component();
+	test_qjl_sketch_dimension_controls_packed_layout();
 	test_code_domain_score_matches_decode_baseline();
 	test_ranking_matches_decode_baseline_for_normalized_cosine_and_ip();
 	test_distance_conversion_contract();

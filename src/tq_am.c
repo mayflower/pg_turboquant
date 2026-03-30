@@ -100,6 +100,12 @@ typedef struct TqProbePageCountFallbackContext
 	Relation	index_relation;
 } TqProbePageCountFallbackContext;
 
+static uint64_t
+tq_prod_qjl_seed(uint64_t transform_seed)
+{
+	return transform_seed ^ UINT64_C(0x9e3779b97f4a7c15);
+}
+
 static void tq_load_option_config(Relation index_relation, TqOptionConfig *config);
 static void tq_reset_scan_opaque(TqScanOpaque *opaque);
 static void tq_buildstate_reset(TqBuildState *state);
@@ -326,6 +332,7 @@ tq_load_option_config(Relation index_relation, TqOptionConfig *config)
 	config->router_iterations = 8;
 	config->router_restarts = 3;
 	config->router_seed = 20260327;
+	config->qjl_sketch_dim = 0;
 	config->normalized = true;
 	config->transform_name = "hadamard";
 	config->lanes_name = "auto";
@@ -339,6 +346,7 @@ tq_load_option_config(Relation index_relation, TqOptionConfig *config)
 	config->router_iterations = options->router_iterations;
 	config->router_restarts = options->router_restarts == 0 ? 3 : options->router_restarts;
 	config->router_seed = options->router_seed;
+	config->qjl_sketch_dim = options->qjl_sketch_dim;
 	config->normalized = options->normalized;
 	config->transform_name = GET_STRING_RELOPTION(options, transform_offset);
 	config->lanes_name = GET_STRING_RELOPTION(options, lanes_offset);
@@ -479,7 +487,11 @@ tq_buildstate_initialize(TqBuildState *state, uint32_t dimension)
 
 	state->dimension = transform_metadata.output_dimension;
 	state->prod_config.dimension = state->dimension;
+	state->prod_config.qjl_dimension = state->option_config.qjl_sketch_dim > 0
+		? (uint32_t) state->option_config.qjl_sketch_dim
+		: state->dimension;
 	state->prod_config.bits = (uint8_t) state->option_config.bits;
+	state->prod_config.qjl_seed = tq_prod_qjl_seed(transform_metadata.seed);
 
 	if (!tq_prod_packed_layout(&state->prod_config, &state->prod_layout,
 							   error_buf, sizeof(error_buf)))
@@ -487,6 +499,7 @@ tq_buildstate_initialize(TqBuildState *state, uint32_t dimension)
 
 	lane_config.block_size = BLCKSZ;
 	lane_config.dimension = (int) state->dimension;
+	lane_config.qjl_dimension = (int) state->prod_config.qjl_dimension;
 	lane_config.bits = state->option_config.bits;
 	lane_config.codec = TQ_CODEC_PROD;
 	lane_config.normalized = state->option_config.normalized;
@@ -535,6 +548,12 @@ tq_buildstate_initialize(TqBuildState *state, uint32_t dimension)
 	state->meta_fields.router_coeff_var = 0.0f;
 	state->meta_fields.router_balance_penalty = 0.0f;
 	state->meta_fields.router_selection_score = 0.0f;
+	state->meta_fields.algorithm_version = TQ_ALGORITHM_VERSION;
+	state->meta_fields.quantizer_version = TQ_QUANTIZER_VERSION;
+	state->meta_fields.residual_sketch_version = TQ_RESIDUAL_SKETCH_VERSION;
+	state->meta_fields.residual_bits_per_dimension = 1;
+	state->meta_fields.residual_sketch_dimension = state->prod_config.qjl_dimension;
+	state->meta_fields.estimator_version = TQ_ESTIMATOR_VERSION;
 	state->initialized = true;
 }
 
@@ -598,22 +617,6 @@ tq_update_batch_page_next_block(Relation index_relation,
 	ReleaseBuffer(buffer);
 }
 
-static float
-tq_vector_l2_distance(const float *left, const float *right, uint32_t dimension)
-{
-	float sum = 0.0f;
-	uint32_t i = 0;
-
-	for (i = 0; i < dimension; i++)
-	{
-		float diff = left[i] - right[i];
-
-		sum += diff * diff;
-	}
-
-	return sqrtf(sum);
-}
-
 static int
 tq_bounded_page_candidate_compare(const void *left, const void *right)
 {
@@ -644,8 +647,6 @@ tq_recompute_batch_page_summary(const TqProdCodecConfig *config,
 	uint16_t lane = 0;
 	uint8_t *rep_code = NULL;
 	uint8_t *lane_code = NULL;
-	float *rep_vector = NULL;
-	float *lane_vector = NULL;
 	bool ok = false;
 
 	if (config == NULL || page == NULL || summary == NULL)
@@ -672,13 +673,9 @@ tq_recompute_batch_page_summary(const TqProdCodecConfig *config,
 
 	rep_code = (uint8_t *) palloc((Size) header.code_bytes);
 	lane_code = (uint8_t *) palloc((Size) header.code_bytes);
-	rep_vector = (float *) palloc(sizeof(float) * (Size) config->dimension);
-	lane_vector = (float *) palloc(sizeof(float) * (Size) config->dimension);
 
 	ok = tq_batch_page_get_code(page, page_size, lane, rep_code, header.code_bytes,
-								errmsg, errmsg_len)
-		&& tq_prod_decode(config, rep_code, header.code_bytes, rep_vector,
-						  config->dimension, errmsg, errmsg_len);
+								errmsg, errmsg_len);
 	if (!ok)
 		goto done;
 
@@ -693,13 +690,21 @@ tq_recompute_batch_page_summary(const TqProdCodecConfig *config,
 			continue;
 
 		ok = tq_batch_page_get_code(page, page_size, lane, lane_code, header.code_bytes,
-									errmsg, errmsg_len)
-			&& tq_prod_decode(config, lane_code, header.code_bytes, lane_vector,
-							  config->dimension, errmsg, errmsg_len);
+									errmsg, errmsg_len);
 		if (!ok)
 			goto done;
 
-		distance = tq_vector_l2_distance(rep_vector, lane_vector, config->dimension);
+		ok = tq_prod_feature_distance(config,
+									  rep_code,
+									  header.code_bytes,
+									  lane_code,
+									  header.code_bytes,
+									  &distance,
+									  errmsg,
+									  errmsg_len);
+		if (!ok)
+			goto done;
+
 		if (distance > computed.residual_radius)
 			computed.residual_radius = distance;
 	}
@@ -713,10 +718,6 @@ done:
 		pfree(rep_code);
 	if (lane_code != NULL)
 		pfree(lane_code);
-	if (rep_vector != NULL)
-		pfree(rep_vector);
-	if (lane_vector != NULL)
-		pfree(lane_vector);
 	return ok;
 }
 
@@ -1410,6 +1411,12 @@ tq_ambuildempty(Relation index_relation)
 	meta_fields.router_coeff_var = 0.0f;
 	meta_fields.router_balance_penalty = 0.0f;
 	meta_fields.router_selection_score = 0.0f;
+	meta_fields.algorithm_version = TQ_ALGORITHM_VERSION;
+	meta_fields.quantizer_version = TQ_QUANTIZER_VERSION;
+	meta_fields.residual_sketch_version = TQ_RESIDUAL_SKETCH_VERSION;
+	meta_fields.residual_bits_per_dimension = 1;
+	meta_fields.residual_sketch_dimension = 0;
+	meta_fields.estimator_version = TQ_ESTIMATOR_VERSION;
 	tq_write_meta_page(index_relation, &meta_fields);
 }
 
@@ -1485,12 +1492,17 @@ tq_aminsert(Relation index_relation, Datum *values, bool *isnull,
 			elog(ERROR, "%s", error_buf);
 
 		prod_config.dimension = transform_metadata.output_dimension;
+		prod_config.qjl_dimension = option_config.qjl_sketch_dim > 0
+			? (uint32_t) option_config.qjl_sketch_dim
+			: transform_metadata.output_dimension;
 		prod_config.bits = (uint8_t) option_config.bits;
+		prod_config.qjl_seed = tq_prod_qjl_seed(transform_metadata.seed);
 		if (!tq_prod_packed_layout(&prod_config, &prod_layout, error_buf, sizeof(error_buf)))
 			elog(ERROR, "%s", error_buf);
 
 		lane_config.block_size = BLCKSZ;
 		lane_config.dimension = (int) transform_metadata.output_dimension;
+		lane_config.qjl_dimension = (int) prod_config.qjl_dimension;
 		lane_config.bits = option_config.bits;
 		lane_config.codec = TQ_CODEC_PROD;
 		lane_config.normalized = option_config.normalized;
@@ -1528,13 +1540,21 @@ tq_aminsert(Relation index_relation, Datum *values, bool *isnull,
 		meta_fields.router_coeff_var = 0.0f;
 		meta_fields.router_balance_penalty = 0.0f;
 		meta_fields.router_selection_score = 0.0f;
+		meta_fields.algorithm_version = TQ_ALGORITHM_VERSION;
+		meta_fields.quantizer_version = TQ_QUANTIZER_VERSION;
+		meta_fields.residual_sketch_version = TQ_RESIDUAL_SKETCH_VERSION;
+		meta_fields.residual_bits_per_dimension = 1;
+		meta_fields.residual_sketch_dimension = prod_config.qjl_dimension;
+		meta_fields.estimator_version = TQ_ESTIMATOR_VERSION;
 		needs_meta_write = true;
 	}
 	else
 	{
 		dimension = meta_fields.dimension;
 		prod_config.dimension = meta_fields.transform_output_dimension;
+		prod_config.qjl_dimension = meta_fields.residual_sketch_dimension;
 		prod_config.bits = (uint8_t) meta_fields.bits;
+		prod_config.qjl_seed = tq_prod_qjl_seed(meta_fields.transform_seed);
 		if (!tq_prod_packed_layout(&prod_config, &prod_layout, error_buf, sizeof(error_buf)))
 			elog(ERROR, "%s", error_buf);
 	}
@@ -2540,7 +2560,9 @@ tq_summarize_index(Relation index_relation,
 
 					memset(&prod_config, 0, sizeof(prod_config));
 					prod_config.dimension = meta_fields->transform_output_dimension;
+					prod_config.qjl_dimension = meta_fields->residual_sketch_dimension;
 					prod_config.bits = (uint8_t) meta_fields->bits;
+					prod_config.qjl_seed = tq_prod_qjl_seed(meta_fields->transform_seed);
 
 					if (!tq_wal_compact_batch_page(index_relation, buffer,
 												   error_buf, sizeof(error_buf))
@@ -2683,6 +2705,8 @@ tq_collect_bounded_pages_for_list(Relation index_relation,
 		|| entry->summary_head_block == TQ_INVALID_BLOCK_NUMBER
 		|| entry->batch_page_count == 0)
 	{
+		tq_scan_stats_record_page_bound_mode(TQ_PAGE_BOUND_MODE_DATA_PAGE_FALLBACK,
+											 false);
 		return tq_collect_bounded_pages_for_chain(index_relation,
 												  entry->head_block,
 												  opaque,
@@ -2697,6 +2721,11 @@ tq_collect_bounded_pages_for_list(Relation index_relation,
 	if (!tq_prod_packed_layout(&opaque->prod_config, &layout, errmsg, errmsg_len))
 		return false;
 
+	tq_scan_stats_record_page_bound_mode(
+		tq_scan_page_bounds_are_safe_for_pruning(opaque->normalized, opaque->distance_kind)
+			? TQ_PAGE_BOUND_MODE_SAFE_SUMMARY_PRUNING
+			: TQ_PAGE_BOUND_MODE_ORDERING_ONLY_SUMMARY,
+		tq_scan_page_bounds_are_safe_for_pruning(opaque->normalized, opaque->distance_kind));
 	representative_code = (uint8_t *) palloc0(layout.total_bytes);
 	summary_block = entry->summary_head_block;
 	while (summary_block != TQ_INVALID_BLOCK_NUMBER
@@ -3001,7 +3030,9 @@ tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque)
 				 errmsg("turboquant query vector dimension does not match index dimension")));
 
 	opaque->prod_config.dimension = meta_fields.transform_output_dimension;
+	opaque->prod_config.qjl_dimension = meta_fields.residual_sketch_dimension;
 	opaque->prod_config.bits = (uint8_t) meta_fields.bits;
+	opaque->prod_config.qjl_seed = tq_prod_qjl_seed(meta_fields.transform_seed);
 
 	transform_config.kind = meta_fields.transform;
 	transform_config.dimension = meta_fields.dimension;

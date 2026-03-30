@@ -23,6 +23,7 @@ tq_reloptions_validator(void *parsed_options, relopt_value *vals, int nvals)
 		.router_iterations = options->router_iterations,
 		.router_restarts = options->router_restarts,
 		.router_seed = options->router_seed,
+		.qjl_sketch_dim = options->qjl_sketch_dim,
 		.normalized = options->normalized,
 		.transform_name = GET_STRING_RELOPTION(options, transform_offset),
 		.lanes_name = GET_STRING_RELOPTION(options, lanes_offset)
@@ -66,6 +67,10 @@ tq_init_local_relopts(local_relopts *relopts)
 							"TurboQuant IVF router deterministic seed",
 							20260327, 0, INT_MAX,
 							offsetof(TqAmOptions, router_seed));
+	add_local_int_reloption(relopts, "qjl_sketch_dim",
+							"TurboQuant residual QJL projection dimension; 0 selects the transformed dimension",
+							0, 0, 65536,
+							offsetof(TqAmOptions, qjl_sketch_dim));
 	add_local_bool_reloption(relopts, "normalized",
 							 "Whether input vectors are already normalized",
 							 true,

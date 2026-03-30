@@ -55,6 +55,8 @@ SELECT
 	(stats->>'visited_code_count')::int > 0 AS visited_codes_positive,
 	(stats->>'visited_page_count')::int > 0 AS visited_pages_positive,
 	(stats->>'bound_data_page_reads')::int = 0 AS bound_reads_avoided,
+	stats->>'page_bound_mode' AS page_bound_mode,
+	(stats->>'safe_pruning_enabled')::boolean AS safe_pruning_enabled,
 	(stats->>'selected_list_count')::int <= 2 AS selected_lists_within_probes,
 	(stats->>'selected_live_count')::int > 0 AS selected_live_positive,
 	(stats->>'candidate_heap_capacity')::int >= (stats->>'candidate_heap_count')::int AS heap_bounded

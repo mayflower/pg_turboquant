@@ -48,6 +48,7 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
         )
 
         self.assertEqual(payload["profile"], "tiny")
+        self.assertEqual(payload["metrics"], ["cosine"])
         self.assertEqual(
             payload["corpora"],
             [
@@ -76,6 +77,7 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
         scenario = payload["scenarios"][0]
         self.assertIn("corpus", scenario)
         self.assertIn("method", scenario)
+        self.assertIn("benchmark_metric", scenario)
         self.assertIn("ground_truth", scenario)
         self.assertIn("metrics", scenario)
         self.assertIn("index", scenario)
@@ -103,6 +105,7 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
         self.assertIn("sealed_baseline_build_wal_bytes", scenario["metrics"])
         self.assertIn("sealed_baseline_insert_wal_bytes", scenario["metrics"])
         self.assertIn("sealed_baseline_maintenance_wal_bytes", scenario["metrics"])
+        self.assertIn("metric", scenario["ground_truth"])
         self.assertIn("turboquant.probes", scenario["query_knobs"])
         self.assertEqual(scenario["query_api"]["helper"], "tq_rerank_candidates")
         self.assertIn("candidate_limit", scenario["query_api"])
@@ -110,11 +113,18 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
         self.assertIn("format_version", scenario["index_metadata"])
         self.assertIn("metric", scenario["index_metadata"])
         self.assertIn("list_count", scenario["index_metadata"])
+        self.assertIn("page_summary", scenario["index_metadata"])
         self.assertIn("capabilities", scenario["index_metadata"])
         self.assertIn("index_only_scan", scenario["index_metadata"]["capabilities"])
         self.assertIn("multicolumn", scenario["index_metadata"]["capabilities"])
         self.assertIn("include_columns", scenario["index_metadata"]["capabilities"])
         self.assertIn("bitmap_scan", scenario["index_metadata"]["capabilities"])
+        self.assertIn("mode", scenario["index_metadata"]["page_summary"])
+        self.assertIn("safe_pruning", scenario["index_metadata"]["page_summary"])
+        if scenario["method"].startswith("turboquant_"):
+            self.assertIn("residual_sketch", scenario["index_metadata"])
+            self.assertIn("projected_dimension", scenario["index_metadata"]["residual_sketch"])
+            self.assertIn("bit_budget", scenario["index_metadata"]["residual_sketch"])
         self.assertIn("preferred_kernel", scenario["simd"])
         self.assertIn("compiled", scenario["simd"])
         self.assertIn("runtime_available", scenario["simd"])
@@ -141,6 +151,10 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
         self.assertIn("shadow_decode_overlap_count", scenario["scan_stats"])
         self.assertIn("shadow_decode_primary_only_count", scenario["scan_stats"])
         self.assertIn("shadow_decode_only_count", scenario["scan_stats"])
+        self.assertIn("page_bound_mode", scenario["scan_stats"])
+        self.assertIn("safe_pruning_enabled", scenario["scan_stats"])
+        self.assertIn("faithful_fast_path", scenario["scan_stats"])
+        self.assertIn("compatibility_fallback", scenario["scan_stats"])
         if scenario["query_mode"] == "ordered_rerank" and scenario["method"].startswith("turboquant_"):
             self.assertIn("avg_candidate_count", scenario["candidate_retention"])
             self.assertIn("avg_exact_top_10_retention", scenario["candidate_retention"])
@@ -152,15 +166,31 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
             self.assertIn("avg_shadow_exact_top_100_retention", scenario["candidate_retention"])
             self.assertIn("avg_shadow_exact_top_100_miss_count", scenario["candidate_retention"])
             self.assertIn("worst_shadow_exact_top_100_retention", scenario["candidate_retention"])
+            self.assertIn("estimator_quality", scenario)
+            self.assertIn("sample_count", scenario["estimator_quality"])
+            self.assertIn("distance_error_bias", scenario["estimator_quality"])
+            self.assertIn("distance_error_variance", scenario["estimator_quality"])
+            self.assertIn("distance_error_mae", scenario["estimator_quality"])
+            self.assertIn("avg_abs_rank_shift", scenario["estimator_quality"])
+            self.assertIn("max_abs_rank_shift", scenario["estimator_quality"])
         if scenario["method"] in {"turboquant_flat", "turboquant_ivf"}:
             self.assertEqual(scenario["scan_stats"]["score_mode"], "code_domain")
             self.assertEqual(scenario["scan_stats"]["decoded_vector_count"], 0)
+            if scenario["method"] == "turboquant_ivf":
+                self.assertEqual(
+                    scenario["index_metadata"]["page_summary"]["mode"],
+                    "safe_summary_pruning",
+                )
+                self.assertTrue(scenario["index_metadata"]["page_summary"]["safe_pruning"])
+                self.assertEqual(scenario["scan_stats"]["page_bound_mode"], "safe_summary_pruning")
+                self.assertTrue(scenario["scan_stats"]["safe_pruning_enabled"])
         self.assertIn("python_version", payload["environment"])
         self.assertIn("platform", payload["environment"])
         self.assertIn("cpu_arch", payload["environment"])
         self.assertIn("methods", payload["scenario_matrix"])
         self.assertIn("corpora", payload["scenario_matrix"])
         self.assertIn("profiles", payload["scenario_matrix"])
+        self.assertIn("metrics", payload["scenario_matrix"])
 
     def test_report_artifact_generation_contract(self):
         payload = self.run_suite(
@@ -190,11 +220,13 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
         self.assertGreater(summary["scenario_count"], 0)
         self.assertIn("methods", summary)
         self.assertIn("corpora", summary)
+        self.assertIn("metrics", summary)
         self.assertIn("query_modes", summary)
 
         method_row = payload["report"]["method_rows"][0]
         self.assertIn("corpus", method_row)
         self.assertIn("method", method_row)
+        self.assertIn("benchmark_metric", method_row)
         self.assertIn("recall_at_10", method_row)
         self.assertIn("p50_ms", method_row)
         self.assertIn("p95_ms", method_row)
@@ -205,14 +237,21 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
         self.assertIn("selected_page_count", method_row)
         self.assertIn("score_kernel", method_row)
         self.assertIn("query_helper", method_row)
+        self.assertIn("qjl_sketch_dimension", method_row)
+        self.assertIn("distance_error_bias", method_row)
+        self.assertIn("distance_error_variance", method_row)
+        self.assertIn("avg_abs_rank_shift", method_row)
 
         comparison = payload["report"]["comparisons"][0]
         self.assertIn("corpus", comparison)
+        self.assertIn("benchmark_metric", comparison)
         self.assertIn("baseline_method", comparison)
         self.assertIn("candidate_method", comparison)
+        self.assertIn("comparison_scope", comparison)
         self.assertIn("metrics", comparison)
         self.assertIn("candidate", comparison)
         self.assertIn("baseline", comparison)
+        self.assertIn("qjl_sketch_dimension", comparison)
         self.assertIn("recall_at_10_delta", comparison["metrics"])
         self.assertIn("p95_ms_delta", comparison["metrics"])
         self.assertIn("build_seconds_delta", comparison["metrics"])
@@ -220,6 +259,84 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
         self.assertIn("build_wal_bytes_delta", comparison["metrics"])
         self.assertIn("visited_code_count_delta", comparison["metrics"])
         self.assertIn("selected_page_count_delta", comparison["metrics"])
+        self.assertIn("distance_error_bias_delta", comparison["metrics"])
+        self.assertIn("avg_abs_rank_shift_delta", comparison["metrics"])
+
+    def test_report_includes_internal_turboquant_ivf_vs_flat_comparison(self):
+        payload = self.run_suite(
+            "--profile",
+            "tiny",
+            "--corpus",
+            "normalized_dense",
+            "--methods",
+            "turboquant_flat,turboquant_ivf,pgvector_ivfflat",
+            "--report",
+        )
+
+        self.assertTrue(
+            any(
+                comparison["comparison_scope"] == "turboquant_internal"
+                and comparison["candidate_method"] == "turboquant_ivf"
+                and comparison["baseline_method"] == "turboquant_flat"
+                for comparison in payload["report"]["comparisons"]
+            )
+        )
+
+    def test_ip_metric_contract_uses_ip_opclasses_and_ground_truth(self):
+        payload = self.run_suite(
+            "--profile",
+            "tiny",
+            "--corpus",
+            "normalized_dense",
+            "--methods",
+            "turboquant_flat,turboquant_ivf,pgvector_ivfflat",
+            "--metrics",
+            "ip",
+        )
+
+        self.assertEqual(payload["metrics"], ["ip"])
+        for scenario in payload["scenarios"]:
+            self.assertEqual(scenario["benchmark_metric"], "ip")
+            self.assertEqual(scenario["ground_truth"]["metric"], "ip")
+            if scenario["method"].startswith("turboquant_"):
+                self.assertEqual(scenario["index"]["opclass"], "tq_ip_ops")
+            elif scenario["method"].startswith("pgvector_"):
+                self.assertEqual(scenario["index"]["opclass"], "vector_ip_ops")
+
+    def test_qjl_sketch_budget_sweep_contract(self):
+        payload = self.run_suite(
+            "--profile",
+            "tiny",
+            "--corpus",
+            "normalized_dense",
+            "--methods",
+            "turboquant_flat,turboquant_ivf,pgvector_ivfflat",
+            "--turboquant-qjl-sketch-dims",
+            "d/4,d/2",
+            "--report",
+        )
+
+        turboquant_dims = sorted(
+            {
+                scenario["index_metadata"]["residual_sketch"]["projected_dimension"]
+                for scenario in payload["scenarios"]
+                if scenario["method"].startswith("turboquant_")
+            }
+        )
+        self.assertEqual(turboquant_dims, [1, 2])
+
+        pgvector_scenarios = [
+            scenario for scenario in payload["scenarios"] if scenario["method"].startswith("pgvector_")
+        ]
+        self.assertEqual(len(pgvector_scenarios), 1)
+
+        self.assertTrue(
+            any(
+                comparison["comparison_scope"] == "turboquant_internal"
+                and comparison["qjl_sketch_dimension"] in (1, 2)
+                for comparison in payload["report"]["comparisons"]
+            )
+        )
 
     def test_report_markdown_is_factual_and_hotpot_ready(self):
         payload = self.run_suite(
@@ -507,6 +624,68 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
         self.assertEqual(
             scenario["query_api"]["effective_candidate_limit"],
             164,
+        )
+
+    def test_build_index_threads_qjl_and_rescore_knobs_without_positional_drift(self):
+        corpus = BENCHMARK_SUITE.Corpus(
+            name="normalized_dense",
+            dimension=2,
+            rows=[
+                BENCHMARK_SUITE.Row(1, (1.0, 0.0)),
+                BENCHMARK_SUITE.Row(2, (0.0, 1.0)),
+            ],
+            queries=[(1.0, 0.0)],
+            metadata={"normalized": True},
+        )
+
+        with (
+            mock.patch.object(
+                BENCHMARK_SUITE,
+                "method_spec",
+                return_value={
+                    "index_method": "turboquant",
+                    "opclass": "tq_ip_ops",
+                    "with": {"bits": 4, "lists": 0, "qjl_sketch_dim": 1},
+                },
+            ) as method_spec_mock,
+            mock.patch.object(BENCHMARK_SUITE, "current_wal_lsn", return_value="0/0"),
+            mock.patch.object(BENCHMARK_SUITE, "run_psql"),
+            mock.patch.object(BENCHMARK_SUITE, "wal_bytes_since", return_value=0),
+            mock.patch.object(BENCHMARK_SUITE, "query_psql", return_value="8192"),
+        ):
+            BENCHMARK_SUITE.build_index(
+                ["psql"],
+                "benchmark_items",
+                "benchmark_items_embedding_idx",
+                corpus,
+                "turboquant_ivf",
+                "ip",
+                requested_rerank_candidate_limit=40,
+                turboquant_probes=6,
+                turboquant_oversample_factor=8,
+                turboquant_max_visited_codes=1024,
+                turboquant_max_visited_pages=32,
+                turboquant_shadow_decode_diagnostics=True,
+                turboquant_force_decode_score_diagnostics=False,
+                turboquant_decode_rescore_factor=4,
+                turboquant_decode_rescore_extra_candidates=64,
+                turboquant_qjl_sketch_dim="half",
+            )
+
+        method_spec_mock.assert_called_once_with(
+            method="turboquant_ivf",
+            corpus=corpus,
+            benchmark_metric="ip",
+            requested_rerank_candidate_limit=40,
+            turboquant_probes=6,
+            turboquant_oversample_factor=8,
+            turboquant_max_visited_codes=1024,
+            turboquant_max_visited_pages=32,
+            turboquant_shadow_decode_diagnostics=True,
+            turboquant_force_decode_score_diagnostics=False,
+            turboquant_decode_rescore_factor=4,
+            turboquant_decode_rescore_extra_candidates=64,
+            turboquant_qjl_sketch_dim="half",
         )
 
     def test_synthetic_skew_probe_regression_prefers_lower_work_without_recall_loss(self):
@@ -888,6 +1067,61 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
             )
 
         self.assertEqual(query_psql_commands_mock.call_count, 3)
+
+    def test_run_scenario_uses_all_repetition_latencies_for_percentiles(self):
+        corpus = BENCHMARK_SUITE.Corpus(
+            name="normalized_dense",
+            dimension=2,
+            rows=[
+                BENCHMARK_SUITE.Row(1, (1.0, 0.0)),
+                BENCHMARK_SUITE.Row(2, (0.0, 1.0)),
+            ],
+            queries=[(1.0, 0.0)],
+            metadata={"normalized": True},
+        )
+        pgvector_spec = BENCHMARK_SUITE.method_spec("pgvector_ivfflat", corpus)
+
+        with (
+            mock.patch.object(BENCHMARK_SUITE, "load_corpus"),
+            mock.patch.object(
+                BENCHMARK_SUITE,
+                "build_index",
+                return_value=(0.01, 2048, 128, pgvector_spec),
+            ),
+            mock.patch.object(BENCHMARK_SUITE, "fetch_index_metadata", return_value={"format_version": 0}),
+            mock.patch.object(BENCHMARK_SUITE, "fetch_simd_metadata", return_value={"selected_kernel": "scalar"}),
+            mock.patch.object(BENCHMARK_SUITE, "query_psql", return_value="8192"),
+            mock.patch.object(BENCHMARK_SUITE, "measure_insert_wal", return_value=(0, 0)),
+            mock.patch.object(
+                BENCHMARK_SUITE,
+                "measure_concurrent_insert_rows_per_second",
+                return_value=(0.0, 0, 0),
+            ),
+            mock.patch.object(BENCHMARK_SUITE, "measure_maintenance_wal", return_value=(0, 0)),
+            mock.patch.object(BENCHMARK_SUITE, "run_psql"),
+            mock.patch.object(BENCHMARK_SUITE, "query_top_ids", return_value=[1, 2]) as query_top_ids_mock,
+            mock.patch.object(BENCHMARK_SUITE.time, "perf_counter", side_effect=[0.0, 0.010, 1.0, 1.050, 2.0, 2.090]),
+        ):
+            scenario = BENCHMARK_SUITE.run_scenario(
+                ["psql"],
+                corpus,
+                "pgvector_ivfflat",
+                repetitions=3,
+                scenario_index=4,
+                turboquant_probes=None,
+                turboquant_oversample_factor=None,
+                turboquant_max_visited_codes=None,
+                turboquant_max_visited_pages=None,
+                turboquant_shadow_decode_diagnostics=False,
+                turboquant_force_decode_score_diagnostics=False,
+                turboquant_decode_rescore_factor=1,
+                turboquant_decode_rescore_extra_candidates=0,
+                requested_rerank_candidate_limit=32,
+            )
+
+        self.assertEqual(query_top_ids_mock.call_count, 3)
+        self.assertEqual(scenario["metrics"]["p50_ms"], 50.0)
+        self.assertEqual(scenario["metrics"]["p95_ms"], 90.0)
 
 
 if __name__ == "__main__":

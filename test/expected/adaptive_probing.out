@@ -51,7 +51,7 @@ FROM (
 ) ranked;
  adaptive_off_ids 
 ------------------
- {14,15,16}
+ {94,95,96}
 (1 row)
 
 WITH stats AS (
@@ -78,7 +78,7 @@ FROM (
 ) ranked;
  adaptive_on_ids 
 -----------------
- {100,101,102}
+ {101,102,103}
 (1 row)
 
 WITH stats AS (

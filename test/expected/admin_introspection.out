@@ -34,12 +34,14 @@ CREATE INDEX tq_admin_flat_idx
 	WITH (
 		bits = 4,
 		lists = 0,
+		qjl_sketch_dim = 2,
 		lanes = auto,
 		transform = 'hadamard',
 		normalized = true
 	);
 SELECT
 	(meta->>'format_version')::int AS format_version,
+	(meta->>'algorithm_version')::int AS algorithm_version,
 	meta->>'metric' AS metric,
 	meta->>'opclass' AS opclass,
 	(meta->>'list_count')::int AS list_count,
@@ -47,11 +49,21 @@ SELECT
 	(meta->>'dead_count')::int AS dead_count,
 	(meta->>'heap_live_rows')::int AS heap_live_rows,
 	meta #>> '{transform,kind}' AS transform_kind,
-	(meta #>> '{transform,version}')::int AS transform_version
+	(meta #>> '{transform,version}')::int AS transform_version,
+	(meta->>'faithful_fast_path')::boolean AS faithful_fast_path,
+	(meta->>'compatibility_fallback_only')::boolean AS compatibility_fallback_only,
+	meta #>> '{page_summary,mode}' AS page_summary_mode,
+	(meta #>> '{page_summary,safe_pruning}')::boolean AS page_summary_safe_pruning,
+	meta #>> '{quantizer,family}' AS quantizer_family,
+	meta #>> '{residual_sketch,kind}' AS residual_sketch_kind,
+	(meta #>> '{residual_sketch,bits_per_dimension}')::int AS residual_bits_per_dimension,
+	(meta #>> '{residual_sketch,projected_dimension}')::int AS residual_projected_dimension,
+	(meta #>> '{residual_sketch,bit_budget}')::int AS residual_bit_budget,
+	meta #>> '{estimator,mode}' AS estimator_mode
 FROM (SELECT tq_index_metadata('tq_admin_flat_idx'::regclass) AS meta) AS s;
- format_version | metric |    opclass    | list_count | live_count | dead_count | heap_live_rows | transform_kind | transform_version 
-----------------+--------+---------------+------------+------------+------------+----------------+----------------+-------------------
-              8 | cosine | tq_cosine_ops |          0 |          4 |          0 |              4 | hadamard       |                 1
+ format_version | algorithm_version | metric |    opclass    | list_count | live_count | dead_count | heap_live_rows | transform_kind | transform_version | faithful_fast_path | compatibility_fallback_only | page_summary_mode | page_summary_safe_pruning | quantizer_family | residual_sketch_kind | residual_bits_per_dimension | residual_projected_dimension | residual_bit_budget |  estimator_mode   
+----------------+-------------------+--------+---------------+------------+------------+------------+----------------+----------------+-------------------+--------------------+-----------------------------+-------------------+---------------------------+------------------+----------------------+-----------------------------+------------------------------+---------------------+-------------------
+             12 |                 3 | cosine | tq_cosine_ops |          0 |          4 |          0 |              4 | hadamard       |                 1 | t                  | f                           | disabled          | f                         | beta_lloyd_max   | 1bit_qjl             |                           1 |                            2 |                   2 | qprod_unbiased_ip
 (1 row)
 
 INSERT INTO tq_admin_docs (id, embedding) VALUES
@@ -113,6 +125,8 @@ CREATE INDEX tq_admin_ivf_idx
 SELECT
 	(meta->>'list_count')::int AS list_count,
 	meta #>> '{router,algorithm}' AS router_algorithm,
+	meta #>> '{page_summary,mode}' AS page_summary_mode,
+	(meta #>> '{page_summary,safe_pruning}')::boolean AS page_summary_safe_pruning,
 	(meta #>> '{router,seed}')::int AS router_seed,
 	(meta #>> '{router,trained_vector_count}')::int AS router_trained_vector_count,
 	(meta #>> '{list_distribution,min_live_count}')::int AS min_live_count,
@@ -120,9 +134,9 @@ SELECT
 	(meta #>> '{list_distribution,avg_live_count}')::numeric(10,2) AS avg_live_count,
 	jsonb_array_length(meta->'lists') AS list_rows
 FROM (SELECT tq_index_metadata('tq_admin_ivf_idx'::regclass) AS meta) AS s;
- list_count | router_algorithm | router_seed | router_trained_vector_count | min_live_count | max_live_count | avg_live_count | list_rows 
-------------+------------------+-------------+-----------------------------+----------------+----------------+----------------+-----------
-          2 | kmeans           |    20260327 |                           4 |              1 |              3 |           2.00 |         2
+ list_count | router_algorithm |  page_summary_mode   | page_summary_safe_pruning | router_seed | router_trained_vector_count | min_live_count | max_live_count | avg_live_count | list_rows 
+------------+------------------+----------------------+---------------------------+-------------+-----------------------------+----------------+----------------+----------------+-----------
+          2 | kmeans           | safe_summary_pruning | t                         |    20260327 |                           4 |              1 |              3 |           2.00 |         2
 (1 row)
 
 WITH meta AS (

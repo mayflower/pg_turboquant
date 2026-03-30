@@ -33,8 +33,14 @@ $node->command_ok(
 my $payload = decode_json(slurp_file($output_path));
 my $scenario = $payload->{scenarios}[0];
 
-is($scenario->{scan_stats}{page_prune_count}, 0, 'unsafe page pruning is disabled');
-is($scenario->{scan_stats}{early_stop_count}, 0, 'unsafe early stop is disabled');
+is(
+	$scenario->{scan_stats}{page_bound_mode},
+	'safe_summary_pruning',
+	'hotpot skew profile reports same-space safe pruning'
+);
+ok($scenario->{scan_stats}{safe_pruning_enabled}, 'safe pruning is marked enabled');
+cmp_ok($scenario->{scan_stats}{page_prune_count}, '>', 0, 'safe page pruning removes some pages');
+cmp_ok($scenario->{scan_stats}{early_stop_count}, '>', 0, 'safe early stop is active');
 cmp_ok(
 	$scenario->{scan_stats}{visited_code_count},
 	'<=',

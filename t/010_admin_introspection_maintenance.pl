@@ -78,7 +78,7 @@ my $reindexed = decode_json(
 
 is($reindexed->{live_count}, 3, 'reindex preserves live count');
 is($reindexed->{dead_count}, 0, 'reindex clears dead count');
-is($reindexed->{format_version}, 8, 'introspection includes page format version');
+is($reindexed->{format_version}, 12, 'introspection includes page format version');
 
 $node->stop;
 

@@ -74,9 +74,10 @@ tq_validate_code_domain_inputs(const TqProdCodecConfig *config,
 	}
 
 	if (lut->dimension != config->dimension
+		|| lut->qjl_dimension != (config->qjl_dimension == 0 ? config->dimension : config->qjl_dimension)
 		|| lut->level_count != ((uint32_t) 1u << ((uint32_t) config->bits - 1u))
 		|| lut->values == NULL
-		|| lut->query_signs == NULL)
+		|| lut->qjl_values == NULL)
 	{
 		tq_set_error(errmsg, errmsg_len,
 					 "invalid turboquant code-domain dispatch: lut shape must match codec config");
@@ -93,6 +94,7 @@ tq_prod_code_domain_shape_supports_vectorized(const TqProdCodecConfig *config)
 		return false;
 
 	return config->bits == 4
+		&& (config->qjl_dimension == 0 || config->qjl_dimension == config->dimension)
 		&& config->dimension > 0
 		&& (config->dimension % 8u) == 0u;
 }
@@ -283,9 +285,8 @@ tq_prod_score_code_from_lut_avx2_impl(const TqProdCodecConfig *config,
 									  size_t errmsg_len)
 {
 	TqProdPackedLayout layout;
-	float gamma = 0.0f;
 	__m256 base_sum = _mm256_setzero_ps();
-	__m256 qjl_sum = _mm256_setzero_ps();
+	__m256 residual_sum = _mm256_setzero_ps();
 	uint32_t dim = 0;
 
 	memset(&layout, 0, sizeof(layout));
@@ -300,39 +301,54 @@ tq_prod_score_code_from_lut_avx2_impl(const TqProdCodecConfig *config,
 		return false;
 	}
 
-	if (!tq_prod_packed_layout(config, &layout, errmsg, errmsg_len)
-		|| !tq_prod_read_gamma(config, packed, packed_len, &gamma, errmsg, errmsg_len))
+	if (!tq_prod_packed_layout(config, &layout, errmsg, errmsg_len))
 		return false;
+	if (packed_len < layout.total_bytes)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid tq_prod buffer: packed input buffer is too small");
+		return false;
+	}
 
 	for (dim = 0; dim < config->dimension; dim += 8)
 	{
 		uint8_t idx_codes[8];
 		uint8_t sign_bits[8];
-		int32_t gather_indices[8];
-		float qjl_scale[8];
+		float residual_sign[8];
+		float qjl_values[8];
 		uint32_t lane = 0;
 
 		tq_prod_unpack_code_domain_block8(&layout, packed, dim, idx_codes, sign_bits);
 
 		for (lane = 0; lane < 8; lane++)
 		{
-			uint32_t current_dim = dim + lane;
-
-			gather_indices[lane] = (int32_t) (current_dim * lut->level_count + idx_codes[lane]);
-			qjl_scale[lane] = (sign_bits[lane] == lut->query_signs[current_dim]) ? 2.0f : 0.0f;
+			residual_sign[lane] = sign_bits[lane] ? 1.0f : -1.0f;
+			qjl_values[lane] = lut->qjl_values[dim + lane];
 		}
 
 		{
-			__m256i gather_index_vec = _mm256_loadu_si256((const __m256i *) gather_indices);
-			__m256 weights = _mm256_i32gather_ps(lut->values, gather_index_vec, 4);
-			__m256 qjl_scale_vec = _mm256_loadu_ps(qjl_scale);
+			float base_lanes[8];
+			__m256 residual_sign_vec = _mm256_loadu_ps(residual_sign);
+			__m256 residual = _mm256_loadu_ps(qjl_values);
 
-			base_sum = _mm256_add_ps(base_sum, weights);
-			qjl_sum = _mm256_add_ps(qjl_sum, _mm256_mul_ps(weights, qjl_scale_vec));
+			for (lane = 0; lane < 8; lane++)
+				base_lanes[lane] = lut->values[(size_t) (dim + lane) * (size_t) lut->level_count + (size_t) idx_codes[lane]];
+
+			{
+				__m256 base = _mm256_loadu_ps(base_lanes);
+			base_sum = _mm256_add_ps(base_sum, base);
+			residual_sum = _mm256_add_ps(residual_sum, _mm256_mul_ps(residual, residual_sign_vec));
+			}
 		}
 	}
 
-	*score = gamma * (tq_hsum_avx2(qjl_sum) - tq_hsum_avx2(base_sum));
+	{
+		float gamma = 0.0f;
+
+		if (!tq_prod_read_gamma(config, packed, packed_len, &gamma, errmsg, errmsg_len))
+			return false;
+		*score = tq_hsum_avx2(base_sum) + (gamma * tq_hsum_avx2(residual_sum));
+	}
 	return true;
 }
 #endif
@@ -362,11 +378,10 @@ tq_prod_score_code_from_lut_neon_impl(const TqProdCodecConfig *config,
 									  size_t errmsg_len)
 {
 	TqProdPackedLayout layout;
-	float gamma = 0.0f;
 	float32x4_t base_sum_lo = vdupq_n_f32(0.0f);
 	float32x4_t base_sum_hi = vdupq_n_f32(0.0f);
-	float32x4_t qjl_sum_lo = vdupq_n_f32(0.0f);
-	float32x4_t qjl_sum_hi = vdupq_n_f32(0.0f);
+	float32x4_t residual_sum_lo = vdupq_n_f32(0.0f);
+	float32x4_t residual_sum_hi = vdupq_n_f32(0.0f);
 	uint32_t dim = 0;
 
 	memset(&layout, 0, sizeof(layout));
@@ -381,18 +396,23 @@ tq_prod_score_code_from_lut_neon_impl(const TqProdCodecConfig *config,
 		return false;
 	}
 
-	if (!tq_prod_packed_layout(config, &layout, errmsg, errmsg_len)
-		|| !tq_prod_read_gamma(config, packed, packed_len, &gamma, errmsg, errmsg_len))
+	if (!tq_prod_packed_layout(config, &layout, errmsg, errmsg_len))
 		return false;
+	if (packed_len < layout.total_bytes)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid tq_prod buffer: packed input buffer is too small");
+		return false;
+	}
 
 	for (dim = 0; dim < config->dimension; dim += 8)
 	{
 		uint8_t idx_codes[8];
 		uint8_t sign_bits[8];
-		float weights_lo_lanes[4];
-		float weights_hi_lanes[4];
-		float qjl_scale_lo_lanes[4];
-		float qjl_scale_hi_lanes[4];
+		float base_lo_lanes[4];
+		float base_hi_lanes[4];
+		float residual_lo_lanes[4];
+		float residual_hi_lanes[4];
 		uint32_t lane = 0;
 
 		tq_prod_unpack_code_domain_block8(&layout, packed, dim, idx_codes, sign_bits);
@@ -400,36 +420,42 @@ tq_prod_score_code_from_lut_neon_impl(const TqProdCodecConfig *config,
 		for (lane = 0; lane < 8; lane++)
 		{
 			uint32_t current_dim = dim + lane;
-			float weight = lut->values[current_dim * lut->level_count + idx_codes[lane]];
-			float qjl_scale = (sign_bits[lane] == lut->query_signs[current_dim]) ? 2.0f : 0.0f;
+			float base = lut->values[current_dim * lut->level_count + idx_codes[lane]];
+			float residual = lut->qjl_values[current_dim] * (sign_bits[lane] ? 1.0f : -1.0f);
 
 			if (lane < 4)
 			{
-				weights_lo_lanes[lane] = weight;
-				qjl_scale_lo_lanes[lane] = qjl_scale;
+				base_lo_lanes[lane] = base;
+				residual_lo_lanes[lane] = residual;
 			}
 			else
 			{
-				weights_hi_lanes[lane - 4] = weight;
-				qjl_scale_hi_lanes[lane - 4] = qjl_scale;
+				base_hi_lanes[lane - 4] = base;
+				residual_hi_lanes[lane - 4] = residual;
 			}
 		}
 
 		{
-			float32x4_t weights_lo = vld1q_f32(weights_lo_lanes);
-			float32x4_t weights_hi = vld1q_f32(weights_hi_lanes);
-			float32x4_t qjl_scale_lo = vld1q_f32(qjl_scale_lo_lanes);
-			float32x4_t qjl_scale_hi = vld1q_f32(qjl_scale_hi_lanes);
+			float32x4_t base_lo = vld1q_f32(base_lo_lanes);
+			float32x4_t base_hi = vld1q_f32(base_hi_lanes);
+			float32x4_t residual_lo = vld1q_f32(residual_lo_lanes);
+			float32x4_t residual_hi = vld1q_f32(residual_hi_lanes);
 
-			base_sum_lo = vaddq_f32(base_sum_lo, weights_lo);
-			base_sum_hi = vaddq_f32(base_sum_hi, weights_hi);
-			qjl_sum_lo = vmlaq_f32(qjl_sum_lo, weights_lo, qjl_scale_lo);
-			qjl_sum_hi = vmlaq_f32(qjl_sum_hi, weights_hi, qjl_scale_hi);
+			base_sum_lo = vaddq_f32(base_sum_lo, base_lo);
+			base_sum_hi = vaddq_f32(base_sum_hi, base_hi);
+			residual_sum_lo = vaddq_f32(residual_sum_lo, residual_lo);
+			residual_sum_hi = vaddq_f32(residual_sum_hi, residual_hi);
 		}
 	}
 
-	*score = gamma * ((tq_hsum_neon(qjl_sum_lo) + tq_hsum_neon(qjl_sum_hi))
-					  - (tq_hsum_neon(base_sum_lo) + tq_hsum_neon(base_sum_hi)));
+	{
+		float gamma = 0.0f;
+
+		if (!tq_prod_read_gamma(config, packed, packed_len, &gamma, errmsg, errmsg_len))
+			return false;
+		*score = (tq_hsum_neon(base_sum_lo) + tq_hsum_neon(base_sum_hi))
+			+ (gamma * (tq_hsum_neon(residual_sum_lo) + tq_hsum_neon(residual_sum_hi)));
+	}
 	return true;
 }
 #endif

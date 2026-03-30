@@ -12,6 +12,7 @@ typedef struct TqAmOptions
 	int			router_iterations;
 	int			router_restarts;
 	int			router_seed;
+	int			qjl_sketch_dim;
 	bool		normalized;
 	int			transform_offset;
 	int			lanes_offset;

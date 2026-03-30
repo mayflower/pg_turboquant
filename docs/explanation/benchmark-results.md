@@ -12,6 +12,27 @@ The evidence so far supports three broad claims:
 
 ## Representative retrieval results
 
+### KILT NQ live rerun (`query_limit = 20`, 2026-03-30)
+
+This is the freshest live comparative RAG retrieval slice produced against the current faithful TurboQuant build.
+Artifacts live in `benchmarks/rag/results/kilt-nq-rerun-q20-20260330/`.
+
+| Method | Recall@10 | P95 Latency (ms) | Footprint (bytes) |
+|---|---:|---:|---:|
+| `pg_turboquant_approx` | 0.950000 | 26.805267 | 1,277,952 |
+| `pg_turboquant_rerank` | 0.950000 | 23.189301 | 1,277,952 |
+| `pgvector_hnsw_approx` | 0.950000 | 14.630533 | 5,079,040 |
+| `pgvector_hnsw_rerank` | 0.950000 | 18.305264 | 5,079,040 |
+| `pgvector_ivfflat_approx` | 0.950000 | 24.923995 | 4,374,528 |
+| `pgvector_ivfflat_rerank` | 0.950000 | 22.457834 | 4,374,528 |
+
+Interpretation:
+
+- In this fresh live slice, recall matched across all six method variants.
+- TurboQuant again kept the smallest footprint by a large margin.
+- Latency did not lead the field: HNSW approx was faster, and IVFFlat approx was slightly faster than TurboQuant approx.
+- This rerun is intentionally narrow. It is a live sanity slice for the current faithful implementation, not a substitute for the larger multi-dataset campaigns.
+
 ### KILT NQ small live
 
 | Method | Recall@10 | P95 Latency (ms) | Footprint (bytes) |

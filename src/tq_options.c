@@ -3,9 +3,6 @@
 #include <stdio.h>
 #include <string.h>
 
-#define TQ_GAMMA_BYTES 4
-#define TQ_NORM_BYTES 4
-
 static void
 tq_set_error(char *errmsg, size_t errmsg_len, const char *message)
 {
@@ -69,6 +66,7 @@ tq_validate_option_config(const TqOptionConfig *config, char *errmsg, size_t err
 	int			router_samples = config->router_samples == 0 ? 256 : config->router_samples;
 	int			router_iterations = config->router_iterations == 0 ? 8 : config->router_iterations;
 	int			router_restarts = config->router_restarts == 0 ? 3 : config->router_restarts;
+	int			qjl_sketch_dim = config->qjl_sketch_dim;
 
 	if (config->bits < 2 || config->bits > 8)
 	{
@@ -112,6 +110,13 @@ tq_validate_option_config(const TqOptionConfig *config, char *errmsg, size_t err
 		return false;
 	}
 
+	if (qjl_sketch_dim < 0 || qjl_sketch_dim > 65536)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid value for parameter \"qjl_sketch_dim\": turboquant qjl_sketch_dim must be between 0 and 65536");
+		return false;
+	}
+
 	if (!tq_parse_transform_name(config->transform_name, NULL, errmsg, errmsg_len))
 		return false;
 
@@ -128,6 +133,7 @@ tq_compute_code_bytes(const TqLaneConfig *config,
 					   size_t errmsg_len)
 {
 	size_t		bytes = 0;
+	int			qjl_dimension = config->qjl_dimension == 0 ? config->dimension : config->qjl_dimension;
 
 	if (config->block_size <= 0)
 	{
@@ -140,6 +146,13 @@ tq_compute_code_bytes(const TqLaneConfig *config,
 	{
 		tq_set_error(errmsg, errmsg_len,
 					 "invalid page budget: dimension must be positive");
+		return false;
+	}
+
+	if (qjl_dimension <= 0 || qjl_dimension > config->dimension)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid page budget: qjl sketch dimension must be between 1 and the transformed dimension");
 		return false;
 	}
 
@@ -161,8 +174,8 @@ tq_compute_code_bytes(const TqLaneConfig *config,
 	{
 		case TQ_CODEC_PROD:
 			bytes += tq_div_ceil((size_t) config->dimension * (size_t) (config->bits - 1), 8);
-			bytes += tq_div_ceil((size_t) config->dimension, 8);
-			bytes += TQ_GAMMA_BYTES;
+			bytes += tq_div_ceil((size_t) qjl_dimension, 8);
+			bytes += sizeof(float);
 			break;
 		case TQ_CODEC_MSE:
 			bytes += tq_div_ceil((size_t) config->dimension * (size_t) config->bits, 8);
@@ -174,9 +187,6 @@ tq_compute_code_bytes(const TqLaneConfig *config,
 	}
 
 	bytes += (size_t) config->tid_bytes;
-
-	if (!config->normalized)
-		bytes += TQ_NORM_BYTES;
 
 	*code_bytes = bytes;
 	return true;

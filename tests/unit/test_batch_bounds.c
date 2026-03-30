@@ -24,22 +24,6 @@ normalize(float *values, size_t len)
 		values[i] /= norm;
 }
 
-static float
-vector_l2_distance(const float *left, const float *right, size_t len)
-{
-	float sum = 0.0f;
-	size_t i = 0;
-
-	for (i = 0; i < len; i++)
-	{
-		float delta = left[i] - right[i];
-
-		sum += delta * delta;
-	}
-
-	return sqrtf(sum);
-}
-
 static void
 seeded_unit_vector(uint32_t seed, float *values, size_t len)
 {
@@ -383,7 +367,60 @@ test_full_heap_prunes_worse_page_bounds(void)
 }
 
 static void
-test_code_domain_page_bounds_are_not_pruning_safe(void)
+test_query_weight_norm_bounds_feature_score_difference(void)
+{
+	TqProdCodecConfig config = {.dimension = 8, .bits = 4, .qjl_seed = 99u};
+	TqProdLut lut;
+	TqProdPackedLayout layout;
+	float query[8];
+	float left[8];
+	float right[8];
+	uint8_t left_code[64];
+	uint8_t right_code[64];
+	float left_score = 0.0f;
+	float right_score = 0.0f;
+	float feature_distance = 0.0f;
+	float weight_norm = 0.0f;
+	char errmsg[256];
+
+	memset(&lut, 0, sizeof(lut));
+	memset(&layout, 0, sizeof(layout));
+	memset(query, 0, sizeof(query));
+	memset(left, 0, sizeof(left));
+	memset(right, 0, sizeof(right));
+	memset(left_code, 0, sizeof(left_code));
+	memset(right_code, 0, sizeof(right_code));
+
+	seeded_unit_vector(41u, query, 8);
+	seeded_unit_vector(42u, left, 8);
+	seeded_unit_vector(43u, right, 8);
+
+	assert(tq_prod_packed_layout(&config, &layout, errmsg, sizeof(errmsg)));
+	assert(layout.total_bytes <= sizeof(left_code));
+	assert(layout.total_bytes <= sizeof(right_code));
+	assert(tq_prod_encode(&config, left, left_code, layout.total_bytes, errmsg, sizeof(errmsg)));
+	assert(tq_prod_encode(&config, right, right_code, layout.total_bytes, errmsg, sizeof(errmsg)));
+	assert(tq_prod_lut_build(&config, query, &lut, errmsg, sizeof(errmsg)));
+	assert(tq_prod_score_code_from_lut(&config, &lut, left_code, layout.total_bytes,
+									   &left_score, errmsg, sizeof(errmsg)));
+	assert(tq_prod_score_code_from_lut(&config, &lut, right_code, layout.total_bytes,
+									   &right_score, errmsg, sizeof(errmsg)));
+	assert(tq_prod_feature_distance(&config,
+									left_code,
+									layout.total_bytes,
+									right_code,
+									layout.total_bytes,
+									&feature_distance,
+									errmsg,
+									sizeof(errmsg)));
+	assert(tq_prod_query_weight_l2_norm(&config, &lut, &weight_norm, errmsg, sizeof(errmsg)));
+	assert(fabsf(left_score - right_score) <= (weight_norm * feature_distance) + 1e-5f);
+
+	tq_prod_lut_reset(&lut);
+}
+
+static void
+test_code_domain_page_bounds_are_same_space_safe_for_pruning(void)
 {
 	TqProdCodecConfig config = {.dimension = 8, .bits = 4};
 	TqProdLut lut;
@@ -397,9 +434,8 @@ test_code_domain_page_bounds_are_not_pruning_safe(void)
 	TqBatchPageSummary summary;
 	float optimistic_distance = 0.0f;
 	float best_distance = 0.0f;
-	float residual_radius = 0.0f;
+	float feature_radius = 0.0f;
 	uint32_t query_seed = 0;
-	bool saw_violation = false;
 	char errmsg[256];
 
 	memset(&lut, 0, sizeof(lut));
@@ -414,14 +450,19 @@ test_code_domain_page_bounds_are_not_pruning_safe(void)
 
 	assert(tq_prod_packed_layout(&config, &layout, errmsg, sizeof(errmsg)));
 	assert(layout.total_bytes <= sizeof(representative_code));
-	assert(!tq_scan_page_bounds_are_safe_for_pruning(true, TQ_DISTANCE_COSINE));
+	assert(tq_scan_page_bounds_are_safe_for_pruning(true, TQ_DISTANCE_COSINE));
+	assert(tq_scan_page_bounds_are_safe_for_pruning(true, TQ_DISTANCE_IP));
+	assert(!tq_scan_page_bounds_are_safe_for_pruning(false, TQ_DISTANCE_COSINE));
+	assert(!tq_scan_page_bounds_are_safe_for_pruning(true, TQ_DISTANCE_L2));
 
 	for (query_seed = 1; query_seed <= 256; query_seed++)
 	{
 		uint32_t lane_seed = 0;
+		uint8_t lane_code[64];
 
 		memset(page, 0, sizeof(page));
 		memset(&summary, 0, sizeof(summary));
+		memset(lane_code, 0, sizeof(lane_code));
 		seeded_unit_vector(query_seed, query, 8);
 		seeded_unit_vector(query_seed * 17u + 3u, representative, 8);
 		assert(tq_prod_lut_build(&config, query, &lut, errmsg, sizeof(errmsg)));
@@ -439,16 +480,33 @@ test_code_domain_page_bounds_are_not_pruning_safe(void)
 							   lane_values[lane_seed], 8);
 			append_encoded_lane(page, sizeof(page), &config, lane_values[lane_seed],
 								(uint16_t) (lane_seed + 2u));
-			if (vector_l2_distance(representative, lane_values[lane_seed], 8) > residual_radius)
-				residual_radius = vector_l2_distance(representative, lane_values[lane_seed], 8);
 		}
 
 		summary.representative_lane = 0;
-		summary.residual_radius = residual_radius;
-		assert(tq_batch_page_set_summary(page, sizeof(page), &summary, errmsg, sizeof(errmsg)));
 		assert(tq_batch_page_get_code(page, sizeof(page), summary.representative_lane,
 									  representative_code, layout.total_bytes,
 									  errmsg, sizeof(errmsg)));
+		for (lane_seed = 0; lane_seed < 3; lane_seed++)
+		{
+			float lane_radius = 0.0f;
+
+			assert(tq_batch_page_get_code(page, sizeof(page), (uint16_t) (lane_seed + 1u),
+										  lane_code, layout.total_bytes,
+										  errmsg, sizeof(errmsg)));
+			assert(tq_prod_feature_distance(&config,
+											representative_code,
+											layout.total_bytes,
+											lane_code,
+											layout.total_bytes,
+											&lane_radius,
+											errmsg,
+											sizeof(errmsg)));
+			if (lane_radius > feature_radius)
+				feature_radius = lane_radius;
+		}
+
+		summary.residual_radius = feature_radius;
+		assert(tq_batch_page_set_summary(page, sizeof(page), &summary, errmsg, sizeof(errmsg)));
 		assert(tq_scan_summary_optimistic_distance_bound(&config,
 														 &lut,
 														 &summary,
@@ -462,17 +520,10 @@ test_code_domain_page_bounds_are_not_pruning_safe(void)
 														 errmsg,
 														 sizeof(errmsg)));
 		best_distance = best_actual_page_distance(page, sizeof(page), &config, &lut);
-		if (optimistic_distance > best_distance + 1e-5f)
-		{
-			saw_violation = true;
-			tq_prod_lut_reset(&lut);
-			break;
-		}
+		assert(optimistic_distance <= best_distance + 1e-5f);
 		tq_prod_lut_reset(&lut);
-		residual_radius = 0.0f;
+		feature_radius = 0.0f;
 	}
-
-	assert(saw_violation);
 }
 
 int
@@ -485,6 +536,7 @@ main(void)
 	test_empty_page_bound_is_safe();
 	test_early_stop_requires_full_heap();
 	test_full_heap_prunes_worse_page_bounds();
-	test_code_domain_page_bounds_are_not_pruning_safe();
+	test_query_weight_norm_bounds_feature_score_difference();
+	test_code_domain_page_bounds_are_same_space_safe_for_pruning();
 	return 0;
 }

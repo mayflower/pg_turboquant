@@ -10,7 +10,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#define TQ_META_PAGE_HEADER_BYTES 108
+#define TQ_META_PAGE_HEADER_BYTES 122
 #define TQ_LIST_DIR_PAGE_HEADER_BYTES 16
 #define TQ_LIST_DIR_ENTRY_BYTES 32
 #define TQ_BATCH_PAGE_HEADER_BYTES 44
@@ -51,6 +51,12 @@
 #define TQ_META_ROUTER_COEFF_VAR_OFFSET 96
 #define TQ_META_ROUTER_BALANCE_PENALTY_OFFSET 100
 #define TQ_META_ROUTER_SELECTION_SCORE_OFFSET 104
+#define TQ_META_ALGORITHM_VERSION_OFFSET 108
+#define TQ_META_QUANTIZER_VERSION_OFFSET 110
+#define TQ_META_RESIDUAL_SKETCH_VERSION_OFFSET 112
+#define TQ_META_RESIDUAL_BITS_PER_DIMENSION_OFFSET 114
+#define TQ_META_RESIDUAL_SKETCH_DIMENSION_OFFSET 116
+#define TQ_META_ESTIMATOR_VERSION_OFFSET 120
 
 #define TQ_LIST_DIR_ENTRY_CAPACITY_OFFSET 8
 #define TQ_LIST_DIR_ENTRY_COUNT_OFFSET 10
@@ -667,6 +673,12 @@ tq_meta_page_init(void *page,
 	tq_write_float32(bytes, TQ_META_ROUTER_COEFF_VAR_OFFSET, fields->router_coeff_var);
 	tq_write_float32(bytes, TQ_META_ROUTER_BALANCE_PENALTY_OFFSET, fields->router_balance_penalty);
 	tq_write_float32(bytes, TQ_META_ROUTER_SELECTION_SCORE_OFFSET, fields->router_selection_score);
+	tq_write_u16(bytes, TQ_META_ALGORITHM_VERSION_OFFSET, fields->algorithm_version);
+	tq_write_u16(bytes, TQ_META_QUANTIZER_VERSION_OFFSET, fields->quantizer_version);
+	tq_write_u16(bytes, TQ_META_RESIDUAL_SKETCH_VERSION_OFFSET, fields->residual_sketch_version);
+	tq_write_u16(bytes, TQ_META_RESIDUAL_BITS_PER_DIMENSION_OFFSET, fields->residual_bits_per_dimension);
+	tq_write_u32(bytes, TQ_META_RESIDUAL_SKETCH_DIMENSION_OFFSET, fields->residual_sketch_dimension);
+	tq_write_u16(bytes, TQ_META_ESTIMATOR_VERSION_OFFSET, fields->estimator_version);
 	return true;
 }
 
@@ -723,6 +735,12 @@ tq_meta_page_read(const void *page,
 	fields->router_coeff_var = tq_read_float32(bytes, TQ_META_ROUTER_COEFF_VAR_OFFSET);
 	fields->router_balance_penalty = tq_read_float32(bytes, TQ_META_ROUTER_BALANCE_PENALTY_OFFSET);
 	fields->router_selection_score = tq_read_float32(bytes, TQ_META_ROUTER_SELECTION_SCORE_OFFSET);
+	fields->algorithm_version = tq_read_u16(bytes, TQ_META_ALGORITHM_VERSION_OFFSET);
+	fields->quantizer_version = tq_read_u16(bytes, TQ_META_QUANTIZER_VERSION_OFFSET);
+	fields->residual_sketch_version = tq_read_u16(bytes, TQ_META_RESIDUAL_SKETCH_VERSION_OFFSET);
+	fields->residual_bits_per_dimension = tq_read_u16(bytes, TQ_META_RESIDUAL_BITS_PER_DIMENSION_OFFSET);
+	fields->residual_sketch_dimension = tq_read_u32(bytes, TQ_META_RESIDUAL_SKETCH_DIMENSION_OFFSET);
+	fields->estimator_version = tq_read_u16(bytes, TQ_META_ESTIMATOR_VERSION_OFFSET);
 	if (fields->transform_version != TQ_TRANSFORM_CONTRACT_VERSION)
 	{
 		tq_set_error(errmsg, errmsg_len,
@@ -743,6 +761,18 @@ tq_meta_page_read(const void *page,
 	{
 		tq_set_error(errmsg, errmsg_len,
 					 "invalid turboquant meta page: transform output dimension does not match persisted contract");
+		return false;
+	}
+	if (fields->algorithm_version != TQ_ALGORITHM_VERSION
+		|| fields->quantizer_version != TQ_QUANTIZER_VERSION
+		|| fields->residual_sketch_version != TQ_RESIDUAL_SKETCH_VERSION
+		|| fields->residual_bits_per_dimension != 1
+		|| fields->residual_sketch_dimension == 0
+		|| fields->residual_sketch_dimension > fields->transform_output_dimension
+		|| fields->estimator_version != TQ_ESTIMATOR_VERSION)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant meta page: unsupported faithful turboquant metadata");
 		return false;
 	}
 	return true;

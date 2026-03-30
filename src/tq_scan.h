@@ -41,11 +41,25 @@ typedef enum TqScanScoreMode
 	TQ_SCAN_SCORE_MODE_BITMAP_FILTER
 } TqScanScoreMode;
 
+typedef enum TqPageBoundMode
+{
+	TQ_PAGE_BOUND_MODE_NONE = 0,
+	TQ_PAGE_BOUND_MODE_DISABLED,
+	TQ_PAGE_BOUND_MODE_SAFE_SUMMARY_PRUNING,
+	TQ_PAGE_BOUND_MODE_ORDERING_ONLY_SUMMARY,
+	TQ_PAGE_BOUND_MODE_DATA_PAGE_FALLBACK,
+	TQ_PAGE_BOUND_MODE_MIXED
+} TqPageBoundMode;
+
 typedef struct TqScanStats
 {
 	TqScanMode	mode;
 	TqScanScoreMode score_mode;
 	TqProdScoreKernel score_kernel;
+	TqPageBoundMode page_bound_mode;
+	bool		faithful_fast_path;
+	bool		compatibility_fallback;
+	bool		safe_pruning_enabled;
 	size_t		configured_probe_count;
 	size_t		nominal_probe_count;
 	size_t		effective_probe_count;
@@ -120,6 +134,10 @@ extern void tq_scan_stats_reset_last(void);
 extern void tq_scan_stats_begin(TqScanMode mode, size_t configured_probe_count);
 extern void tq_scan_stats_set_score_mode(TqScanScoreMode score_mode);
 extern void tq_scan_stats_set_score_kernel(TqProdScoreKernel score_kernel);
+extern void tq_scan_stats_set_path_flags(bool faithful_fast_path,
+										 bool compatibility_fallback);
+extern void tq_scan_stats_record_page_bound_mode(TqPageBoundMode page_bound_mode,
+												 bool safe_pruning_enabled);
 extern void tq_scan_stats_reset_candidate_heap_metrics(void);
 extern void tq_scan_stats_set_probe_budget(size_t nominal_probe_count,
 										   size_t effective_probe_count,

@@ -1,13 +1,36 @@
 #include "src/tq_codec_prod.h"
+#include "src/tq_transform.h"
 
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define TQ_PROD_GAMMA_BYTES 4
+#define TQ_PROD_CODEBOOK_GRID 8192u
+#define TQ_PROD_LLOYD_MAX_ITERATIONS 64u
+#define TQ_PROD_QJL_SCALE ((float) 1.253314137315500251f)
+
+typedef struct TqProdCodebook
+{
+	uint32_t	dimension;
+	uint8_t		bits;
+	uint32_t	level_count;
+	float	   *centroids;
+	float	   *boundaries;
+} TqProdCodebook;
+
+typedef struct TqProdSketch
+{
+	uint32_t	dimension;
+	uint64_t	seed;
+	TqTransformState transform;
+} TqProdSketch;
 
 static size_t tq_prod_decode_counter = 0;
+static TqProdCodebook tq_prod_cached_codebook = {0};
+static TqProdSketch tq_prod_cached_sketch = {0};
+
+static uint32_t tq_prod_qjl_dimension(const TqProdCodecConfig *config);
 
 static void
 tq_set_error(char *errmsg, size_t errmsg_len, const char *message)
@@ -16,6 +39,65 @@ tq_set_error(char *errmsg, size_t errmsg_len, const char *message)
 		return;
 
 	snprintf(errmsg, errmsg_len, "%s", message);
+}
+
+static void
+tq_pack_bits(uint8_t *packed, uint32_t bit_offset, uint32_t bit_count, uint32_t value)
+{
+	uint32_t	bit = 0;
+
+	for (bit = 0; bit < bit_count; bit++)
+	{
+		uint32_t	target_bit = bit_offset + bit;
+		uint32_t	byte_index = target_bit / 8u;
+		uint32_t	byte_shift = target_bit % 8u;
+		uint8_t		mask = (uint8_t) (1u << byte_shift);
+
+		if ((value >> bit) & 1u)
+			packed[byte_index] |= mask;
+		else
+			packed[byte_index] &= (uint8_t) ~mask;
+	}
+}
+
+static uint32_t
+tq_unpack_bits(const uint8_t *packed, uint32_t bit_offset, uint32_t bit_count)
+{
+	uint32_t	value = 0;
+	uint32_t	bit = 0;
+
+	for (bit = 0; bit < bit_count; bit++)
+	{
+		uint32_t	target_bit = bit_offset + bit;
+		uint32_t	byte_index = target_bit / 8u;
+		uint32_t	byte_shift = target_bit % 8u;
+
+		if ((packed[byte_index] >> byte_shift) & 1u)
+			value |= UINT32_C(1) << bit;
+	}
+
+	return value;
+}
+
+static void
+tq_prod_codebook_reset(TqProdCodebook *codebook)
+{
+	if (codebook == NULL)
+		return;
+
+	free(codebook->centroids);
+	free(codebook->boundaries);
+	memset(codebook, 0, sizeof(*codebook));
+}
+
+static void
+tq_prod_sketch_reset(TqProdSketch *sketch)
+{
+	if (sketch == NULL)
+		return;
+
+	tq_transform_reset(&sketch->transform);
+	memset(sketch, 0, sizeof(*sketch));
 }
 
 static bool
@@ -44,13 +126,20 @@ tq_prod_validate_config(const TqProdCodecConfig *config,
 		return false;
 	}
 
+	if (tq_prod_qjl_dimension(config) == 0 || tq_prod_qjl_dimension(config) > config->dimension)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid tq_prod codec config: qjl sketch dimension must be between 1 and the transformed dimension");
+		return false;
+	}
+
 	return true;
 }
 
 static uint32_t
 tq_prod_idx_bits(const TqProdCodecConfig *config)
 {
-	return (uint32_t) config->bits - 1;
+	return (uint32_t) config->bits - 1u;
 }
 
 static uint32_t
@@ -59,175 +148,375 @@ tq_prod_idx_levels(const TqProdCodecConfig *config)
 	return UINT32_C(1) << tq_prod_idx_bits(config);
 }
 
-static float
-tq_prod_gamma_scale_factor(const TqProdCodecConfig *config)
-{
-	static const float gamma_scale_by_bits[] = {
-		1.0f,
-		1.0f,
-		1.00f,
-		1.00f,
-		1.00f,
-		0.99f,
-		0.98f,
-		0.97f,
-		0.96f
-	};
-
-	return gamma_scale_by_bits[config->bits];
-}
-
-static float
-tq_prod_companding_mu(const TqProdCodecConfig *config)
-{
-	static const float mu_by_bits[] = {
-		0.0f,
-		0.0f,
-		0.25f,
-		0.50f,
-		0.50f,
-		1.00f,
-		1.25f,
-		1.50f,
-		2.00f
-	};
-
-	return mu_by_bits[config->bits];
-}
-
-static void
-tq_pack_bits(uint8_t *packed, uint32_t bit_offset, uint32_t bit_count, uint32_t value)
-{
-	uint32_t	bit = 0;
-
-	for (bit = 0; bit < bit_count; bit++)
-	{
-		uint32_t	target_bit = bit_offset + bit;
-		uint32_t	byte_index = target_bit / 8;
-		uint32_t	byte_shift = target_bit % 8;
-		uint8_t		mask = (uint8_t) (1u << byte_shift);
-
-		if ((value >> bit) & 1u)
-			packed[byte_index] |= mask;
-		else
-			packed[byte_index] &= (uint8_t) ~mask;
-	}
-}
-
 static uint32_t
-tq_unpack_bits(const uint8_t *packed, uint32_t bit_offset, uint32_t bit_count)
+tq_prod_qjl_dimension(const TqProdCodecConfig *config)
 {
-	uint32_t	value = 0;
-	uint32_t	bit = 0;
+	return config->qjl_dimension == 0 ? config->dimension : config->qjl_dimension;
+}
 
-	for (bit = 0; bit < bit_count; bit++)
-	{
-		uint32_t	target_bit = bit_offset + bit;
-		uint32_t	byte_index = target_bit / 8;
-		uint32_t	byte_shift = target_bit % 8;
-
-		if ((packed[byte_index] >> byte_shift) & 1u)
-			value |= UINT32_C(1) << bit;
-	}
-
+static float
+tq_prod_clamp_unit(float value)
+{
+	if (value > 1.0f)
+		return 1.0f;
+	if (value < -1.0f)
+		return -1.0f;
 	return value;
 }
 
 static float
-tq_prod_max_abs(const float *input, uint32_t dimension)
+tq_prod_qjl_scale(uint32_t qjl_dimension)
 {
-	float		gamma = 0.0f;
-	uint32_t	i = 0;
-
-	for (i = 0; i < dimension; i++)
-	{
-		float		abs_value = fabsf(input[i]);
-
-		if (abs_value > gamma)
-			gamma = abs_value;
-	}
-
-	return gamma;
-}
-
-static float
-tq_prod_derive_gamma(const TqProdCodecConfig *config, const float *input)
-{
-	float		max_abs = tq_prod_max_abs(input, config->dimension);
-
-	if (max_abs <= 0.0f)
-		return 0.0f;
-
-	return max_abs * tq_prod_gamma_scale_factor(config);
-}
-
-static uint32_t
-tq_prod_quantize_magnitude(const TqProdCodecConfig *config, float magnitude, float gamma)
-{
-	uint32_t	max_code = tq_prod_idx_levels(config) - 1;
-	float		normalized = 0.0f;
-	float		companded = 0.0f;
-	float		mu = tq_prod_companding_mu(config);
-	long		rounded = 0;
-
-	if (gamma <= 0.0f)
-		return 0;
-
-	if (magnitude <= 0.0f)
-		return 0;
-
-	if (magnitude >= gamma)
-		return max_code;
-
-	normalized = magnitude / gamma;
-	if (mu > 0.0f)
-		companded = log1pf(mu * normalized) / log1pf(mu);
-	else
-		companded = normalized;
-
-	rounded = lroundf(companded * (float) max_code);
-
-	if (rounded < 0)
-		return 0;
-
-	if ((uint32_t) rounded > max_code)
-		return max_code;
-
-	return (uint32_t) rounded;
-}
-
-static float
-tq_prod_decode_magnitude(const TqProdCodecConfig *config, uint32_t code, float gamma)
-{
-	uint32_t	max_code = tq_prod_idx_levels(config) - 1;
-	float		mu = tq_prod_companding_mu(config);
-	float		companded = 0.0f;
-	float		normalized = 0.0f;
-
-	if (max_code == 0 || gamma <= 0.0f)
-		return 0.0f;
-
-	companded = (float) code / (float) max_code;
-	if (mu > 0.0f)
-		normalized = expm1f(companded * log1pf(mu)) / mu;
-	else
-		normalized = companded;
-
-	return gamma * normalized;
+	return TQ_PROD_QJL_SCALE / (float) qjl_dimension;
 }
 
 static bool
-tq_prod_unpack_parts(const uint8_t *packed,
-					 size_t packed_len,
-					 const TqProdPackedLayout *layout,
-					 float *gamma,
+tq_prod_get_sketch(const TqProdCodecConfig *config,
+				   const TqProdSketch **sketch,
+				   char *errmsg,
+				   size_t errmsg_len)
+{
+	TqTransformConfig transform_config;
+
+	if (sketch == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid tq_prod codec config: sketch output must be non-null");
+		return false;
+	}
+
+	if (!tq_prod_validate_config(config, errmsg, errmsg_len))
+		return false;
+
+	if (tq_prod_cached_sketch.dimension != config->dimension
+		|| tq_prod_cached_sketch.seed != config->qjl_seed
+		|| tq_prod_cached_sketch.transform.dimension != config->dimension
+		|| tq_prod_cached_sketch.transform.padded_dimension == 0
+		|| tq_prod_cached_sketch.transform.permutation == NULL
+		|| tq_prod_cached_sketch.transform.signs == NULL)
+	{
+		memset(&transform_config, 0, sizeof(transform_config));
+		tq_prod_sketch_reset(&tq_prod_cached_sketch);
+		transform_config.kind = TQ_TRANSFORM_HADAMARD;
+		transform_config.dimension = config->dimension;
+		transform_config.seed = config->qjl_seed;
+
+		if (!tq_transform_prepare(&transform_config,
+								  &tq_prod_cached_sketch.transform,
+								  errmsg,
+								  errmsg_len))
+			return false;
+
+		tq_prod_cached_sketch.dimension = config->dimension;
+		tq_prod_cached_sketch.seed = config->qjl_seed;
+	}
+
+	*sketch = &tq_prod_cached_sketch;
+	return true;
+}
+
+static void
+tq_prod_write_float32(uint8_t *dest, float value)
+{
+	memcpy(dest, &value, sizeof(float));
+}
+
+static float
+tq_prod_read_float32(const uint8_t *src)
+{
+	float		value = 0.0f;
+
+	memcpy(&value, src, sizeof(float));
+	return value;
+}
+
+static double
+tq_prod_coordinate_density(uint32_t dimension, double value)
+{
+	double		clamped = value;
+	double		one_minus = 0.0;
+	double		exponent = 0.0;
+
+	if (clamped > 1.0)
+		clamped = 1.0;
+	if (clamped < -1.0)
+		clamped = -1.0;
+
+	one_minus = 1.0 - (clamped * clamped);
+	if (one_minus <= 0.0)
+		return 0.0;
+
+	if (dimension > 3u)
+		exponent = ((double) dimension - 3.0) * 0.5;
+
+	if (exponent <= 0.0)
+		return 1.0;
+
+	return exp(exponent * log(one_minus));
+}
+
+static float
+tq_prod_quantile_edge(const double *cdf,
+					  uint32_t grid_count,
+					  double total_mass,
+					  double target_mass)
+{
+	uint32_t	low = 0;
+	uint32_t	high = grid_count;
+	double		dx = 2.0 / (double) grid_count;
+	uint32_t	index = 0;
+
+	if (target_mass <= 0.0)
+		return -1.0f;
+	if (target_mass >= total_mass)
+		return 1.0f;
+
+	while (low < high)
+	{
+		uint32_t	mid = low + ((high - low) / 2u);
+
+		if (cdf[mid] < target_mass)
+			low = mid + 1u;
+		else
+			high = mid;
+	}
+
+	index = low;
+	if (index == 0)
+		return -1.0f;
+	if (index >= grid_count)
+		return 1.0f;
+
+	{
+		double left_cdf = cdf[index - 1u];
+		double right_cdf = cdf[index];
+		double fraction = 0.0;
+		double left_edge = -1.0 + ((double) (index - 1u) * dx);
+
+		if (right_cdf > left_cdf)
+			fraction = (target_mass - left_cdf) / (right_cdf - left_cdf);
+
+		if (fraction < 0.0)
+			fraction = 0.0;
+		if (fraction > 1.0)
+			fraction = 1.0;
+
+		return (float) (left_edge + (fraction * dx));
+	}
+}
+
+static float
+tq_prod_interval_weighted_mean(const double *weights,
+							   uint32_t grid_count,
+							   float lower,
+							   float upper,
+							   float fallback)
+{
+	double		dx = 2.0 / (double) grid_count;
+	double		mass = 0.0;
+	double		moment = 0.0;
+	uint32_t	cell = 0;
+
+	if (upper <= lower)
+		return fallback;
+
+	for (cell = 0; cell < grid_count; cell++)
+	{
+		double cell_lower = -1.0 + ((double) cell * dx);
+		double cell_upper = cell_lower + dx;
+		double overlap_lower = cell_lower > lower ? cell_lower : lower;
+		double overlap_upper = cell_upper < upper ? cell_upper : upper;
+
+		if (overlap_upper <= overlap_lower)
+			continue;
+
+		{
+			double overlap_fraction = (overlap_upper - overlap_lower) / dx;
+			double midpoint = 0.5 * (overlap_lower + overlap_upper);
+			double weight = weights[cell] * overlap_fraction;
+
+			mass += weight;
+			moment += midpoint * weight;
+		}
+	}
+
+	if (mass <= 0.0)
+		return fallback;
+
+	return (float) (moment / mass);
+}
+
+static bool
+tq_prod_build_codebook(const TqProdCodecConfig *config,
+					   TqProdCodebook *codebook,
+					   char *errmsg,
+					   size_t errmsg_len)
+{
+	uint32_t	level_count = tq_prod_idx_levels(config);
+	double	   *weights = NULL;
+	double	   *cdf = NULL;
+	double		total_mass = 0.0;
+	double		dx = 2.0 / (double) TQ_PROD_CODEBOOK_GRID;
+	float	   *next_centroids = NULL;
+	uint32_t	cell = 0;
+	uint32_t	level = 0;
+	uint32_t	iteration = 0;
+
+	tq_prod_codebook_reset(codebook);
+
+	codebook->centroids = (float *) calloc((size_t) level_count, sizeof(float));
+	codebook->boundaries = (float *) calloc((size_t) level_count + 1u, sizeof(float));
+	weights = (double *) calloc((size_t) TQ_PROD_CODEBOOK_GRID, sizeof(double));
+	cdf = (double *) calloc((size_t) TQ_PROD_CODEBOOK_GRID, sizeof(double));
+	next_centroids = (float *) calloc((size_t) level_count, sizeof(float));
+
+	if (codebook->centroids == NULL || codebook->boundaries == NULL
+		|| weights == NULL || cdf == NULL || next_centroids == NULL)
+	{
+		tq_prod_codebook_reset(codebook);
+		free(weights);
+		free(cdf);
+		free(next_centroids);
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid tq_prod codec config: out of memory");
+		return false;
+	}
+
+	for (cell = 0; cell < TQ_PROD_CODEBOOK_GRID; cell++)
+	{
+		double mid = -1.0 + (((double) cell + 0.5) * dx);
+		double weight = tq_prod_coordinate_density(config->dimension, mid) * dx;
+
+		weights[cell] = weight;
+		total_mass += weight;
+		cdf[cell] = total_mass;
+	}
+
+	for (level = 0; level < level_count; level++)
+	{
+		float lower_edge = -1.0f;
+		float upper_edge = 1.0f;
+		double lower_target = total_mass * ((double) level / (double) level_count);
+		double upper_target = total_mass * ((double) (level + 1u) / (double) level_count);
+
+		if (level > 0)
+			lower_edge = tq_prod_quantile_edge(cdf, TQ_PROD_CODEBOOK_GRID, total_mass, lower_target);
+		if (level + 1u < level_count)
+			upper_edge = tq_prod_quantile_edge(cdf, TQ_PROD_CODEBOOK_GRID, total_mass, upper_target);
+
+		codebook->centroids[level] = tq_prod_interval_weighted_mean(weights,
+																	 TQ_PROD_CODEBOOK_GRID,
+																	 lower_edge,
+																	 upper_edge,
+																	 0.5f * (lower_edge + upper_edge));
+	}
+
+	for (iteration = 0; iteration < TQ_PROD_LLOYD_MAX_ITERATIONS; iteration++)
+	{
+		float	max_shift = 0.0f;
+
+		codebook->boundaries[0] = -1.0f;
+		codebook->boundaries[level_count] = 1.0f;
+		for (level = 1; level < level_count; level++)
+			codebook->boundaries[level] = 0.5f * (codebook->centroids[level - 1u] + codebook->centroids[level]);
+
+		for (level = 0; level < level_count; level++)
+		{
+			float lower = codebook->boundaries[level];
+			float upper = codebook->boundaries[level + 1u];
+			float fallback = 0.5f * (lower + upper);
+
+			next_centroids[level] = tq_prod_interval_weighted_mean(weights,
+																	 TQ_PROD_CODEBOOK_GRID,
+																	 lower,
+																	 upper,
+																	 fallback);
+			if (fabsf(next_centroids[level] - codebook->centroids[level]) > max_shift)
+				max_shift = fabsf(next_centroids[level] - codebook->centroids[level]);
+		}
+
+		memcpy(codebook->centroids, next_centroids, sizeof(float) * (size_t) level_count);
+		if (max_shift < 1e-6f)
+			break;
+	}
+
+	codebook->boundaries[0] = -1.0f;
+	codebook->boundaries[level_count] = 1.0f;
+	for (level = 1; level < level_count; level++)
+		codebook->boundaries[level] = 0.5f * (codebook->centroids[level - 1u] + codebook->centroids[level]);
+
+	codebook->dimension = config->dimension;
+	codebook->bits = config->bits;
+	codebook->level_count = level_count;
+
+	free(weights);
+	free(cdf);
+	free(next_centroids);
+	return true;
+}
+
+static bool
+tq_prod_get_codebook(const TqProdCodecConfig *config,
+					 const TqProdCodebook **codebook,
 					 char *errmsg,
 					 size_t errmsg_len)
 {
-	if (packed == NULL || gamma == NULL)
+	if (codebook == NULL)
 	{
 		tq_set_error(errmsg, errmsg_len,
-					 "invalid tq_prod buffer: packed input and gamma output must be non-null");
+					 "invalid tq_prod codec config: codebook output must be non-null");
+		return false;
+	}
+
+	if (!tq_prod_validate_config(config, errmsg, errmsg_len))
+		return false;
+
+	if (tq_prod_cached_codebook.dimension != config->dimension
+		|| tq_prod_cached_codebook.bits != config->bits
+		|| tq_prod_cached_codebook.level_count != tq_prod_idx_levels(config)
+		|| tq_prod_cached_codebook.centroids == NULL
+		|| tq_prod_cached_codebook.boundaries == NULL)
+	{
+		if (!tq_prod_build_codebook(config, &tq_prod_cached_codebook, errmsg, errmsg_len))
+			return false;
+	}
+
+	*codebook = &tq_prod_cached_codebook;
+	return true;
+}
+
+static uint32_t
+tq_prod_find_code(const TqProdCodebook *codebook, float value)
+{
+	uint32_t	low = 0;
+	uint32_t	high = codebook->level_count;
+
+	while (low + 1u < high)
+	{
+		uint32_t	mid = low + ((high - low) / 2u);
+
+		if (value < codebook->boundaries[mid])
+			high = mid;
+		else
+			low = mid;
+	}
+
+	if (low >= codebook->level_count)
+		return codebook->level_count - 1u;
+	return low;
+}
+
+static bool
+tq_prod_validate_packed_inputs(const TqProdPackedLayout *layout,
+							   const uint8_t *packed,
+							   size_t packed_len,
+							   char *errmsg,
+							   size_t errmsg_len)
+{
+	if (packed == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid tq_prod buffer: packed input must be non-null");
 		return false;
 	}
 
@@ -238,7 +527,6 @@ tq_prod_unpack_parts(const uint8_t *packed,
 		return false;
 	}
 
-	memcpy(gamma, packed + layout->idx_bytes + layout->qjl_bytes, sizeof(float));
 	return true;
 }
 
@@ -261,10 +549,246 @@ tq_prod_packed_layout(const TqProdCodecConfig *config,
 		return false;
 
 	idx_bits = (uint64_t) config->dimension * (uint64_t) tq_prod_idx_bits(config);
-	layout->idx_bytes = (size_t) ((idx_bits + 7) / 8);
-	layout->qjl_bytes = (size_t) (((uint64_t) config->dimension + 7) / 8);
-	layout->gamma_bytes = TQ_PROD_GAMMA_BYTES;
+	layout->idx_bytes = (size_t) ((idx_bits + 7u) / 8u);
+	layout->qjl_bytes = (size_t) (((uint64_t) tq_prod_qjl_dimension(config) + 7u) / 8u);
+	layout->gamma_bytes = sizeof(float);
 	layout->total_bytes = layout->idx_bytes + layout->qjl_bytes + layout->gamma_bytes;
+	return true;
+}
+
+bool
+tq_prod_qjl_project(const TqProdCodecConfig *config,
+					const float *input,
+					float *output,
+					size_t output_len,
+					char *errmsg,
+					size_t errmsg_len)
+{
+	const TqProdSketch *sketch = NULL;
+	float	   *full_projection = NULL;
+	uint32_t	qjl_dimension = 0;
+	uint32_t	i = 0;
+	bool		ok = false;
+
+	if (input == NULL || output == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid tq_prod qjl: input and output must be non-null");
+		return false;
+	}
+
+	if (!tq_prod_get_sketch(config, &sketch, errmsg, errmsg_len))
+		return false;
+
+	qjl_dimension = tq_prod_qjl_dimension(config);
+	if (output_len < qjl_dimension)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid tq_prod qjl: output buffer is too small");
+		return false;
+	}
+
+	full_projection = (float *) calloc((size_t) sketch->transform.padded_dimension, sizeof(float));
+	if (full_projection == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid tq_prod qjl: out of memory");
+		return false;
+	}
+
+	if (!tq_transform_apply(&sketch->transform,
+							 input,
+							 full_projection,
+							 sketch->transform.padded_dimension,
+							 errmsg,
+							 errmsg_len))
+		goto cleanup;
+
+	for (i = 0; i < qjl_dimension; i++)
+		output[i] = full_projection[i];
+
+	ok = true;
+
+cleanup:
+	free(full_projection);
+	return ok;
+}
+
+bool
+tq_prod_qjl_backproject_signs(const TqProdCodecConfig *config,
+							  const uint8_t *packed_signs,
+							  size_t packed_signs_len,
+							  float *output,
+							  size_t output_len,
+							  char *errmsg,
+							  size_t errmsg_len)
+{
+	const TqProdSketch *sketch = NULL;
+	float	   *full_signs = NULL;
+	uint32_t	qjl_dimension = 0;
+	uint32_t	i = 0;
+	size_t		required_bytes = 0;
+	bool		ok = false;
+
+	if (packed_signs == NULL || output == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid tq_prod qjl: packed signs and output must be non-null");
+		return false;
+	}
+
+	if (!tq_prod_get_sketch(config, &sketch, errmsg, errmsg_len))
+		return false;
+
+	qjl_dimension = tq_prod_qjl_dimension(config);
+	if (output_len < config->dimension)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid tq_prod qjl: output buffer is too small");
+		return false;
+	}
+
+	required_bytes = (size_t) (((uint64_t) qjl_dimension + 7u) / 8u);
+	if (packed_signs_len < required_bytes)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid tq_prod qjl: packed sign buffer is too small");
+		return false;
+	}
+
+	full_signs = (float *) calloc((size_t) sketch->transform.padded_dimension, sizeof(float));
+	if (full_signs == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid tq_prod qjl: out of memory");
+		return false;
+	}
+
+	for (i = 0; i < qjl_dimension; i++)
+		full_signs[i] = tq_unpack_bits(packed_signs, i, 1u) ? 1.0f : -1.0f;
+
+	if (!tq_transform_inverse(&sketch->transform,
+							   full_signs,
+							   sketch->transform.padded_dimension,
+							   output,
+							   output_len,
+							   errmsg,
+							   errmsg_len))
+		goto cleanup;
+
+	ok = true;
+
+cleanup:
+	free(full_signs);
+	return ok;
+}
+
+bool
+tq_prod_feature_distance(const TqProdCodecConfig *config,
+						 const uint8_t *left_packed,
+						 size_t left_packed_len,
+						 const uint8_t *right_packed,
+						 size_t right_packed_len,
+						 float *distance,
+	char *errmsg,
+	size_t errmsg_len)
+{
+	TqProdPackedLayout layout;
+	float	   *left_decoded = NULL;
+	float	   *right_decoded = NULL;
+	double		distance_sq = 0.0;
+	uint32_t	i = 0;
+	bool		ok = false;
+
+	if (distance == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid tq_prod scorer: feature distance output must be non-null");
+		return false;
+	}
+
+	memset(&layout, 0, sizeof(layout));
+	if (!tq_prod_packed_layout(config, &layout, errmsg, errmsg_len)
+		|| !tq_prod_validate_packed_inputs(&layout, left_packed, left_packed_len, errmsg, errmsg_len)
+		|| !tq_prod_validate_packed_inputs(&layout, right_packed, right_packed_len, errmsg, errmsg_len))
+		return false;
+
+	left_decoded = (float *) calloc((size_t) config->dimension, sizeof(float));
+	right_decoded = (float *) calloc((size_t) config->dimension, sizeof(float));
+	if (left_decoded == NULL || right_decoded == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid tq_prod scorer: out of memory");
+		goto cleanup;
+	}
+
+	if (!tq_prod_decode(config,
+						left_packed,
+						left_packed_len,
+						left_decoded,
+						config->dimension,
+						errmsg,
+						errmsg_len)
+		|| !tq_prod_decode(config,
+						   right_packed,
+						   right_packed_len,
+						   right_decoded,
+						   config->dimension,
+						   errmsg,
+						   errmsg_len))
+		goto cleanup;
+
+	for (i = 0; i < config->dimension; i++)
+	{
+		double delta = (double) left_decoded[i] - (double) right_decoded[i];
+		distance_sq += delta * delta;
+	}
+
+	*distance = (float) sqrt(distance_sq);
+	ok = true;
+
+cleanup:
+	free(left_decoded);
+	free(right_decoded);
+	return ok;
+}
+
+bool
+tq_prod_query_weight_l2_norm(const TqProdCodecConfig *config,
+							 const TqProdLut *lut,
+							 float *norm,
+							 char *errmsg,
+							 size_t errmsg_len)
+{
+	if (norm == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid tq_prod scorer: query weight norm output must be non-null");
+		return false;
+	}
+
+	if (lut == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid tq_prod scorer: lut must be non-null");
+		return false;
+	}
+
+	if (!tq_prod_validate_config(config, errmsg, errmsg_len))
+		return false;
+
+	if (lut->dimension != config->dimension
+		|| lut->qjl_dimension != tq_prod_qjl_dimension(config)
+		|| lut->level_count != tq_prod_idx_levels(config)
+		|| lut->values == NULL
+		|| lut->qjl_values == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid tq_prod scorer: lut shape does not match codec config");
+		return false;
+	}
+
+	*norm = lut->feature_weight_norm;
 	return true;
 }
 
@@ -277,8 +801,14 @@ tq_prod_encode(const TqProdCodecConfig *config,
 			   size_t errmsg_len)
 {
 	TqProdPackedLayout layout;
+	const TqProdCodebook *codebook = NULL;
+	float	   *residual = NULL;
+	float	   *projection = NULL;
+	double		residual_norm_sq = 0.0;
 	float		gamma = 0.0f;
+	uint32_t	qjl_dimension = 0;
 	uint32_t	i = 0;
+	bool		ok = false;
 
 	if (input == NULL || packed == NULL)
 	{
@@ -289,7 +819,9 @@ tq_prod_encode(const TqProdCodecConfig *config,
 
 	memset(&layout, 0, sizeof(layout));
 
-	if (!tq_prod_packed_layout(config, &layout, errmsg, errmsg_len))
+	if (!tq_prod_packed_layout(config, &layout, errmsg, errmsg_len)
+		|| !tq_prod_get_codebook(config, &codebook, errmsg, errmsg_len)
+		)
 		return false;
 
 	if (packed_len < layout.total_bytes)
@@ -299,20 +831,54 @@ tq_prod_encode(const TqProdCodecConfig *config,
 		return false;
 	}
 
+	qjl_dimension = tq_prod_qjl_dimension(config);
+	residual = (float *) malloc(sizeof(float) * (size_t) config->dimension);
+	projection = (float *) malloc(sizeof(float) * (size_t) qjl_dimension);
+	if (residual == NULL || projection == NULL)
+	{
+		free(residual);
+		free(projection);
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid tq_prod buffer: out of memory");
+		return false;
+	}
+
 	memset(packed, 0, packed_len);
-	gamma = tq_prod_derive_gamma(config, input);
 
 	for (i = 0; i < config->dimension; i++)
 	{
-		uint32_t	idx_code = tq_prod_quantize_magnitude(config, fabsf(input[i]), gamma);
-		uint32_t	sign_bit = input[i] >= 0.0f ? 1u : 0u;
+		float		clamped = tq_prod_clamp_unit(input[i]);
+		uint32_t	idx_code = tq_prod_find_code(codebook, clamped);
+		float		stage1 = codebook->centroids[idx_code];
+		float		delta = clamped - stage1;
 
 		tq_pack_bits(packed, i * tq_prod_idx_bits(config), tq_prod_idx_bits(config), idx_code);
-		tq_pack_bits(packed + layout.idx_bytes, i, 1, sign_bit);
+		residual[i] = delta;
+		residual_norm_sq += (double) delta * (double) delta;
 	}
 
-	memcpy(packed + layout.idx_bytes + layout.qjl_bytes, &gamma, sizeof(float));
-	return true;
+	gamma = (float) sqrt(residual_norm_sq);
+	tq_prod_write_float32(packed + layout.idx_bytes + layout.qjl_bytes, gamma);
+
+	if (gamma > 0.0f)
+	{
+		if (!tq_prod_qjl_project(config, residual, projection, qjl_dimension, errmsg, errmsg_len))
+			goto cleanup;
+
+		for (i = 0; i < qjl_dimension; i++)
+		{
+			uint32_t	bit = 0;
+
+			bit = projection[i] >= 0.0f ? 1u : 0u;
+			tq_pack_bits(packed + layout.idx_bytes, i, 1u, bit);
+		}
+	}
+
+	ok = true;
+cleanup:
+	free(residual);
+	free(projection);
+	return ok;
 }
 
 bool
@@ -325,12 +891,21 @@ tq_prod_read_gamma(const TqProdCodecConfig *config,
 {
 	TqProdPackedLayout layout;
 
+	if (gamma == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid tq_prod buffer: gamma output must be non-null");
+		return false;
+	}
+
 	memset(&layout, 0, sizeof(layout));
 
-	if (!tq_prod_packed_layout(config, &layout, errmsg, errmsg_len))
+	if (!tq_prod_packed_layout(config, &layout, errmsg, errmsg_len)
+		|| !tq_prod_validate_packed_inputs(&layout, packed, packed_len, errmsg, errmsg_len))
 		return false;
 
-	return tq_prod_unpack_parts(packed, packed_len, &layout, gamma, errmsg, errmsg_len);
+	*gamma = tq_prod_read_float32(packed + layout.idx_bytes + layout.qjl_bytes);
+	return true;
 }
 
 bool
@@ -343,8 +918,13 @@ tq_prod_decode(const TqProdCodecConfig *config,
 			   size_t errmsg_len)
 {
 	TqProdPackedLayout layout;
+	const TqProdCodebook *codebook = NULL;
+	float	   *residual = NULL;
 	float		gamma = 0.0f;
+	float		scale = 0.0f;
+	uint32_t	qjl_dimension = 0;
 	uint32_t	i = 0;
+	bool		ok = false;
 
 	if (packed == NULL || output == NULL)
 	{
@@ -355,7 +935,9 @@ tq_prod_decode(const TqProdCodecConfig *config,
 
 	memset(&layout, 0, sizeof(layout));
 
-	if (!tq_prod_packed_layout(config, &layout, errmsg, errmsg_len))
+	if (!tq_prod_packed_layout(config, &layout, errmsg, errmsg_len)
+		|| !tq_prod_get_codebook(config, &codebook, errmsg, errmsg_len)
+		|| !tq_prod_validate_packed_inputs(&layout, packed, packed_len, errmsg, errmsg_len))
 		return false;
 
 	if (output_len < config->dimension)
@@ -365,21 +947,45 @@ tq_prod_decode(const TqProdCodecConfig *config,
 		return false;
 	}
 
-	if (!tq_prod_unpack_parts(packed, packed_len, &layout, &gamma, errmsg, errmsg_len))
-		return false;
-
 	tq_prod_decode_counter += 1;
-
 	for (i = 0; i < config->dimension; i++)
 	{
 		uint32_t	idx_code = tq_unpack_bits(packed, i * tq_prod_idx_bits(config), tq_prod_idx_bits(config));
-		uint32_t	sign_bit = tq_unpack_bits(packed + layout.idx_bytes, i, 1);
-		float		value = tq_prod_decode_magnitude(config, idx_code, gamma);
 
-		output[i] = sign_bit ? value : -value;
+		output[i] = codebook->centroids[idx_code];
 	}
 
-	return true;
+	gamma = tq_prod_read_float32(packed + layout.idx_bytes + layout.qjl_bytes);
+	if (gamma <= 0.0f)
+		return true;
+
+	qjl_dimension = tq_prod_qjl_dimension(config);
+	residual = (float *) calloc((size_t) config->dimension, sizeof(float));
+	if (residual == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid tq_prod buffer: out of memory");
+		return false;
+	}
+
+	if (!tq_prod_qjl_backproject_signs(config,
+									   packed + layout.idx_bytes,
+									   layout.qjl_bytes,
+									   residual,
+									   config->dimension,
+									   errmsg,
+									   errmsg_len))
+		goto cleanup;
+
+	scale = tq_prod_qjl_scale(qjl_dimension) * gamma;
+	for (i = 0; i < config->dimension; i++)
+		output[i] += scale * residual[i];
+
+	ok = true;
+
+cleanup:
+	free(residual);
+	return ok;
 }
 
 void
@@ -389,7 +995,7 @@ tq_prod_lut_reset(TqProdLut *lut)
 		return;
 
 	free(lut->values);
-	free(lut->query_signs);
+	free(lut->qjl_values);
 	memset(lut, 0, sizeof(*lut));
 }
 
@@ -400,10 +1006,14 @@ tq_prod_lut_build(const TqProdCodecConfig *config,
 				  char *errmsg,
 				  size_t errmsg_len)
 {
-	uint32_t	level_count = 0;
+	const TqProdCodebook *codebook = NULL;
+	float	   *projection = NULL;
+	uint32_t	qjl_dimension = 0;
 	uint32_t	dim = 0;
 	uint32_t	code = 0;
-	uint32_t	max_code = 0;
+	float		scale = 0.0f;
+	double		weight_norm_sq = 0.0;
+	bool		ok = false;
 
 	if (query == NULL || lut == NULL)
 	{
@@ -412,17 +1022,24 @@ tq_prod_lut_build(const TqProdCodecConfig *config,
 		return false;
 	}
 
-	if (!tq_prod_validate_config(config, errmsg, errmsg_len))
+	if (!tq_prod_get_codebook(config, &codebook, errmsg, errmsg_len))
 		return false;
 
 	tq_prod_lut_reset(lut);
+	qjl_dimension = tq_prod_qjl_dimension(config);
 
-	level_count = tq_prod_idx_levels(config);
-	max_code = level_count - 1;
-	lut->values = (float *) malloc(sizeof(float) * (size_t) config->dimension * (size_t) level_count);
-	lut->query_signs = (uint8_t *) malloc(sizeof(uint8_t) * (size_t) config->dimension);
-
-	if (lut->values == NULL || lut->query_signs == NULL)
+	lut->values = (float *) malloc(sizeof(float) * (size_t) config->dimension * (size_t) codebook->level_count);
+	lut->qjl_values = (float *) malloc(sizeof(float) * (size_t) qjl_dimension);
+	projection = (float *) malloc(sizeof(float) * (size_t) qjl_dimension);
+	if (lut->values == NULL || lut->qjl_values == NULL)
+	{
+		tq_prod_lut_reset(lut);
+		free(projection);
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid tq_prod lut: out of memory");
+		return false;
+	}
+	if (projection == NULL)
 	{
 		tq_prod_lut_reset(lut);
 		tq_set_error(errmsg, errmsg_len,
@@ -431,33 +1048,39 @@ tq_prod_lut_build(const TqProdCodecConfig *config,
 	}
 
 	lut->dimension = config->dimension;
-	lut->level_count = level_count;
+	lut->qjl_dimension = qjl_dimension;
+	lut->level_count = codebook->level_count;
 
 	for (dim = 0; dim < config->dimension; dim++)
 	{
-		float		abs_query = fabsf(query[dim]);
-
-		lut->query_signs[dim] = query[dim] >= 0.0f ? 1u : 0u;
-		for (code = 0; code < level_count; code++)
+		for (code = 0; code < codebook->level_count; code++)
 		{
-			float		normalized_level = 0.0f;
+			size_t index = ((size_t) dim * (size_t) codebook->level_count) + (size_t) code;
 
-			if (max_code != 0)
-			{
-				float		companded = (float) code / (float) max_code;
-				float		mu = tq_prod_companding_mu(config);
-
-				if (mu > 0.0f)
-					normalized_level = expm1f(companded * log1pf(mu)) / mu;
-				else
-					normalized_level = companded;
-			}
-
-			lut->values[(size_t) dim * (size_t) level_count + (size_t) code] = abs_query * normalized_level;
+			lut->values[index] = query[dim] * codebook->centroids[code];
 		}
+		weight_norm_sq += (double) query[dim] * (double) query[dim];
 	}
 
-	return true;
+	if (!tq_prod_qjl_project(config, query, projection, qjl_dimension, errmsg, errmsg_len))
+		goto cleanup;
+
+	scale = tq_prod_qjl_scale(qjl_dimension);
+	for (dim = 0; dim < qjl_dimension; dim++)
+	{
+		lut->qjl_values[dim] = scale * projection[dim];
+		weight_norm_sq += (double) lut->qjl_values[dim] * (double) lut->qjl_values[dim];
+	}
+
+	lut->feature_weight_norm = (float) sqrt(weight_norm_sq);
+
+	ok = true;
+
+cleanup:
+	free(projection);
+	if (!ok)
+		tq_prod_lut_reset(lut);
+	return ok;
 }
 
 bool
@@ -472,9 +1095,10 @@ tq_prod_score_decompose_ip(const TqProdCodecConfig *config,
 						   size_t errmsg_len)
 {
 	TqProdPackedLayout layout;
-	float		gamma = 0.0f;
 	float		base_sum = 0.0f;
-	float		qjl_sum = 0.0f;
+	float		residual_sum = 0.0f;
+	float		gamma = 0.0f;
+	uint32_t	qjl_dimension = 0;
 	uint32_t	i = 0;
 
 	if (lut == NULL || packed == NULL || mse_contribution == NULL
@@ -486,35 +1110,43 @@ tq_prod_score_decompose_ip(const TqProdCodecConfig *config,
 	}
 
 	memset(&layout, 0, sizeof(layout));
+	qjl_dimension = tq_prod_qjl_dimension(config);
 
 	if (!tq_prod_packed_layout(config, &layout, errmsg, errmsg_len))
 		return false;
 
-	if (lut->dimension != config->dimension || lut->level_count != tq_prod_idx_levels(config)
-		|| lut->values == NULL || lut->query_signs == NULL)
+	if (lut->dimension != config->dimension
+		|| lut->qjl_dimension != qjl_dimension
+		|| lut->level_count != tq_prod_idx_levels(config)
+		|| lut->values == NULL
+		|| lut->qjl_values == NULL)
 	{
 		tq_set_error(errmsg, errmsg_len,
 					 "invalid tq_prod scorer: lut shape does not match codec config");
 		return false;
 	}
 
-	if (!tq_prod_unpack_parts(packed, packed_len, &layout, &gamma, errmsg, errmsg_len))
+	if (!tq_prod_validate_packed_inputs(&layout, packed, packed_len, errmsg, errmsg_len))
 		return false;
 
 	for (i = 0; i < config->dimension; i++)
 	{
 		uint32_t	idx_code = tq_unpack_bits(packed, i * tq_prod_idx_bits(config), tq_prod_idx_bits(config));
-		uint32_t	sign_bit = tq_unpack_bits(packed + layout.idx_bytes, i, 1);
-		float		weight = lut->values[(size_t) i * (size_t) lut->level_count + (size_t) idx_code];
+		size_t		index = ((size_t) i * (size_t) lut->level_count) + (size_t) idx_code;
+			base_sum += lut->values[index];
+		}
 
-		base_sum += weight;
-		if (sign_bit == lut->query_signs[i])
-			qjl_sum += (2.0f * weight);
+	for (i = 0; i < qjl_dimension; i++)
+	{
+		float sign = tq_unpack_bits(packed + layout.idx_bytes, i, 1u) ? 1.0f : -1.0f;
+
+		residual_sum += sign * lut->qjl_values[i];
 	}
 
-	*mse_contribution = -gamma * base_sum;
-	*qjl_contribution = gamma * qjl_sum;
-	*combined_score = *mse_contribution + *qjl_contribution;
+	gamma = tq_prod_read_float32(packed + layout.idx_bytes + layout.qjl_bytes);
+	*mse_contribution = base_sum;
+	*qjl_contribution = gamma * residual_sum;
+	*combined_score = base_sum + (*qjl_contribution);
 	return true;
 }
 
@@ -540,8 +1172,8 @@ tq_prod_score_packed_ip(const TqProdCodecConfig *config,
 						char *errmsg,
 						size_t errmsg_len)
 {
-	float		mse_contribution = 0.0f;
-	float		qjl_contribution = 0.0f;
+	float		stage1_contribution = 0.0f;
+	float		residual_contribution = 0.0f;
 
 	if (score == NULL)
 	{
@@ -550,9 +1182,15 @@ tq_prod_score_packed_ip(const TqProdCodecConfig *config,
 		return false;
 	}
 
-	return tq_prod_score_decompose_ip(config, lut, packed, packed_len,
-									  &mse_contribution, &qjl_contribution, score,
-									  errmsg, errmsg_len);
+	return tq_prod_score_decompose_ip(config,
+									  lut,
+									  packed,
+									  packed_len,
+									  &stage1_contribution,
+									  &residual_contribution,
+									  score,
+									  errmsg,
+									  errmsg_len);
 }
 
 void

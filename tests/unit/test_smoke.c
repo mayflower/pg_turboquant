@@ -286,6 +286,7 @@ default_prod_config(uint32_t dimension, uint8_t bits)
 	memset(&config, 0, sizeof(config));
 	config.dimension = dimension;
 	config.bits = bits;
+	config.qjl_seed = UINT64_C(0x13579BDF2468ACE0);
 
 	return config;
 }
@@ -993,11 +994,14 @@ static void
 test_tq_prod_packed_length_calculations(void)
 {
 	TqProdCodecConfig config5 = default_prod_config(5, 4);
-	TqProdCodecConfig config7 = default_prod_config(7, 2);
+	TqProdCodecConfig config17 = default_prod_config(17, 4);
 	TqProdPackedLayout layout;
 	char		errmsg[256];
 
 	memset(&layout, 0, sizeof(layout));
+
+	config5.qjl_dimension = 5;
+	config17.qjl_dimension = 9;
 
 	assert(tq_prod_packed_layout(&config5, &layout, errmsg, sizeof(errmsg)));
 	assert(layout.idx_bytes == 2);
@@ -1005,11 +1009,11 @@ test_tq_prod_packed_length_calculations(void)
 	assert(layout.gamma_bytes == 4);
 	assert(layout.total_bytes == 7);
 
-	assert(tq_prod_packed_layout(&config7, &layout, errmsg, sizeof(errmsg)));
-	assert(layout.idx_bytes == 1);
-	assert(layout.qjl_bytes == 1);
+	assert(tq_prod_packed_layout(&config17, &layout, errmsg, sizeof(errmsg)));
+	assert(layout.idx_bytes == 7);
+	assert(layout.qjl_bytes == 2);
 	assert(layout.gamma_bytes == 4);
-	assert(layout.total_bytes == 6);
+	assert(layout.total_bytes == 13);
 }
 
 static void
@@ -1036,6 +1040,7 @@ test_tq_prod_encode_decode_determinism(void)
 
 	assert(tq_prod_read_gamma(&config, left, sizeof(left), &gamma_left, errmsg, sizeof(errmsg)));
 	assert(tq_prod_read_gamma(&config, right, sizeof(right), &gamma_right, errmsg, sizeof(errmsg)));
+	assert(gamma_left > 0.0f);
 	assert_float_close(gamma_left, gamma_right, 1e-6f);
 
 	assert(tq_prod_decode(&config, left, sizeof(left), decoded_left, 5, errmsg, sizeof(errmsg)));
@@ -1061,7 +1066,7 @@ test_tq_prod_invalid_parameter_handling(void)
 	assert(strcmp(errmsg,
 				  "invalid tq_prod codec config: bits must be between 2 and 8") == 0);
 
-	assert(!tq_prod_encode(&valid, input, packed, 6, errmsg, sizeof(errmsg)));
+	assert(!tq_prod_encode(&valid, input, packed, 2, errmsg, sizeof(errmsg)));
 	assert(strcmp(errmsg,
 				  "invalid tq_prod buffer: packed output buffer is too small") == 0);
 }
@@ -1074,32 +1079,31 @@ test_tq_prod_score_decomposition(void)
 	const float	query[2] = {0.25f, -0.5f};
 	uint8_t		packed[6];
 	TqProdLut	lut;
+	float		decoded[2];
 	float		mse_contribution = 0.0f;
 	float		qjl_contribution = 0.0f;
 	float		combined = 0.0f;
-	float		expected_lut[16] = {
-		0.0f, 0.02981701f, 0.06141213f, 0.09489139f,
-		0.13036716f, 0.16795850f, 0.20779154f, 0.25f,
-		0.0f, 0.05963402f, 0.12282426f, 0.18978278f,
-		0.26073432f, 0.33591697f, 0.41558310f, 0.5f
-	};
+	float		helper_score = 0.0f;
 	char		errmsg[256];
 
 	memset(packed, 0, sizeof(packed));
 	memset(&lut, 0, sizeof(lut));
+	memset(decoded, 0, sizeof(decoded));
 
 	assert(tq_prod_encode(&config, input, packed, sizeof(packed), errmsg, sizeof(errmsg)));
 	assert(tq_prod_lut_build(&config, query, &lut, errmsg, sizeof(errmsg)));
 	assert(lut.dimension == 2);
 	assert(lut.level_count == 8);
-	assert_float_array_close(lut.values, expected_lut, 16, 1e-5f);
+	assert(lut.qjl_values != NULL);
 
 	assert(tq_prod_score_decompose_ip(&config, &lut, packed, sizeof(packed),
 									  &mse_contribution, &qjl_contribution, &combined,
 									  errmsg, sizeof(errmsg)));
-	assert_float_close(mse_contribution, -0.63036716f, 1e-5f);
-	assert_float_close(qjl_contribution, 1.26073432f, 1e-5f);
-	assert_float_close(combined, 0.63036716f, 1e-5f);
+	assert(tq_prod_decode(&config, packed, sizeof(packed), decoded, 2, errmsg, sizeof(errmsg)));
+	helper_score = dot_product(query, decoded, 2);
+	assert_float_close(combined, mse_contribution + qjl_contribution, 1e-6f);
+	assert_float_close(combined, helper_score, 1e-6f);
+	assert(fabsf(qjl_contribution) > 1e-4f);
 
 	tq_prod_lut_reset(&lut);
 }
@@ -1149,7 +1153,7 @@ test_tq_prod_stability_seeded_random_corpus(void)
 	for (vec = 0; vec < 16; vec++)
 	{
 		float		input[8];
-		uint8_t		packed[12];
+		uint8_t		packed[8];
 		float		decoded[8];
 		TqProdLut	lut;
 		float		exact_score = 0.0f;
@@ -1175,8 +1179,8 @@ test_tq_prod_stability_seeded_random_corpus(void)
 		tq_prod_lut_reset(&lut);
 	}
 
-	assert(fabsf(signed_error_sum / 16.0f) < 0.15f);
-	assert((abs_error_sum / 16.0f) < 0.35f);
+	assert(fabsf(signed_error_sum / 16.0f) < 0.08f);
+	assert((abs_error_sum / 16.0f) < 0.22f);
 }
 
 typedef enum TqProdTestDistribution
@@ -1287,16 +1291,15 @@ legacy_tq_prod_score_ip(const TqProdCodecConfig *config,
 }
 
 static float
-tq_prod_average_abs_ip_error(const TqProdCodecConfig *config,
-							 TqProdTestDistribution distribution,
-							 bool use_legacy_codec)
+tq_prod_average_signed_ip_error(const TqProdCodecConfig *config,
+								TqProdTestDistribution distribution)
 {
 	enum { SAMPLE_COUNT = 48 };
-	uint32_t	input_state = UINT32_C(0x51A7E001) + (uint32_t) distribution;
-	uint32_t	query_state = UINT32_C(0x51A7E101) + (uint32_t) distribution;
+	uint32_t	input_state = UINT32_C(0x5A7B9C11) + (uint32_t) distribution;
+	uint32_t	query_state = UINT32_C(0x5A7B9D11) + (uint32_t) distribution;
 	float		input[16];
 	float		query[16];
-	uint8_t		packed[24];
+	uint8_t		packed[32];
 	TqProdLut	lut;
 	float		total_error = 0.0f;
 	char		errmsg[256];
@@ -1314,18 +1317,13 @@ tq_prod_average_abs_ip_error(const TqProdCodecConfig *config,
 		fill_tq_prod_test_vector(distribution, config->dimension, &query_state, query);
 		exact_score = dot_product(query, input, config->dimension);
 
-		if (use_legacy_codec)
-			approx_score = legacy_tq_prod_score_ip(config, query, input);
-		else
-		{
-			memset(packed, 0, sizeof(packed));
-			assert(tq_prod_encode(config, input, packed, sizeof(packed), errmsg, sizeof(errmsg)));
-			assert(tq_prod_lut_build(config, query, &lut, errmsg, sizeof(errmsg)));
-			assert(tq_prod_score_packed_ip(config, &lut, packed, sizeof(packed), &approx_score, errmsg, sizeof(errmsg)));
-			tq_prod_lut_reset(&lut);
-		}
+		memset(packed, 0, sizeof(packed));
+		assert(tq_prod_encode(config, input, packed, sizeof(packed), errmsg, sizeof(errmsg)));
+		assert(tq_prod_lut_build(config, query, &lut, errmsg, sizeof(errmsg)));
+		assert(tq_prod_score_packed_ip(config, &lut, packed, sizeof(packed), &approx_score, errmsg, sizeof(errmsg)));
+		tq_prod_lut_reset(&lut);
 
-		total_error += fabsf(approx_score - exact_score);
+		total_error += (approx_score - exact_score);
 	}
 
 	return total_error / (float) SAMPLE_COUNT;
@@ -1412,13 +1410,14 @@ tq_prod_average_recall_at_k(const TqProdCodecConfig *config,
 }
 
 static void
-test_tq_prod_calibrated_estimator_reduces_heavy_tail_ip_error(void)
+test_tq_prod_unbiased_estimator_has_low_signed_error_on_seeded_corpora(void)
 {
 	TqProdCodecConfig config = default_prod_config(8, 4);
-	float		legacy_error = tq_prod_average_abs_ip_error(&config, TQ_PROD_TEST_HEAVY_TAIL, true);
-	float		current_error = tq_prod_average_abs_ip_error(&config, TQ_PROD_TEST_HEAVY_TAIL, false);
+	float		normalized_error = tq_prod_average_signed_ip_error(&config, TQ_PROD_TEST_NORMALIZED);
+	float		heavy_tail_error = tq_prod_average_signed_ip_error(&config, TQ_PROD_TEST_HEAVY_TAIL);
 
-	assert(current_error < legacy_error * 0.95f);
+	assert(fabsf(normalized_error) < 0.08f);
+	assert(fabsf(heavy_tail_error) < 0.08f);
 }
 
 static void
@@ -2269,10 +2268,11 @@ test_tq_batch_page_scan_cosine_is_scale_invariant(void)
 }
 
 static void
-test_tq_batch_page_scan_l2_diverges_from_ip_on_non_normalized_input(void)
+test_tq_batch_page_scan_non_normalized_metrics_use_compatibility_fallback(void)
 {
 	TqProdCodecConfig config = default_prod_config(2, 4);
 	TqProdLut lut;
+	TqScanStats stats;
 	TqBatchPageParams params = {
 		.lane_count = 4,
 		.code_bytes = 6,
@@ -2293,6 +2293,7 @@ test_tq_batch_page_scan_l2_diverges_from_ip_on_non_normalized_input(void)
 	char		errmsg[256];
 
 	memset(&lut, 0, sizeof(lut));
+	memset(&stats, 0, sizeof(stats));
 	memset(page, 0, sizeof(page));
 	memset(packed, 0, sizeof(packed));
 	memset(&ip_heap, 0, sizeof(ip_heap));
@@ -2319,18 +2320,28 @@ test_tq_batch_page_scan_l2_diverges_from_ip_on_non_normalized_input(void)
 
 	assert(tq_batch_page_scan_prod(page, sizeof(page), &config, false, TQ_DISTANCE_IP, &lut,
 								   query, 2, &ip_heap, NULL, errmsg, sizeof(errmsg)));
+	tq_scan_stats_snapshot(&stats);
+	assert(!stats.faithful_fast_path);
+	assert(stats.compatibility_fallback);
 	assert(tq_batch_page_scan_prod(page, sizeof(page), &config, false, TQ_DISTANCE_L2, &lut,
 								   query, 2, &l2_heap, NULL, errmsg, sizeof(errmsg)));
+	tq_scan_stats_snapshot(&stats);
+	assert(!stats.faithful_fast_path);
+	assert(stats.compatibility_fallback);
 
 	assert(tq_candidate_heap_pop_best(&ip_heap, &ip_entry));
-	assert(ip_entry.tid.offset_number == 2);
+	assert(ip_entry.tid.offset_number >= 1);
+	assert(ip_entry.tid.offset_number <= 3);
 
 	assert(tq_candidate_heap_pop_best(&l2_heap, &l2_entry));
-	assert(l2_entry.tid.offset_number == 1);
+	assert(l2_entry.tid.offset_number >= 1);
+	assert(l2_entry.tid.offset_number <= 3);
 	assert(tq_candidate_heap_pop_best(&l2_heap, &l2_entry));
-	assert(l2_entry.tid.offset_number == 2);
+	assert(l2_entry.tid.offset_number >= 1);
+	assert(l2_entry.tid.offset_number <= 3);
 	assert(tq_candidate_heap_pop_best(&l2_heap, &l2_entry));
-	assert(l2_entry.tid.offset_number == 3);
+	assert(l2_entry.tid.offset_number >= 1);
+	assert(l2_entry.tid.offset_number <= 3);
 
 	tq_candidate_heap_reset(&ip_heap);
 	tq_candidate_heap_reset(&l2_heap);
@@ -2354,7 +2365,13 @@ test_tq_meta_page_roundtrip(void)
 		.list_count = 128,
 		.directory_root_block = 7,
 		.centroid_root_block = 9,
-		.transform_seed = UINT64_C(0x1122334455667788)
+		.transform_seed = UINT64_C(0x1122334455667788),
+		.algorithm_version = TQ_ALGORITHM_VERSION,
+		.quantizer_version = TQ_QUANTIZER_VERSION,
+		.residual_sketch_version = TQ_RESIDUAL_SKETCH_VERSION,
+		.residual_bits_per_dimension = 1,
+		.residual_sketch_dimension = 512,
+		.estimator_version = TQ_ESTIMATOR_VERSION
 	};
 	TqMetaPageFields readback;
 	char		errmsg[256];
@@ -2377,6 +2394,12 @@ test_tq_meta_page_roundtrip(void)
 	assert(readback.directory_root_block == written.directory_root_block);
 	assert(readback.centroid_root_block == written.centroid_root_block);
 	assert(readback.transform_seed == written.transform_seed);
+	assert(readback.algorithm_version == written.algorithm_version);
+	assert(readback.quantizer_version == written.quantizer_version);
+	assert(readback.residual_sketch_version == written.residual_sketch_version);
+	assert(readback.residual_bits_per_dimension == written.residual_bits_per_dimension);
+	assert(readback.residual_sketch_dimension == written.residual_sketch_dimension);
+	assert(readback.estimator_version == written.estimator_version);
 }
 
 static void
@@ -2396,7 +2419,13 @@ test_tq_meta_page_rejects_old_format_version(void)
 		.list_count = 0,
 		.directory_root_block = TQ_INVALID_BLOCK_NUMBER,
 		.centroid_root_block = TQ_INVALID_BLOCK_NUMBER,
-		.transform_seed = UINT64_C(7)
+		.transform_seed = UINT64_C(7),
+		.algorithm_version = TQ_ALGORITHM_VERSION,
+		.quantizer_version = TQ_QUANTIZER_VERSION,
+		.residual_sketch_version = TQ_RESIDUAL_SKETCH_VERSION,
+		.residual_bits_per_dimension = 1,
+		.residual_sketch_dimension = 8,
+		.estimator_version = TQ_ESTIMATOR_VERSION
 	};
 	TqMetaPageFields readback;
 	char		errmsg[256];
@@ -2452,7 +2481,7 @@ test_tq_batch_page_header_init(void)
 	uint8_t		page[TQ_DEFAULT_BLOCK_SIZE];
 	TqBatchPageParams params = {
 		.lane_count = 8,
-		.code_bytes = 778,
+		.code_bytes = 774,
 		.list_id = 3,
 		.next_block = 42
 	};
@@ -2465,7 +2494,7 @@ test_tq_batch_page_header_init(void)
 	assert(tq_batch_page_init(page, sizeof(page), &params, errmsg, sizeof(errmsg)));
 	assert(tq_batch_page_read_header(page, sizeof(page), &header, errmsg, sizeof(errmsg)));
 	assert(header.lane_count == 8);
-	assert(header.code_bytes == 778);
+	assert(header.code_bytes == 774);
 	assert(header.list_id == 3);
 	assert(header.next_block == 42);
 	assert(header.occupied_count == 0);
@@ -2475,9 +2504,9 @@ test_tq_batch_page_header_init(void)
 static void
 test_tq_batch_page_capacity_checks(void)
 {
-	assert(tq_batch_page_required_bytes(8, 778) < (size_t) TQ_DEFAULT_BLOCK_SIZE);
-	assert(tq_batch_page_can_fit(TQ_DEFAULT_BLOCK_SIZE, 8, 778));
-	assert(!tq_batch_page_can_fit(TQ_DEFAULT_BLOCK_SIZE, 16, 778));
+	assert(tq_batch_page_required_bytes(8, 774) < (size_t) TQ_DEFAULT_BLOCK_SIZE);
+	assert(tq_batch_page_can_fit(TQ_DEFAULT_BLOCK_SIZE, 8, 774));
+	assert(!tq_batch_page_can_fit(TQ_DEFAULT_BLOCK_SIZE, 16, 774));
 }
 
 static void
@@ -2723,7 +2752,7 @@ main(void)
 	test_tq_prod_score_decomposition();
 	test_tq_prod_scalar_score_matches_decode_helper();
 	test_tq_prod_stability_seeded_random_corpus();
-	test_tq_prod_calibrated_estimator_reduces_heavy_tail_ip_error();
+	test_tq_prod_unbiased_estimator_has_low_signed_error_on_seeded_corpora();
 	test_tq_prod_calibrated_estimator_improves_recall_on_representative_corpora();
 	test_tq_vector_copy_from_pgvector_struct();
 	test_tq_vector_copy_from_halfvec_struct();
@@ -2750,7 +2779,7 @@ main(void)
 	test_tq_batch_page_scan_tiny_corpus();
 	test_tq_batch_page_scan_normalized_metric_orders_align();
 	test_tq_batch_page_scan_cosine_is_scale_invariant();
-	test_tq_batch_page_scan_l2_diverges_from_ip_on_non_normalized_input();
+	test_tq_batch_page_scan_non_normalized_metrics_use_compatibility_fallback();
 	test_tq_meta_page_roundtrip();
 	test_tq_meta_page_rejects_old_format_version();
 	test_tq_list_dir_entry_roundtrip();

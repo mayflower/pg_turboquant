@@ -89,3 +89,27 @@ The generated report is descriptive rather than normative. It states what was me
 ## RAG benchmarks
 
 The repository also carries a higher-level benchmark harness under `benchmarks/rag/`. That layer compares `pg_turboquant`, pgvector HNSW, and pgvector IVFFlat under retrieval-only and fixed-generator RAG scenarios.
+
+For a focused live rerun against an existing local PostgreSQL RAG corpus:
+
+```sh
+./benchmarks/rag/.venv/bin/python benchmarks/rag/run_live_campaign.py \
+  --output-dir benchmarks/rag/results/kilt-nq-rerun-q20-20260330 \
+  --datasets kilt_nq \
+  --dsn 'postgresql:///postgres?host=/tmp&port=5432' \
+  --table-name rag_passages \
+  --turboquant-index-name rag_passages_tq_idx \
+  --hnsw-index-name rag_passages_hnsw_idx \
+  --ivfflat-index-name rag_passages_ivf_idx \
+  --query-limit 20
+```
+
+To render a standalone HTML outcome page from the resulting campaign JSON:
+
+```sh
+./benchmarks/rag/.venv/bin/python benchmarks/rag/run_outcome_report.py \
+  --campaign-json benchmarks/rag/results/kilt-nq-rerun-q20-20260330/rag-campaign.json \
+  --output output.html
+```
+
+That flow writes the campaign-local report under `benchmarks/rag/results/.../outcome.html` and can also emit a top-level `output.html` for quick sharing or review.

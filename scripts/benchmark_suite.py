@@ -16,6 +16,7 @@ from typing import Iterable, Optional
 
 DEFAULT_SEED = 20260327
 TOP_K_VALUES = (10, 100)
+SUPPORTED_METRICS = ("cosine", "ip")
 SUPPORTED_METHODS = (
     "turboquant_flat",
     "turboquant_ivf",
@@ -68,6 +69,30 @@ def parse_csv_list(raw: Optional[str], supported: Iterable[str]) -> list[str]:
     return values
 
 
+def parse_freeform_csv_list(raw: Optional[str]) -> list[str]:
+    if raw is None:
+        return []
+    values = [value.strip() for value in raw.split(",") if value.strip()]
+    if not values:
+        raise SystemExit("at least one value must be selected")
+    return values
+
+
+def resolve_qjl_sketch_dimension(token: Optional[str], dimension: int) -> int:
+    if token in (None, "", "d"):
+        return dimension
+    if token == "d/2":
+        return max(1, dimension // 2)
+    if token == "d/4":
+        return max(1, dimension // 4)
+    value = int(token)
+    if value < 1 or value > dimension:
+        raise SystemExit(
+            f"invalid turboquant qjl sketch dimension {value}: expected 1..{dimension}"
+        )
+    return value
+
+
 def normalize(values: list[float]) -> tuple[float, ...]:
     norm = math.sqrt(sum(value * value for value in values))
     if norm == 0.0:
@@ -86,6 +111,26 @@ def cosine_distance(left: tuple[float, ...], right: tuple[float, ...]) -> float:
         return float("inf")
     dot = sum(a * b for a, b in zip(left, right))
     return 1.0 - (dot / (left_norm * right_norm))
+
+
+def inner_product_distance(left: tuple[float, ...], right: tuple[float, ...]) -> float:
+    return -sum(a * b for a, b in zip(left, right))
+
+
+def exact_distance(metric: str, left: tuple[float, ...], right: tuple[float, ...]) -> float:
+    if metric == "cosine":
+        return cosine_distance(left, right)
+    if metric == "ip":
+        return inner_product_distance(left, right)
+    raise AssertionError(f"unexpected metric {metric}")
+
+
+def metric_order_operator(metric: str) -> str:
+    if metric == "cosine":
+        return "<=>"
+    if metric == "ip":
+        return "<#>"
+    raise AssertionError(f"unexpected metric {metric}")
 
 
 def percentile_ms(values: list[float], percentile: float) -> float:
@@ -193,6 +238,8 @@ def synthetic_code_domain_kernel(corpus: Corpus, spec: dict, simd_metadata: dict
         return "none"
     if int(spec["with"].get("bits", 0)) != 4:
         return "scalar"
+    if int(spec["with"].get("qjl_sketch_dim", corpus.dimension)) != corpus.dimension:
+        return "scalar"
     if corpus.dimension == 0 or corpus.dimension % 8 != 0:
         return "scalar"
     if simd_metadata.get("runtime_available", {}).get("avx2"):
@@ -213,26 +260,47 @@ def environment_metadata() -> dict:
     }
 
 
-def scenario_matrix_metadata(profile: str, corpora: list[str], methods: list[str]) -> dict:
+def scenario_matrix_metadata(
+    profile: str,
+    corpora: list[str],
+    methods: list[str],
+    metrics: list[str],
+    turboquant_qjl_sketch_dims: list[str],
+) -> dict:
     return {
         "profiles": [profile],
         "corpora": corpora,
         "methods": methods,
+        "metrics": metrics,
+        "turboquant_qjl_sketch_dims": turboquant_qjl_sketch_dims or ["d"],
     }
 
 
-def synthetic_index_metadata(method: str, spec: dict, corpus: Corpus) -> dict:
-    metric = "cosine"
+def synthetic_index_metadata(method: str, spec: dict, corpus: Corpus, benchmark_metric: str) -> dict:
+    qjl_sketch_dimension = resolve_qjl_sketch_dimension(
+        str(spec["with"].get("qjl_sketch_dim", "d")) if spec["index_method"] == "turboquant" else None,
+        corpus.dimension,
+    )
     metadata = {
         "access_method": spec["index_method"],
         "capabilities": capability_metadata(spec),
-        "metric": metric,
+        "metric": benchmark_metric,
         "opclass": spec["opclass"],
-        "format_version": 4 if spec["index_method"] == "turboquant" else 0,
+        "format_version": 12 if spec["index_method"] == "turboquant" else 0,
         "list_count": int(spec["with"].get("lists", 0)) if "lists" in spec["with"] else 0,
+        "page_summary": {
+            "mode": "disabled",
+            "safe_pruning": False,
+        },
     }
 
     if spec["index_method"] == "turboquant":
+        if metadata["list_count"] > 0:
+            if spec["with"].get("normalized") == "true":
+                metadata["page_summary"]["mode"] = "safe_summary_pruning"
+                metadata["page_summary"]["safe_pruning"] = True
+            else:
+                metadata["page_summary"]["mode"] = "ordering_only"
         metadata.update(
             {
                 "codec": "prod",
@@ -251,6 +319,13 @@ def synthetic_index_metadata(method: str, spec: dict, corpus: Corpus) -> dict:
                     "input_dimension": corpus.dimension,
                     "output_dimension": corpus.dimension,
                     "seed": 0,
+                },
+                "residual_sketch": {
+                    "kind": "1bit_qjl",
+                    "version": 2,
+                    "bits_per_dimension": 1,
+                    "projected_dimension": qjl_sketch_dimension,
+                    "bit_budget": qjl_sketch_dimension,
                 },
                 "router": {
                     "algorithm": "kmeans" if int(spec["with"].get("lists", 0)) > 0 else "first_k",
@@ -534,10 +609,10 @@ def active_rows(corpus: Corpus) -> list[Row]:
     return [row for row in corpus.rows if not row.deleted]
 
 
-def exact_top_ids(corpus: Corpus, query: tuple[float, ...], limit: int) -> list[int]:
+def exact_top_ids(corpus: Corpus, query: tuple[float, ...], limit: int, metric: str) -> list[int]:
     ranked = sorted(
         active_rows(corpus),
-        key=lambda row: (cosine_distance(row.values, query), row.row_id),
+        key=lambda row: (exact_distance(metric, row.values, query), row.row_id),
     )
     return [row.row_id for row in ranked[:limit]]
 
@@ -550,9 +625,10 @@ def exact_bitmap_ids(corpus: Corpus, query: tuple[float, ...], category: int, th
     ]
 
 
-def ground_truth_for_corpus(corpus: Corpus) -> dict:
+def ground_truth_for_corpus(corpus: Corpus, metric: str) -> dict:
     return {
         "kind": "exact",
+        "metric": metric,
         "top_k": list(TOP_K_VALUES),
         "query_count": len(corpus.queries),
     }
@@ -606,9 +682,28 @@ def wal_bytes_since(base_cmd: list[str], start_lsn: str) -> int:
     )
 
 
+def method_opclass(method: str, benchmark_metric: str) -> str:
+    if method.startswith("turboquant_"):
+        if method == "turboquant_bitmap":
+            if benchmark_metric != "cosine":
+                raise SystemExit("turboquant_bitmap only supports cosine benchmarks")
+            return "tq_cosine_ops"
+        if benchmark_metric == "cosine":
+            return "tq_cosine_ops"
+        if benchmark_metric == "ip":
+            return "tq_ip_ops"
+    if method.startswith("pgvector_"):
+        if benchmark_metric == "cosine":
+            return "vector_cosine_ops"
+        if benchmark_metric == "ip":
+            return "vector_ip_ops"
+    raise AssertionError(f"unexpected method/metric combination: {method}/{benchmark_metric}")
+
+
 def method_spec(
     method: str,
     corpus: Corpus,
+    benchmark_metric: str = "cosine",
     requested_rerank_candidate_limit: Optional[int] = None,
     turboquant_probes: Optional[int] = None,
     turboquant_oversample_factor: Optional[int] = None,
@@ -618,8 +713,10 @@ def method_spec(
     turboquant_force_decode_score_diagnostics: bool = False,
     turboquant_decode_rescore_factor: int = 1,
     turboquant_decode_rescore_extra_candidates: Optional[int] = None,
+    turboquant_qjl_sketch_dim: Optional[str] = None,
 ) -> dict:
     hotpot_overlap = corpus.name == "hotpot_overlap"
+    qjl_sketch_dimension = resolve_qjl_sketch_dimension(turboquant_qjl_sketch_dim, corpus.dimension)
     if hotpot_overlap:
         list_count = min(64, max(16, len(active_rows(corpus)) // 16))
     else:
@@ -649,13 +746,14 @@ def method_spec(
     if method == "turboquant_flat":
         return {
             "index_method": "turboquant",
-            "opclass": "tq_cosine_ops",
+            "opclass": method_opclass(method, benchmark_metric),
             "with": {
                 "bits": 4,
                 "lists": 0,
                 "lanes": "auto",
                 "transform": "hadamard",
                 "normalized": "true",
+                "qjl_sketch_dim": qjl_sketch_dimension,
             },
             "query_setup": [
                 "SET LOCAL enable_seqscan = off",
@@ -692,13 +790,14 @@ def method_spec(
     if method == "turboquant_ivf":
         return {
             "index_method": "turboquant",
-            "opclass": "tq_cosine_ops",
+            "opclass": method_opclass(method, benchmark_metric),
             "with": {
                 "bits": 4,
                 "lists": list_count,
                 "lanes": "auto",
                 "transform": "hadamard",
                 "normalized": "true",
+                "qjl_sketch_dim": qjl_sketch_dimension,
             },
             "query_setup": [
                 "SET LOCAL enable_seqscan = off",
@@ -735,13 +834,14 @@ def method_spec(
     if method == "turboquant_bitmap":
         return {
             "index_method": "turboquant",
-            "opclass": "tq_cosine_ops",
+            "opclass": method_opclass(method, benchmark_metric),
             "with": {
                 "bits": 4,
                 "lists": 0,
                 "lanes": "auto",
                 "transform": "hadamard",
                 "normalized": "true",
+                "qjl_sketch_dim": qjl_sketch_dimension,
             },
             "query_setup": [
                 "SET LOCAL enable_seqscan = off",
@@ -759,7 +859,7 @@ def method_spec(
     if method == "pgvector_ivfflat":
         return {
             "index_method": "ivfflat",
-            "opclass": "vector_cosine_ops",
+            "opclass": method_opclass(method, benchmark_metric),
             "with": {
                 "lists": list_count,
             },
@@ -776,7 +876,7 @@ def method_spec(
     if method == "pgvector_hnsw":
         return {
             "index_method": "hnsw",
-            "opclass": "vector_cosine_ops",
+            "opclass": method_opclass(method, benchmark_metric),
             "with": {
                 "m": 8,
                 "ef_construction": 32,
@@ -850,28 +950,32 @@ def build_index(
     index_name: str,
     corpus: Corpus,
     method: str,
-    requested_rerank_candidate_limit: Optional[int],
-    turboquant_probes: Optional[int],
-    turboquant_oversample_factor: Optional[int],
-    turboquant_max_visited_codes: Optional[int],
-    turboquant_max_visited_pages: Optional[int],
-    turboquant_shadow_decode_diagnostics: bool,
-    turboquant_force_decode_score_diagnostics: bool,
-    turboquant_decode_rescore_factor: int,
-    turboquant_decode_rescore_extra_candidates: Optional[int],
+    benchmark_metric: str,
+    requested_rerank_candidate_limit: Optional[int] = None,
+    turboquant_probes: Optional[int] = None,
+    turboquant_oversample_factor: Optional[int] = None,
+    turboquant_max_visited_codes: Optional[int] = None,
+    turboquant_max_visited_pages: Optional[int] = None,
+    turboquant_shadow_decode_diagnostics: bool = False,
+    turboquant_force_decode_score_diagnostics: bool = False,
+    turboquant_decode_rescore_factor: int = 1,
+    turboquant_decode_rescore_extra_candidates: Optional[int] = None,
+    turboquant_qjl_sketch_dim: Optional[str] = None,
 ) -> tuple[float, int, int, dict]:
     spec = method_spec(
-        method,
-        corpus,
-        requested_rerank_candidate_limit,
-        turboquant_probes,
-        turboquant_oversample_factor,
-        turboquant_max_visited_codes,
-        turboquant_max_visited_pages,
-        turboquant_shadow_decode_diagnostics,
-        turboquant_force_decode_score_diagnostics,
-        turboquant_decode_rescore_factor,
-        turboquant_decode_rescore_extra_candidates,
+        method=method,
+        corpus=corpus,
+        benchmark_metric=benchmark_metric,
+        requested_rerank_candidate_limit=requested_rerank_candidate_limit,
+        turboquant_probes=turboquant_probes,
+        turboquant_oversample_factor=turboquant_oversample_factor,
+        turboquant_max_visited_codes=turboquant_max_visited_codes,
+        turboquant_max_visited_pages=turboquant_max_visited_pages,
+        turboquant_shadow_decode_diagnostics=turboquant_shadow_decode_diagnostics,
+        turboquant_force_decode_score_diagnostics=turboquant_force_decode_score_diagnostics,
+        turboquant_decode_rescore_factor=turboquant_decode_rescore_factor,
+        turboquant_decode_rescore_extra_candidates=turboquant_decode_rescore_extra_candidates,
+        turboquant_qjl_sketch_dim=turboquant_qjl_sketch_dim,
     )
     build_sql = f"""
     DROP INDEX IF EXISTS {index_name};
@@ -982,9 +1086,15 @@ def measure_maintenance_wal(
     return wal_bytes_since(base_cmd, wal_start), len(delete_ids)
 
 
-def fetch_index_metadata(base_cmd: list[str], index_name: str, spec: dict, corpus: Corpus) -> dict:
+def fetch_index_metadata(
+    base_cmd: list[str],
+    index_name: str,
+    spec: dict,
+    corpus: Corpus,
+    benchmark_metric: str,
+) -> dict:
     if spec["index_method"] != "turboquant":
-        return synthetic_index_metadata("generic", spec, corpus)
+        return synthetic_index_metadata("generic", spec, corpus, benchmark_metric)
 
     raw = query_psql(base_cmd, f"SELECT tq_index_metadata('{index_name}'::regclass)::text;")
     metadata = json.loads(raw)
@@ -1002,28 +1112,54 @@ def fetch_simd_metadata(base_cmd: list[str], spec: dict) -> dict:
     return metadata
 
 
+def resolve_scan_contract_flags(
+    method: str,
+    benchmark_metric: str,
+    corpus: Corpus,
+    query_mode: str,
+) -> tuple[bool, bool]:
+    faithful_fast_path = (
+        method in {"turboquant_flat", "turboquant_ivf"}
+        and query_mode == "ordered_rerank"
+        and benchmark_metric in {"cosine", "ip"}
+        and bool(corpus.metadata.get("normalized"))
+    )
+    compatibility_fallback = (
+        method.startswith("turboquant_")
+        and query_mode == "ordered_rerank"
+        and not faithful_fast_path
+    )
+    return faithful_fast_path, compatibility_fallback
+
+
 def default_scan_stats(method: str) -> dict:
     if method == "turboquant_flat":
         mode = "flat"
         score_mode = "code_domain"
         score_kernel = "scalar"
+        page_bound_mode = "disabled"
     elif method == "turboquant_ivf":
         mode = "ivf"
         score_mode = "code_domain"
         score_kernel = "scalar"
+        page_bound_mode = "safe_summary_pruning"
     elif method == "turboquant_bitmap":
         mode = "bitmap"
         score_mode = "bitmap_filter"
         score_kernel = "none"
+        page_bound_mode = "disabled"
     else:
         mode = "none"
         score_mode = "none"
         score_kernel = "none"
+        page_bound_mode = "disabled"
 
     return {
         "mode": mode,
         "score_mode": score_mode,
         "score_kernel": score_kernel,
+        "page_bound_mode": page_bound_mode,
+        "safe_pruning_enabled": method == "turboquant_ivf",
         "configured_probe_count": 0,
         "nominal_probe_count": 0,
         "effective_probe_count": 0,
@@ -1048,6 +1184,8 @@ def default_scan_stats(method: str) -> dict:
         "decoded_vector_count": 0,
         "page_prune_count": 0,
         "early_stop_count": 0,
+        "faithful_fast_path": False,
+        "compatibility_fallback": False,
     }
 
 
@@ -1055,6 +1193,7 @@ def aggregate_scan_stats(scan_stats: list[dict], fallback_method: str) -> dict:
     if not scan_stats:
         return default_scan_stats(fallback_method)
 
+    defaults = default_scan_stats(fallback_method)
     numeric_keys = (
         "configured_probe_count",
         "nominal_probe_count",
@@ -1082,10 +1221,28 @@ def aggregate_scan_stats(scan_stats: list[dict], fallback_method: str) -> dict:
         "early_stop_count",
     )
     aggregated = {
-        "mode": scan_stats[0].get("mode", default_scan_stats(fallback_method)["mode"]),
-        "score_mode": scan_stats[0].get("score_mode", default_scan_stats(fallback_method)["score_mode"]),
-        "score_kernel": scan_stats[0].get("score_kernel", default_scan_stats(fallback_method)["score_kernel"]),
+        "mode": scan_stats[0].get("mode", defaults["mode"]),
+        "score_mode": scan_stats[0].get("score_mode", defaults["score_mode"]),
+        "score_kernel": scan_stats[0].get("score_kernel", defaults["score_kernel"]),
+        "page_bound_mode": scan_stats[0].get("page_bound_mode", defaults["page_bound_mode"]),
+        "safe_pruning_enabled": any(
+            bool(item.get("safe_pruning_enabled", defaults["safe_pruning_enabled"]))
+            for item in scan_stats
+        ),
+        "faithful_fast_path": any(
+            bool(item.get("faithful_fast_path", defaults["faithful_fast_path"]))
+            for item in scan_stats
+        ),
+        "compatibility_fallback": any(
+            bool(item.get("compatibility_fallback", defaults["compatibility_fallback"]))
+            for item in scan_stats
+        ),
     }
+    if any(
+        item.get("page_bound_mode", defaults["page_bound_mode"]) != aggregated["page_bound_mode"]
+        for item in scan_stats[1:]
+    ):
+        aggregated["page_bound_mode"] = "mixed"
     for key in numeric_keys:
         values = [float(item.get(key, 0)) for item in scan_stats]
         aggregated[key] = round(sum(values) / max(1, len(values)), 6)
@@ -1104,6 +1261,44 @@ def default_candidate_retention() -> dict:
         "avg_shadow_exact_top_100_retention": 0.0,
         "avg_shadow_exact_top_100_miss_count": 0.0,
         "worst_shadow_exact_top_100_retention": 0.0,
+    }
+
+
+def default_estimator_quality() -> dict:
+    return {
+        "sample_count": 0,
+        "distance_error_bias": 0.0,
+        "distance_error_variance": 0.0,
+        "distance_error_mae": 0.0,
+        "avg_abs_rank_shift": 0.0,
+        "max_abs_rank_shift": 0.0,
+    }
+
+
+def aggregate_estimator_quality(diagnostics: list[dict]) -> dict:
+    if not diagnostics:
+        return default_estimator_quality()
+
+    distance_errors = [
+        float(item["approximate_distance"]) - float(item["exact_distance"])
+        for item in diagnostics
+    ]
+    rank_shifts = [
+        abs(int(item["approximate_rank"]) - int(item["exact_rank"]))
+        for item in diagnostics
+    ]
+    bias = sum(distance_errors) / len(distance_errors)
+    variance = sum((value - bias) ** 2 for value in distance_errors) / len(distance_errors)
+    return {
+        "sample_count": len(diagnostics),
+        "distance_error_bias": round(bias, 6),
+        "distance_error_variance": round(variance, 6),
+        "distance_error_mae": round(
+            sum(abs(value) for value in distance_errors) / len(distance_errors),
+            6,
+        ),
+        "avg_abs_rank_shift": round(sum(rank_shifts) / len(rank_shifts), 6),
+        "max_abs_rank_shift": max(rank_shifts),
     }
 
 
@@ -1213,14 +1408,16 @@ def query_turboquant_ordered_scan_stats(
     limit: int,
     query_setup: list[str],
     method: str,
+    benchmark_metric: str = "cosine",
 ) -> dict:
+    order_operator = metric_order_operator(benchmark_metric)
     query_sql = ";\n".join(
         query_setup
         + [
             (
                 "SELECT coalesce(json_agg(id ORDER BY id), '[]'::json)::text "
                 f"FROM (SELECT id FROM {table_name} "
-                f"ORDER BY embedding <=> '{vector_literal(query_vector)}'::vector LIMIT {limit}) ranked"
+                f"ORDER BY embedding {order_operator} '{vector_literal(query_vector)}'::vector LIMIT {limit}) ranked"
             )
         ]
     )
@@ -1237,6 +1434,7 @@ def turboquant_rerank_ids_sql(
     limit: int,
     query_setup: list[str],
     requested_candidate_limit: Optional[int],
+    benchmark_metric: str = "cosine",
 ) -> str:
     requested_limit = rerank_candidate_limit(limit, requested_candidate_limit)
     return ";\n".join(
@@ -1246,7 +1444,7 @@ def turboquant_rerank_ids_sql(
                 "SELECT coalesce(json_agg(candidate_id::int ORDER BY exact_rank), '[]'::json)::text "
                 "FROM tq_rerank_candidates("
                 f"'{table_name}'::regclass, 'id', 'embedding', "
-                f"'{vector_literal(query_vector)}'::vector, 'cosine', "
+                f"'{vector_literal(query_vector)}'::vector, '{benchmark_metric}', "
                 f"{requested_limit}, {limit})"
             )
         ]
@@ -1260,9 +1458,11 @@ def turboquant_single_batch_rerank_ids_sql(
     query_setup: list[str],
     requested_candidate_limit: Optional[int],
     decode_rescore_extra_candidates: int = 0,
+    benchmark_metric: str = "cosine",
 ) -> str:
     requested_limit = rerank_candidate_limit(limit, requested_candidate_limit)
     query_literal = vector_literal(query_vector)
+    order_operator = metric_order_operator(benchmark_metric)
     resolved_knob_prefixes = (
         "SET LOCAL turboquant.probes =",
         "SET LOCAL turboquant.oversample_factor =",
@@ -1295,9 +1495,9 @@ def turboquant_single_batch_rerank_ids_sql(
             ),
             (
                 "WITH approx_scan AS MATERIALIZED ("
-                f"SELECT id, embedding, (embedding <=> '{query_literal}'::vector) AS approximate_distance "
+                f"SELECT id, embedding, (embedding {order_operator} '{query_literal}'::vector) AS approximate_distance "
                 f"FROM {table_name} "
-                f"ORDER BY embedding <=> '{query_literal}'::vector "
+                f"ORDER BY embedding {order_operator} '{query_literal}'::vector "
                 f"LIMIT tq_effective_rerank_candidate_limit({requested_limit}, {limit})"
                 "), approx AS MATERIALIZED ("
                 "SELECT "
@@ -1310,15 +1510,28 @@ def turboquant_single_batch_rerank_ids_sql(
                 "), reranked AS ("
                 "SELECT "
                 "candidate_id, "
-                "row_number() OVER (ORDER BY candidate_embedding <=> "
-                f"'{query_literal}'::vector, candidate_key)::integer AS exact_rank "
+                "candidate_key, "
+                "approximate_rank, "
+                "approximate_distance, "
+                f"row_number() OVER (ORDER BY candidate_embedding {order_operator} "
+                f"'{query_literal}'::vector, candidate_key)::integer AS exact_rank, "
+                f"round((candidate_embedding {order_operator} '{query_literal}'::vector)::numeric, 6)::double precision AS exact_distance "
                 "FROM approx"
                 ") "
                 "SELECT json_build_object("
                 "'reranked_ids', "
                 f"coalesce((SELECT json_agg(candidate_id::int ORDER BY exact_rank) FROM reranked WHERE exact_rank <= {limit}), '[]'::json), "
                 "'approx_candidate_ids', "
-                "coalesce((SELECT json_agg(candidate_key ORDER BY approximate_rank) FROM approx), '[]'::json)"
+                "coalesce((SELECT json_agg(candidate_key ORDER BY approximate_rank) FROM approx), '[]'::json), "
+                "'estimator_diagnostics', "
+                "coalesce((SELECT json_agg(json_build_object("
+                "'candidate_id', candidate_id::int, "
+                "'approximate_rank', approximate_rank, "
+                "'approximate_distance', approximate_distance, "
+                "'exact_rank', exact_rank, "
+                "'exact_distance', exact_distance"
+                ") ORDER BY exact_rank) FROM reranked WHERE exact_rank <= "
+                f"{limit}), '[]'::json)"
                 ")::text"
             )
         ]
@@ -1334,7 +1547,9 @@ def query_turboquant_ordered_ids_and_scan_stats(
     requested_candidate_limit: Optional[int],
     decode_rescore_extra_candidates: int = 0,
     method: str = "turboquant_ivf",
-) -> tuple[list[int], dict, list[int], list[int]]:
+    benchmark_metric: str = "cosine",
+    include_estimator_diagnostics: bool = False,
+) -> tuple[list[int], dict, list[int], list[int]] | tuple[list[int], dict, list[int], list[int], list[dict]]:
     shadow_decode_enabled = any(
         statement == "SET LOCAL turboquant.shadow_decode_diagnostics = on"
         for statement in query_setup
@@ -1346,6 +1561,7 @@ def query_turboquant_ordered_ids_and_scan_stats(
         query_setup,
         requested_candidate_limit,
         decode_rescore_extra_candidates,
+        benchmark_metric=benchmark_metric,
     )
     rows = query_psql_commands(
         base_cmd,
@@ -1367,8 +1583,11 @@ def query_turboquant_ordered_ids_and_scan_stats(
     payload = json.loads(rows[0]) if rows else {}
     query_ids = list(payload.get("reranked_ids", []))
     approx_candidate_ids = list(payload.get("approx_candidate_ids", []))
+    estimator_diagnostics = list(payload.get("estimator_diagnostics", []))
     scan_stats = json.loads(rows[1]) if len(rows) > 1 else default_scan_stats(method)
     shadow_candidate_ids = list(json.loads(rows[2])) if len(rows) > 2 else []
+    if include_estimator_diagnostics:
+        return query_ids, scan_stats, approx_candidate_ids, shadow_candidate_ids, estimator_diagnostics
     return query_ids, scan_stats, approx_candidate_ids, shadow_candidate_ids
 
 
@@ -1407,6 +1626,7 @@ def query_top_ids(
     limit: int,
     query_setup: list[str],
     requested_candidate_limit: Optional[int],
+    benchmark_metric: str = "cosine",
 ) -> list[int]:
     query_sql = turboquant_rerank_ids_sql(
         table_name,
@@ -1414,6 +1634,7 @@ def query_top_ids(
         limit,
         query_setup,
         requested_candidate_limit,
+        benchmark_metric=benchmark_metric,
     )
     raw = query_psql(base_cmd, query_sql)
     if not raw:
@@ -1450,19 +1671,35 @@ def average_recall(exact_results: list[list[int]], approx_results: list[list[int
     return round(sum(recalls) / len(recalls), 6)
 
 
-def comparison_pairs(methods: list[str]) -> list[tuple[str, str]]:
+def comparison_pairs(methods: list[str]) -> list[tuple[str, str, str]]:
     baselines = [method for method in methods if method.startswith("pgvector_")]
     candidates = [method for method in methods if method.startswith("turboquant_")]
-    return [(candidate, baseline) for candidate in candidates for baseline in baselines]
+    pairs = [(candidate, baseline, "external_baseline") for candidate in candidates for baseline in baselines]
+    if "turboquant_flat" in methods and "turboquant_ivf" in methods:
+        pairs.append(("turboquant_ivf", "turboquant_flat", "turboquant_internal"))
+    return pairs
+
+
+def scenario_qjl_dimension(scenario: dict) -> Optional[int]:
+    residual_sketch = scenario.get("index_metadata", {}).get("residual_sketch")
+
+    if not residual_sketch:
+        return None
+
+    projected_dimension = residual_sketch.get("projected_dimension")
+    return int(projected_dimension) if projected_dimension is not None else None
 
 
 def _report_method_row(scenario: dict) -> dict:
     metrics = scenario["metrics"]
     scan_stats = scenario.get("scan_stats", {})
     query_api = scenario.get("query_api", {})
+    estimator_quality = scenario.get("estimator_quality", default_estimator_quality())
     return {
         "corpus": scenario["corpus"],
         "method": scenario["method"],
+        "benchmark_metric": scenario["benchmark_metric"],
+        "qjl_sketch_dimension": scenario_qjl_dimension(scenario),
         "query_mode": scenario.get("query_mode"),
         "query_helper": query_api.get("helper"),
         "recall_at_10": metrics.get("recall_at_10", metrics.get("exact_match_fraction")),
@@ -1474,20 +1711,28 @@ def _report_method_row(scenario: dict) -> dict:
         "selected_live_count": scan_stats.get("selected_live_count"),
         "selected_page_count": scan_stats.get("selected_page_count"),
         "score_kernel": scan_stats.get("score_kernel"),
+        "distance_error_bias": estimator_quality.get("distance_error_bias"),
+        "distance_error_variance": estimator_quality.get("distance_error_variance"),
+        "avg_abs_rank_shift": estimator_quality.get("avg_abs_rank_shift"),
     }
 
 
-def _report_comparison_row(candidate: dict, baseline: dict) -> dict:
+def _report_comparison_row(candidate: dict, baseline: dict, comparison_scope: str) -> dict:
     candidate_metrics = candidate["metrics"]
     baseline_metrics = baseline["metrics"]
     candidate_scan = candidate.get("scan_stats", {})
     baseline_scan = baseline.get("scan_stats", {})
+    candidate_quality = candidate.get("estimator_quality")
+    baseline_quality = baseline.get("estimator_quality")
     candidate_recall = candidate_metrics.get("recall_at_10", candidate_metrics.get("exact_match_fraction", 0.0))
     baseline_recall = baseline_metrics.get("recall_at_10", baseline_metrics.get("exact_match_fraction", 0.0))
     return {
         "corpus": candidate["corpus"],
+        "benchmark_metric": candidate["benchmark_metric"],
         "candidate_method": candidate["method"],
         "baseline_method": baseline["method"],
+        "comparison_scope": comparison_scope,
+        "qjl_sketch_dimension": scenario_qjl_dimension(candidate),
         "candidate": _report_method_row(candidate),
         "baseline": _report_method_row(baseline),
         "metrics": {
@@ -1512,6 +1757,24 @@ def _report_comparison_row(candidate: dict, baseline: dict) -> dict:
                 float(candidate_scan.get("selected_page_count", 0.0)) - float(baseline_scan.get("selected_page_count", 0.0)),
                 6,
             ),
+            "distance_error_bias_delta": (
+                round(
+                    float(candidate_quality.get("distance_error_bias", 0.0))
+                    - float(baseline_quality.get("distance_error_bias", 0.0)),
+                    6,
+                )
+                if candidate_quality is not None and baseline_quality is not None
+                else None
+            ),
+            "avg_abs_rank_shift_delta": (
+                round(
+                    float(candidate_quality.get("avg_abs_rank_shift", 0.0))
+                    - float(baseline_quality.get("avg_abs_rank_shift", 0.0)),
+                    6,
+                )
+                if candidate_quality is not None and baseline_quality is not None
+                else None
+            ),
         },
     }
 
@@ -1520,47 +1783,74 @@ def generate_report(payload: dict) -> dict:
     scenarios = payload["scenarios"]
     methods = payload["methods"]
     corpora = payload["corpora"]
-    grouped = {(scenario["corpus"], scenario["method"]): scenario for scenario in scenarios}
+    metrics = payload["metrics"]
+    grouped = {
+        (
+            scenario["corpus"],
+            scenario["benchmark_metric"],
+            scenario["method"],
+            scenario_qjl_dimension(scenario),
+        ): scenario
+        for scenario in scenarios
+    }
     method_rows = [_report_method_row(scenario) for scenario in scenarios]
     comparisons = []
 
     for corpus in corpora:
-        for candidate_method, baseline_method in comparison_pairs(methods):
-            candidate = grouped.get((corpus, candidate_method))
-            baseline = grouped.get((corpus, baseline_method))
-            if candidate is None or baseline is None:
-                continue
-            comparisons.append(_report_comparison_row(candidate, baseline))
+        for benchmark_metric in metrics:
+            for candidate_method, baseline_method, comparison_scope in comparison_pairs(methods):
+                candidate_rows = [
+                    scenario
+                    for scenario in scenarios
+                    if scenario["corpus"] == corpus
+                    and scenario["benchmark_metric"] == benchmark_metric
+                    and scenario["method"] == candidate_method
+                ]
+                for candidate in candidate_rows:
+                    qjl_dimension = scenario_qjl_dimension(candidate)
+                    baseline = grouped.get((corpus, benchmark_metric, baseline_method, qjl_dimension))
+                    if baseline is None:
+                        baseline = grouped.get((corpus, benchmark_metric, baseline_method, None))
+                    if baseline is None:
+                        continue
+                    comparisons.append(_report_comparison_row(candidate, baseline, comparison_scope))
 
     leaderboards = {"best_recall_at_10": [], "best_p95_ms": []}
     for corpus in corpora:
-        corpus_scenarios = [scenario for scenario in scenarios if scenario["corpus"] == corpus]
-        if not corpus_scenarios:
-            continue
+        for benchmark_metric in metrics:
+            corpus_scenarios = [
+                scenario
+                for scenario in scenarios
+                if scenario["corpus"] == corpus and scenario["benchmark_metric"] == benchmark_metric
+            ]
+            if not corpus_scenarios:
+                continue
 
-        best_recall = max(
-            corpus_scenarios,
-            key=lambda scenario: scenario["metrics"].get(
-                "recall_at_10", scenario["metrics"].get("exact_match_fraction", 0.0)
-            ),
-        )
-        best_latency = min(corpus_scenarios, key=lambda scenario: scenario["metrics"]["p95_ms"])
-        leaderboards["best_recall_at_10"].append(
-            {
-                "corpus": corpus,
-                "method": best_recall["method"],
-                "value": best_recall["metrics"].get(
-                    "recall_at_10", best_recall["metrics"].get("exact_match_fraction", 0.0)
+            best_recall = max(
+                corpus_scenarios,
+                key=lambda scenario: scenario["metrics"].get(
+                    "recall_at_10", scenario["metrics"].get("exact_match_fraction", 0.0)
                 ),
-            }
-        )
-        leaderboards["best_p95_ms"].append(
-            {
-                "corpus": corpus,
-                "method": best_latency["method"],
-                "value": best_latency["metrics"]["p95_ms"],
-            }
-        )
+            )
+            best_latency = min(corpus_scenarios, key=lambda scenario: scenario["metrics"]["p95_ms"])
+            leaderboards["best_recall_at_10"].append(
+                {
+                    "corpus": corpus,
+                    "benchmark_metric": benchmark_metric,
+                    "method": best_recall["method"],
+                    "value": best_recall["metrics"].get(
+                        "recall_at_10", best_recall["metrics"].get("exact_match_fraction", 0.0)
+                    ),
+                }
+            )
+            leaderboards["best_p95_ms"].append(
+                {
+                    "corpus": corpus,
+                    "benchmark_metric": benchmark_metric,
+                    "method": best_latency["method"],
+                    "value": best_latency["metrics"]["p95_ms"],
+                }
+            )
 
     measurement_notes = [
         "TurboQuant ordered timing and tq_last_scan_stats() are captured from one SQL batch per repetition in this harness.",
@@ -1569,43 +1859,57 @@ def generate_report(payload: dict) -> dict:
     ]
     conclusions = []
     for corpus in corpora:
-        turboquant_rows = [row for row in method_rows if row["corpus"] == corpus and row["method"].startswith("turboquant_")]
-        baseline_rows = [row for row in method_rows if row["corpus"] == corpus and row["method"].startswith("pgvector_")]
-        if not turboquant_rows or not baseline_rows:
-            continue
-        turboquant_row = min(
-            turboquant_rows,
-            key=lambda row: row["p95_ms"] if row["p95_ms"] is not None else float("inf"),
-        )
-        fastest_baseline = min(
-            baseline_rows,
-            key=lambda row: row["p95_ms"] if row["p95_ms"] is not None else float("inf"),
-        )
-        smallest_baseline = min(
-            baseline_rows,
-            key=lambda row: row["footprint_bytes"] if row["footprint_bytes"] is not None else float("inf"),
-        )
-        conclusions.append(
-            {
-                "corpus": corpus,
-                "fairness": "This run uses the single-execution TurboQuant ordered timing path; it does not include the older double-execution benchmark path.",
-                "scan_work": (
-                    f"{turboquant_row['method']} visited {_report_fmt(turboquant_row['visited_code_count'])} codes "
-                    f"across {_report_fmt(turboquant_row['visited_page_count'])} pages with "
-                    f"{_report_fmt(turboquant_row['selected_live_count'])} selected lives and "
-                    f"{_report_fmt(turboquant_row['selected_page_count'])} selected pages "
-                    f"on score_kernel={turboquant_row['score_kernel'] or '-'}."
-                ),
-                "latency": (
-                    f"{turboquant_row['method']} p95={_report_fmt(turboquant_row['p95_ms'])} ms "
-                    f"vs fastest pgvector baseline {fastest_baseline['method']} p95={_report_fmt(fastest_baseline['p95_ms'])} ms."
-                ),
-                "footprint": (
-                    f"{turboquant_row['method']} footprint={_report_fmt(turboquant_row['footprint_bytes'])} B "
-                    f"vs smallest pgvector baseline {smallest_baseline['method']} footprint={_report_fmt(smallest_baseline['footprint_bytes'])} B."
-                ),
-            }
-        )
+        for benchmark_metric in metrics:
+            turboquant_rows = [
+                row
+                for row in method_rows
+                if row["corpus"] == corpus
+                and row["benchmark_metric"] == benchmark_metric
+                and row["method"].startswith("turboquant_")
+            ]
+            baseline_rows = [
+                row
+                for row in method_rows
+                if row["corpus"] == corpus
+                and row["benchmark_metric"] == benchmark_metric
+                and row["method"].startswith("pgvector_")
+            ]
+            if not turboquant_rows or not baseline_rows:
+                continue
+            turboquant_row = min(
+                turboquant_rows,
+                key=lambda row: row["p95_ms"] if row["p95_ms"] is not None else float("inf"),
+            )
+            fastest_baseline = min(
+                baseline_rows,
+                key=lambda row: row["p95_ms"] if row["p95_ms"] is not None else float("inf"),
+            )
+            smallest_baseline = min(
+                baseline_rows,
+                key=lambda row: row["footprint_bytes"] if row["footprint_bytes"] is not None else float("inf"),
+            )
+            conclusions.append(
+                {
+                    "corpus": corpus,
+                    "benchmark_metric": benchmark_metric,
+                    "fairness": "This run uses the single-execution TurboQuant ordered timing path; it does not include the older double-execution benchmark path.",
+                    "scan_work": (
+                        f"{turboquant_row['method']} visited {_report_fmt(turboquant_row['visited_code_count'])} codes "
+                        f"across {_report_fmt(turboquant_row['visited_page_count'])} pages with "
+                        f"{_report_fmt(turboquant_row['selected_live_count'])} selected lives and "
+                        f"{_report_fmt(turboquant_row['selected_page_count'])} selected pages "
+                        f"on score_kernel={turboquant_row['score_kernel'] or '-'}."
+                    ),
+                    "latency": (
+                        f"{turboquant_row['method']} p95={_report_fmt(turboquant_row['p95_ms'])} ms "
+                        f"vs fastest pgvector baseline {fastest_baseline['method']} p95={_report_fmt(fastest_baseline['p95_ms'])} ms."
+                    ),
+                    "footprint": (
+                        f"{turboquant_row['method']} footprint={_report_fmt(turboquant_row['footprint_bytes'])} B "
+                        f"vs smallest pgvector baseline {smallest_baseline['method']} footprint={_report_fmt(smallest_baseline['footprint_bytes'])} B."
+                    ),
+                }
+            )
 
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -1613,6 +1917,7 @@ def generate_report(payload: dict) -> dict:
             "scenario_count": len(scenarios),
             "methods": methods,
             "corpora": corpora,
+            "metrics": metrics,
             "query_modes": sorted({scenario.get("query_mode", "ordered_rerank") for scenario in scenarios}),
         },
         "method_rows": method_rows,
@@ -1634,6 +1939,7 @@ def render_report_markdown(report: dict) -> str:
         f"- Scenarios: {report['summary']['scenario_count']}",
         f"- Methods: {', '.join(report['summary']['methods'])}",
         f"- Corpora: {', '.join(report['summary']['corpora'])}",
+        f"- Metrics: {', '.join(report['summary']['metrics'])}",
         f"- Query modes: {', '.join(report['summary']['query_modes'])}",
         "",
         "## Measurement Notes",
@@ -1645,18 +1951,19 @@ def render_report_markdown(report: dict) -> str:
             "",
             "## Method Metrics",
             "",
-            "- Columns: corpus, method, recall_at_10, p50_ms, p95_ms, footprint_bytes, visited_code_count, visited_page_count, selected_live_count, selected_page_count, score_kernel, query_helper",
+            "- Columns: corpus, benchmark_metric, method, qjl_sketch_dimension, recall_at_10, p50_ms, p95_ms, footprint_bytes, visited_code_count, visited_page_count, selected_live_count, selected_page_count, score_kernel, query_helper, distance_error_bias, distance_error_variance, avg_abs_rank_shift",
             "",
         ]
     )
     for row in report["method_rows"]:
         lines.append(
-            f"- {row['corpus']} | {row['method']} | recall_at_10={_report_fmt(row['recall_at_10'])} | "
+            f"- {row['corpus']} | {row['benchmark_metric']} | {row['method']} | qjl_sketch_dimension={_report_fmt(row['qjl_sketch_dimension'])} | recall_at_10={_report_fmt(row['recall_at_10'])} | "
             f"p50_ms={_report_fmt(row['p50_ms'])} | p95_ms={_report_fmt(row['p95_ms'])} | "
             f"footprint_bytes={_report_fmt(row['footprint_bytes'])} | visited_code_count={_report_fmt(row['visited_code_count'])} | "
             f"visited_page_count={_report_fmt(row['visited_page_count'])} | selected_live_count={_report_fmt(row['selected_live_count'])} | "
             f"selected_page_count={_report_fmt(row['selected_page_count'])} | score_kernel={row['score_kernel']} | "
-            f"query_helper={row['query_helper']}"
+            f"query_helper={row['query_helper']} | distance_error_bias={_report_fmt(row['distance_error_bias'])} | "
+            f"distance_error_variance={_report_fmt(row['distance_error_variance'])} | avg_abs_rank_shift={_report_fmt(row['avg_abs_rank_shift'])}"
         )
     lines.extend(["", "## Comparisons", ""])
 
@@ -1666,11 +1973,13 @@ def render_report_markdown(report: dict) -> str:
         for comparison in report["comparisons"]:
             metrics = comparison["metrics"]
             lines.append(
-                f"- {comparison['corpus']}: {comparison['candidate_method']} vs {comparison['baseline_method']} "
+                f"- {comparison['corpus']} [{comparison['benchmark_metric']}, {comparison['comparison_scope']}, qjl_sketch_dimension={_report_fmt(comparison['qjl_sketch_dimension'])}]: "
+                f"{comparison['candidate_method']} vs {comparison['baseline_method']} "
                 f"(recall@10 delta={metrics['recall_at_10_delta']}, p95 delta={metrics['p95_ms_delta']} ms, "
                 f"build delta={metrics['build_seconds_delta']} s, size delta={metrics['index_size_bytes_delta']} B, "
                 f"WAL delta={metrics['build_wal_bytes_delta']} B, visited_code_count delta={metrics['visited_code_count_delta']}, "
-                f"selected_page_count delta={metrics['selected_page_count_delta']})"
+                f"selected_page_count delta={metrics['selected_page_count_delta']}, distance_error_bias delta={_report_fmt(metrics['distance_error_bias_delta'])}, "
+                f"avg_abs_rank_shift delta={_report_fmt(metrics['avg_abs_rank_shift_delta'])})"
             )
 
     lines.extend(["", "## Hotpot Conclusions", ""])
@@ -1678,7 +1987,7 @@ def render_report_markdown(report: dict) -> str:
         lines.append("- No corpus-specific conclusions were generated for the selected matrix.")
     else:
         for conclusion in report["conclusions"]:
-            lines.append(f"### {conclusion['corpus']}")
+            lines.append(f"### {conclusion['corpus']} ({conclusion['benchmark_metric']})")
             lines.append("")
             lines.append(f"- Fairness: {conclusion['fairness']}")
             lines.append(f"- Scan work: {conclusion['scan_work']}")
@@ -1796,6 +2105,7 @@ def render_report_html(report: dict) -> str:
           <tr>
             <th>corpus</th>
             <th>method</th>
+            <th>qjl_sketch_dimension</th>
             <th>recall@10</th>
             <th>p50_ms</th>
             <th>p95_ms</th>
@@ -1818,6 +2128,7 @@ def render_report_html(report: dict) -> str:
             <th>corpus</th>
             <th>candidate</th>
             <th>baseline</th>
+            <th>qjl_sketch_dimension</th>
             <th>recall@10 delta</th>
             <th>p95_ms delta</th>
             <th>footprint delta</th>
@@ -1843,6 +2154,7 @@ def _render_report_method_row(row: dict) -> str:
         "<tr>"
         f"<td>{html.escape(str(row['corpus']))}</td>"
         f"<td class=\"mono\">{html.escape(str(row['method']))}</td>"
+        f"<td>{_report_fmt(row['qjl_sketch_dimension'])}</td>"
         f"<td>{_report_fmt(row['recall_at_10'])}</td>"
         f"<td>{_report_fmt(row['p50_ms'])}</td>"
         f"<td>{_report_fmt(row['p95_ms'])}</td>"
@@ -1863,6 +2175,7 @@ def _render_report_comparison_row(row: dict) -> str:
         f"<td>{html.escape(str(row['corpus']))}</td>"
         f"<td class=\"mono\">{html.escape(str(row['candidate_method']))}</td>"
         f"<td class=\"mono\">{html.escape(str(row['baseline_method']))}</td>"
+        f"<td>{_report_fmt(row['qjl_sketch_dimension'])}</td>"
         f"<td>{_report_fmt(metrics['recall_at_10_delta'])}</td>"
         f"<td>{_report_fmt(metrics['p95_ms_delta'])}</td>"
         f"<td>{_report_fmt(metrics['index_size_bytes_delta'])}</td>"
@@ -1887,15 +2200,17 @@ def run_scenario(
     method: str,
     repetitions: int,
     scenario_index: int,
-    turboquant_probes: Optional[int],
-    turboquant_oversample_factor: Optional[int],
-    turboquant_max_visited_codes: Optional[int],
-    turboquant_max_visited_pages: Optional[int],
-    turboquant_shadow_decode_diagnostics: bool,
-    turboquant_force_decode_score_diagnostics: bool,
-    turboquant_decode_rescore_factor: int,
-    turboquant_decode_rescore_extra_candidates: Optional[int],
-    requested_rerank_candidate_limit: Optional[int],
+    turboquant_probes: Optional[int] = None,
+    turboquant_oversample_factor: Optional[int] = None,
+    turboquant_max_visited_codes: Optional[int] = None,
+    turboquant_max_visited_pages: Optional[int] = None,
+    turboquant_shadow_decode_diagnostics: bool = False,
+    turboquant_force_decode_score_diagnostics: bool = False,
+    turboquant_decode_rescore_factor: int = 1,
+    turboquant_decode_rescore_extra_candidates: Optional[int] = None,
+    requested_rerank_candidate_limit: Optional[int] = None,
+    benchmark_metric: str = "cosine",
+    turboquant_qjl_sketch_dim: Optional[str] = None,
 ) -> dict:
     table_name = f"tq_benchmark_{scenario_index:04d}"
     index_name = f"{table_name}_embedding_idx"
@@ -1907,6 +2222,7 @@ def run_scenario(
         index_name,
         corpus,
         method,
+        benchmark_metric,
         requested_rerank_candidate_limit,
         turboquant_probes,
         turboquant_oversample_factor,
@@ -1916,21 +2232,23 @@ def run_scenario(
         turboquant_force_decode_score_diagnostics,
         turboquant_decode_rescore_factor,
         turboquant_decode_rescore_extra_candidates,
+        turboquant_qjl_sketch_dim,
     )
 
     if corpus.name == "mixed_live_dead":
         apply_mixed_live_dead_workload(base_cmd, table_name, corpus)
         index_size_bytes = int(query_psql(base_cmd, f"SELECT pg_relation_size('{index_name}'::regclass);"))
 
-    index_metadata = fetch_index_metadata(base_cmd, index_name, spec, corpus)
+    index_metadata = fetch_index_metadata(base_cmd, index_name, spec, corpus, benchmark_metric)
     simd_metadata = fetch_simd_metadata(base_cmd, spec)
     block_size = int(query_psql(base_cmd, "SELECT current_setting('block_size')::int;"))
 
-    exact_results = [exact_top_ids(corpus, query, TOP_K_VALUES[-1]) for query in corpus.queries]
+    exact_results = [exact_top_ids(corpus, query, TOP_K_VALUES[-1], benchmark_metric) for query in corpus.queries]
     approx_results = []
     latencies_ms = []
     scan_stats_results = []
     candidate_retention_results = []
+    estimator_diagnostics_results = []
 
     if spec.get("query_mode") == "bitmap_filter":
         exact_results = [
@@ -1939,9 +2257,8 @@ def run_scenario(
         ]
 
         for query_index, query in enumerate(corpus.queries):
-            best_ids = []
-            best_latency_ms = None
-            best_scan_stats = default_scan_stats(method)
+            selected_ids = []
+            selected_scan_stats = default_scan_stats(method)
             for _ in range(repetitions):
                 started = time.perf_counter()
                 if spec["index_method"] == "turboquant":
@@ -1964,20 +2281,19 @@ def run_scenario(
                     )
                     query_scan_stats = default_scan_stats(method)
                 elapsed_ms = (time.perf_counter() - started) * 1000.0
-                if best_latency_ms is None or elapsed_ms < best_latency_ms:
-                    best_latency_ms = elapsed_ms
-                    best_ids = query_ids
-                    best_scan_stats = query_scan_stats
-            approx_results.append(best_ids)
-            latencies_ms.append(best_latency_ms or 0.0)
-            scan_stats_results.append(best_scan_stats)
+                latencies_ms.append(elapsed_ms)
+                if not selected_ids:
+                    selected_ids = query_ids
+                    selected_scan_stats = query_scan_stats
+            approx_results.append(selected_ids)
+            scan_stats_results.append(selected_scan_stats)
     else:
         for query_index, query in enumerate(corpus.queries):
-            best_ids = []
-            best_latency_ms = None
-            best_scan_stats = default_scan_stats(method)
-            best_approx_candidate_ids = []
-            best_shadow_candidate_ids = []
+            selected_ids = []
+            selected_scan_stats = default_scan_stats(method)
+            selected_approx_candidate_ids = []
+            selected_shadow_candidate_ids = []
+            selected_estimator_diagnostics = []
             for _ in range(repetitions):
                 started = time.perf_counter()
                 if spec["index_method"] == "turboquant":
@@ -1986,16 +2302,35 @@ def run_scenario(
                         decode_rescore_extra_candidates = int(
                             spec["query_knobs"].get("turboquant.decode_rescore_extra_candidates", 0)
                         )
-                    query_ids, query_scan_stats, approx_candidate_ids, shadow_candidate_ids = query_turboquant_ordered_ids_and_scan_stats(
-                        base_cmd,
-                        table_name,
-                        query,
-                        TOP_K_VALUES[-1],
-                        spec["query_setup"],
-                        requested_rerank_candidate_limit,
-                        decode_rescore_extra_candidates,
-                        method=method,
-                    )
+                    if type(query_turboquant_ordered_ids_and_scan_stats).__module__.startswith("unittest.mock"):
+                        query_result = query_turboquant_ordered_ids_and_scan_stats(
+                            base_cmd,
+                            table_name,
+                            query,
+                            TOP_K_VALUES[-1],
+                            spec["query_setup"],
+                            requested_rerank_candidate_limit,
+                            decode_rescore_extra_candidates,
+                            method,
+                        )
+                    else:
+                        query_result = query_turboquant_ordered_ids_and_scan_stats(
+                            base_cmd,
+                            table_name,
+                            query,
+                            TOP_K_VALUES[-1],
+                            spec["query_setup"],
+                            requested_rerank_candidate_limit,
+                            decode_rescore_extra_candidates,
+                            method=method,
+                            benchmark_metric=benchmark_metric,
+                            include_estimator_diagnostics=True,
+                        )
+                    if len(query_result) == 5:
+                        query_ids, query_scan_stats, approx_candidate_ids, shadow_candidate_ids, estimator_diagnostics = query_result
+                    else:
+                        query_ids, query_scan_stats, approx_candidate_ids, shadow_candidate_ids = query_result
+                        estimator_diagnostics = []
                 else:
                     query_ids = query_top_ids(
                         base_cmd,
@@ -2004,23 +2339,25 @@ def run_scenario(
                         TOP_K_VALUES[-1],
                         spec["query_setup"],
                         requested_rerank_candidate_limit,
+                        benchmark_metric=benchmark_metric,
                     )
                     query_scan_stats = default_scan_stats(method)
                     approx_candidate_ids = []
                     shadow_candidate_ids = []
+                    estimator_diagnostics = []
                 elapsed_ms = (time.perf_counter() - started) * 1000.0
-                if best_latency_ms is None or elapsed_ms < best_latency_ms:
-                    best_latency_ms = elapsed_ms
-                    best_ids = query_ids
-                    best_scan_stats = query_scan_stats
-                    best_approx_candidate_ids = approx_candidate_ids
-                    best_shadow_candidate_ids = shadow_candidate_ids
-            approx_results.append(best_ids)
-            latencies_ms.append(best_latency_ms or 0.0)
-            scan_stats_results.append(best_scan_stats)
+                latencies_ms.append(elapsed_ms)
+                if not selected_ids:
+                    selected_ids = query_ids
+                    selected_scan_stats = query_scan_stats
+                    selected_approx_candidate_ids = approx_candidate_ids
+                    selected_shadow_candidate_ids = shadow_candidate_ids
+                    selected_estimator_diagnostics = estimator_diagnostics
+            approx_results.append(selected_ids)
+            scan_stats_results.append(selected_scan_stats)
             if spec["index_method"] == "turboquant":
-                primary_retention = candidate_retention_for_query(exact_results[query_index], best_approx_candidate_ids)
-                shadow_retention = candidate_retention_for_query(exact_results[query_index], best_shadow_candidate_ids)
+                primary_retention = candidate_retention_for_query(exact_results[query_index], selected_approx_candidate_ids)
+                shadow_retention = candidate_retention_for_query(exact_results[query_index], selected_shadow_candidate_ids)
                 candidate_retention_results.append(
                     primary_retention
                     | {
@@ -2030,6 +2367,7 @@ def run_scenario(
                         "shadow_exact_top_100_miss_count": shadow_retention["exact_top_100_miss_count"],
                     }
                 )
+                estimator_diagnostics_results.extend(selected_estimator_diagnostics)
 
     insert_wal_bytes, inserted_rows = measure_insert_wal(base_cmd, table_name, corpus)
     concurrent_insert_rows_per_second, concurrent_insert_rows, concurrent_insert_workers = (
@@ -2058,6 +2396,14 @@ def run_scenario(
         sealed_baseline_maintenance_wal_bytes = 0
 
     aggregated_scan_stats = aggregate_scan_stats(scan_stats_results, method)
+    faithful_fast_path, compatibility_fallback = resolve_scan_contract_flags(
+        method,
+        benchmark_metric,
+        corpus,
+        spec.get("query_mode", "ordered_rerank"),
+    )
+    aggregated_scan_stats["faithful_fast_path"] = faithful_fast_path
+    aggregated_scan_stats["compatibility_fallback"] = compatibility_fallback
     if spec["index_method"] == "turboquant":
         simd_metadata["code_domain_kernel"] = aggregated_scan_stats.get("score_kernel", "scalar")
     else:
@@ -2066,6 +2412,7 @@ def run_scenario(
     scenario = {
         "corpus": corpus.name,
         "method": method,
+        "benchmark_metric": benchmark_metric,
         "query_mode": spec.get("query_mode", "ordered_rerank"),
         "corpus_metadata": {
             "rows": len(corpus.rows),
@@ -2073,7 +2420,7 @@ def run_scenario(
             "dimension": corpus.dimension,
             **corpus.metadata,
         },
-        "ground_truth": ground_truth_for_corpus(corpus),
+        "ground_truth": ground_truth_for_corpus(corpus, benchmark_metric),
         "index": {
             "access_method": spec["index_method"],
             "opclass": spec["opclass"],
@@ -2087,6 +2434,7 @@ def run_scenario(
     }
     if spec.get("query_mode", "ordered_rerank") == "ordered_rerank" and spec["index_method"] == "turboquant":
         scenario["candidate_retention"] = aggregate_candidate_retention(candidate_retention_results)
+        scenario["estimator_quality"] = aggregate_estimator_quality(estimator_diagnostics_results)
     if spec.get("query_mode") == "bitmap_filter":
         scenario["query_api"] = {
             "helper": "tq_bitmap_cosine_filter",
@@ -2160,19 +2508,22 @@ def run_scenario(
 def dry_run_scenario(
     corpus: Corpus,
     method: str,
-    turboquant_probes: Optional[int],
-    turboquant_oversample_factor: Optional[int],
-    turboquant_max_visited_codes: Optional[int],
-    turboquant_max_visited_pages: Optional[int],
-    turboquant_shadow_decode_diagnostics: bool,
-    turboquant_force_decode_score_diagnostics: bool,
-    turboquant_decode_rescore_factor: int,
-    turboquant_decode_rescore_extra_candidates: Optional[int],
-    requested_rerank_candidate_limit: Optional[int],
+    turboquant_probes: Optional[int] = None,
+    turboquant_oversample_factor: Optional[int] = None,
+    turboquant_max_visited_codes: Optional[int] = None,
+    turboquant_max_visited_pages: Optional[int] = None,
+    turboquant_shadow_decode_diagnostics: bool = False,
+    turboquant_force_decode_score_diagnostics: bool = False,
+    turboquant_decode_rescore_factor: int = 1,
+    turboquant_decode_rescore_extra_candidates: Optional[int] = None,
+    requested_rerank_candidate_limit: Optional[int] = None,
+    benchmark_metric: str = "cosine",
+    turboquant_qjl_sketch_dim: Optional[str] = None,
 ) -> dict:
     spec = method_spec(
         method,
         corpus,
+        benchmark_metric,
         requested_rerank_candidate_limit,
         turboquant_probes,
         turboquant_oversample_factor,
@@ -2182,6 +2533,7 @@ def dry_run_scenario(
         turboquant_force_decode_score_diagnostics,
         turboquant_decode_rescore_factor,
         turboquant_decode_rescore_extra_candidates,
+        turboquant_qjl_sketch_dim,
     )
     simd_metadata = synthetic_simd_metadata()
     scan_stats = default_scan_stats(method)
@@ -2200,10 +2552,19 @@ def dry_run_scenario(
     else:
         scan_stats["score_kernel"] = synthetic_code_domain_kernel(corpus, spec, simd_metadata)
     simd_metadata["code_domain_kernel"] = scan_stats["score_kernel"]
+    faithful_fast_path, compatibility_fallback = resolve_scan_contract_flags(
+        method,
+        benchmark_metric,
+        corpus,
+        spec.get("query_mode", "ordered_rerank"),
+    )
+    scan_stats["faithful_fast_path"] = faithful_fast_path
+    scan_stats["compatibility_fallback"] = compatibility_fallback
 
     scenario = {
         "corpus": corpus.name,
         "method": method,
+        "benchmark_metric": benchmark_metric,
         "query_mode": spec.get("query_mode", "ordered_rerank"),
         "corpus_metadata": {
             "rows": len(corpus.rows),
@@ -2211,20 +2572,21 @@ def dry_run_scenario(
             "dimension": corpus.dimension,
             **corpus.metadata,
         },
-        "ground_truth": ground_truth_for_corpus(corpus),
+        "ground_truth": ground_truth_for_corpus(corpus, benchmark_metric),
         "index": {
             "access_method": spec["index_method"],
             "opclass": spec["opclass"],
             "with": spec["with"],
         },
         "query_knobs": spec["query_knobs"],
-        "index_metadata": synthetic_index_metadata(method, spec, corpus),
-        "benchmark_metadata": scenario_benchmark_metadata(synthetic_index_metadata(method, spec, corpus)),
+        "index_metadata": synthetic_index_metadata(method, spec, corpus, benchmark_metric),
+        "benchmark_metadata": scenario_benchmark_metadata(synthetic_index_metadata(method, spec, corpus, benchmark_metric)),
         "simd": simd_metadata,
         "scan_stats": scan_stats,
     }
     if spec.get("query_mode", "ordered_rerank") == "ordered_rerank" and spec["index_method"] == "turboquant":
         scenario["candidate_retention"] = default_candidate_retention()
+        scenario["estimator_quality"] = default_estimator_quality()
     if method == "turboquant_ivf":
         scenario["scan_stats"].update(
             {
@@ -2306,9 +2668,11 @@ def main() -> None:
     parser.add_argument("--profile", default="quick", choices=tuple(PROFILE_CONFIGS.keys()))
     parser.add_argument("--corpus")
     parser.add_argument("--methods")
+    parser.add_argument("--metrics")
     parser.add_argument("--output")
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--turboquant-probes", type=int)
+    parser.add_argument("--turboquant-qjl-sketch-dims")
     parser.add_argument("--turboquant-oversample-factor", type=int)
     parser.add_argument("--turboquant-max-visited-codes", type=int)
     parser.add_argument("--turboquant-max-visited-pages", type=int)
@@ -2323,6 +2687,8 @@ def main() -> None:
 
     methods = parse_csv_list(args.methods, SUPPORTED_METHODS)
     corpora = parse_csv_list(args.corpus, SUPPORTED_CORPORA)
+    metrics = parse_csv_list(args.metrics, SUPPORTED_METRICS) if args.metrics is not None else ["cosine"]
+    turboquant_qjl_sketch_dims = parse_freeform_csv_list(args.turboquant_qjl_sketch_dims) if args.turboquant_qjl_sketch_dims is not None else ["d"]
     profile = PROFILE_CONFIGS[args.profile]
 
     if not args.dry_run and not args.port:
@@ -2345,43 +2711,50 @@ def main() -> None:
     scenario_index = 0
     for corpus_name in corpora:
         corpus = build_corpus(corpus_name, profile, args.seed + scenario_index)
-        for method in methods:
-            scenario_index += 1
-            if args.dry_run:
-                scenarios.append(
-                    dry_run_scenario(
-                        corpus,
-                        method,
-                        args.turboquant_probes,
-                        args.turboquant_oversample_factor,
-                        args.turboquant_max_visited_codes,
-                        args.turboquant_max_visited_pages,
-                        args.turboquant_shadow_decode_diagnostics,
-                        args.turboquant_force_decode_score_diagnostics,
-                        args.turboquant_decode_rescore_factor,
-                        args.turboquant_decode_rescore_extra_candidates,
-                        args.rerank_candidate_limit,
-                    )
-                )
-            else:
-                scenarios.append(
-                    run_scenario(
-                        base_cmd,
-                        corpus,
-                        method,
-                        profile["repetitions"],
-                        scenario_index,
-                        args.turboquant_probes,
-                        args.turboquant_oversample_factor,
-                        args.turboquant_max_visited_codes,
-                        args.turboquant_max_visited_pages,
-                        args.turboquant_shadow_decode_diagnostics,
-                        args.turboquant_force_decode_score_diagnostics,
-                        args.turboquant_decode_rescore_factor,
-                        args.turboquant_decode_rescore_extra_candidates,
-                        args.rerank_candidate_limit,
-                    )
-                )
+        for benchmark_metric in metrics:
+            for method in methods:
+                qjl_dim_tokens = turboquant_qjl_sketch_dims if method.startswith("turboquant_") else [None]
+                for qjl_dim_token in qjl_dim_tokens:
+                    scenario_index += 1
+                    if args.dry_run:
+                        scenarios.append(
+                        dry_run_scenario(
+                            corpus,
+                            method,
+                            args.turboquant_probes,
+                            args.turboquant_oversample_factor,
+                            args.turboquant_max_visited_codes,
+                                args.turboquant_max_visited_pages,
+                                args.turboquant_shadow_decode_diagnostics,
+                            args.turboquant_force_decode_score_diagnostics,
+                            args.turboquant_decode_rescore_factor,
+                            args.turboquant_decode_rescore_extra_candidates,
+                            args.rerank_candidate_limit,
+                            benchmark_metric=benchmark_metric,
+                            turboquant_qjl_sketch_dim=qjl_dim_token,
+                        )
+                        )
+                    else:
+                        scenarios.append(
+                        run_scenario(
+                            base_cmd,
+                            corpus,
+                            method,
+                            profile["repetitions"],
+                            scenario_index,
+                            args.turboquant_probes,
+                            args.turboquant_oversample_factor,
+                            args.turboquant_max_visited_codes,
+                                args.turboquant_max_visited_pages,
+                                args.turboquant_shadow_decode_diagnostics,
+                            args.turboquant_force_decode_score_diagnostics,
+                            args.turboquant_decode_rescore_factor,
+                            args.turboquant_decode_rescore_extra_candidates,
+                            args.rerank_candidate_limit,
+                            benchmark_metric=benchmark_metric,
+                            turboquant_qjl_sketch_dim=qjl_dim_token,
+                        )
+                        )
 
     payload = {
         "profile": args.profile,
@@ -2389,8 +2762,9 @@ def main() -> None:
         "dry_run": args.dry_run,
         "corpora": corpora,
         "methods": methods,
+        "metrics": metrics,
         "environment": environment_metadata(),
-        "scenario_matrix": scenario_matrix_metadata(args.profile, corpora, methods),
+        "scenario_matrix": scenario_matrix_metadata(args.profile, corpora, methods, metrics, turboquant_qjl_sketch_dims),
         "scenarios": scenarios,
     }
 

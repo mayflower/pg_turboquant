@@ -35,6 +35,7 @@ typedef struct TqOptionConfig
 	int			router_iterations;
 	int			router_restarts;
 	int			router_seed;
+	int			qjl_sketch_dim;
 	bool		normalized;
 	const char *transform_name;
 	const char *lanes_name;
@@ -44,6 +45,7 @@ typedef struct TqLaneConfig
 {
 	int			block_size;
 	int			dimension;
+	int			qjl_dimension;
 	int			bits;
 	TqCodecKind codec;
 	bool		normalized;

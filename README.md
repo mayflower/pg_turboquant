@@ -2,13 +2,22 @@
 
 `pg_turboquant` is a PostgreSQL extension that adds a custom ANN index access method, `turboquant`, for compact nearest-neighbor search over `vector` and `halfvec`.
 
-It is designed around PostgreSQL's storage and executor constraints rather than treating ANN indexing as an external service. The project combines structured transforms, compact TurboQuant-style codecs, lane-adaptive batch pages, ordered ANN scans, bitmap support for filtered workloads, SQL-side exact reranking helpers, and a reproducible benchmark harness.
+It is designed around PostgreSQL's storage and executor constraints rather than treating ANN indexing as an external service. The project combines structured transforms, a faithful TurboQuant `v2` payload for normalized cosine and inner-product retrieval, lane-adaptive batch pages, ordered ANN scans, bitmap support for filtered workloads, SQL-side exact reranking helpers, and a reproducible benchmark harness.
 
 ## Why it exists
 
 - PostgreSQL users already storing embeddings with pgvector often want a denser index format.
 - `pg_turboquant` keeps ANN inside PostgreSQL while optimizing for compact storage and cache-friendly scoring.
 - The access method is explicit about PostgreSQL boundaries: MVCC still lives in the executor, exact reranking still lives in SQL, and v1 still uses generic WAL.
+
+## Algorithm contract
+
+- Faithful fast path:
+  normalized cosine and inner-product retrieval use the paper-faithful `Qprod` payload with structured rotation, `b - 1` stage-1 scalar codes, a residual 1-bit QJL sketch, and stored residual norm `gamma`.
+- Compatibility fallback:
+  L2 and non-normalized scans still work, but they fall back to decoded-vector scoring rather than claiming faithful TurboQuant semantics.
+- Rebuild boundary:
+  the `v2` rewrite is a format bump. Older indexes must be rebuilt with `REINDEX` or recreated.
 
 ## Current capabilities
 
@@ -19,6 +28,9 @@ It is designed around PostgreSQL's storage and executor constraints rather than 
   - flat scan with `lists = 0`
   - IVF-routed scan with `lists > 0`
   - bitmap-filter support for predicate-heavy workloads
+- Fast-path scope:
+  - normalized cosine and inner product run on the faithful `v2` code-domain path
+  - L2 and non-normalized scans use explicit compatibility fallback scoring
 - SQL helpers:
   - `tq_rerank_candidates(...)`
   - `tq_approx_candidates(...)`
@@ -50,7 +62,7 @@ ON docs
 USING turboquant (embedding tq_cosine_ops)
 WITH (
   bits = 4,
-  lists = 128,
+  lists = 0,
   transform = 'hadamard',
   normalized = true
 );
@@ -99,6 +111,15 @@ Representative checked-in retrieval results:
 
 Those results are environment-specific. The benchmark harness keeps recall, latency, footprint, WAL, and concurrent-write measurements separate so tradeoffs remain visible instead of being collapsed into a single score.
 
+The checked-in benchmark corpus still includes pre-`v2` historical runs. Re-run the benchmark suite before using it as evidence for the faithful `v2` rewrite.
+
+Recent live RAG evidence is also available under `benchmarks/rag/`:
+
+- the focused `kilt_nq` rerun at `benchmarks/rag/results/kilt-nq-rerun-q20-20260330/`
+- the generated aggregate HTML at `output.html`
+
+That rerun used the current faithful TurboQuant code against the local PostgreSQL-backed RAG corpus with `query_limit = 20`. In that slice, all six method variants landed at `recall@10 = 0.95`; `pg_turboquant_approx` kept the smallest footprint at `1,277,952` bytes, but its retrieval p95 (`26.81 ms`) was slower than HNSW approx (`14.63 ms`) and slightly slower than IVFFlat approx (`24.92 ms`).
+
 ## Documentation
 
 The public docs follow Diataxis:
@@ -146,3 +167,5 @@ make tapcheck
 The benchmark harness lives in `scripts/benchmark_suite.py`. The RAG evaluation harness lives under `benchmarks/rag/`.
 
 For scan observability, `tq_last_scan_stats()` exposes backend-local JSON for the most recent TurboQuant scan, and the benchmark/RAG harnesses persist scan-work counters such as visited lists, pages, codes, and score mode.
+
+`tq_index_metadata(...)` also reports the current algorithm version, quantizer family/version, residual sketch kind/bit budget, estimator mode, and whether the last indexed path is eligible for the faithful fast path or only for a compatibility fallback.
