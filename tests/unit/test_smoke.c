@@ -2109,7 +2109,7 @@ test_tq_batch_page_scan_tiny_corpus(void)
 	assert(tq_batch_page_set_code(page, sizeof(page), lane, packed, sizeof(packed), errmsg, sizeof(errmsg)));
 
 	assert(tq_batch_page_scan_prod_cosine(page, sizeof(page), &config, true, &lut,
-										  query, 2, &heap, errmsg, sizeof(errmsg)));
+										  query, 2, &heap, NULL, errmsg, sizeof(errmsg)));
 
 	assert(tq_candidate_heap_pop_best(&heap, &entry));
 	assert(entry.tid.offset_number == 1);
@@ -2177,11 +2177,11 @@ test_tq_batch_page_scan_normalized_metric_orders_align(void)
 	assert(tq_batch_page_set_code(page, sizeof(page), lane, packed, sizeof(packed), errmsg, sizeof(errmsg)));
 
 	assert(tq_batch_page_scan_prod(page, sizeof(page), &config, true, TQ_DISTANCE_COSINE, &lut,
-								   query, 2, &cosine_heap, errmsg, sizeof(errmsg)));
+								   query, 2, &cosine_heap, NULL, errmsg, sizeof(errmsg)));
 	assert(tq_batch_page_scan_prod(page, sizeof(page), &config, true, TQ_DISTANCE_IP, &lut,
-								   query, 2, &ip_heap, errmsg, sizeof(errmsg)));
+								   query, 2, &ip_heap, NULL, errmsg, sizeof(errmsg)));
 	assert(tq_batch_page_scan_prod(page, sizeof(page), &config, true, TQ_DISTANCE_L2, &lut,
-								   query, 2, &l2_heap, errmsg, sizeof(errmsg)));
+								   query, 2, &l2_heap, NULL, errmsg, sizeof(errmsg)));
 
 	assert(tq_candidate_heap_pop_best(&cosine_heap, &cosine_entry));
 	assert(tq_candidate_heap_pop_best(&ip_heap, &ip_entry));
@@ -2255,7 +2255,7 @@ test_tq_batch_page_scan_cosine_is_scale_invariant(void)
 	assert(tq_batch_page_set_code(page, sizeof(page), lane, packed, sizeof(packed), errmsg, sizeof(errmsg)));
 
 	assert(tq_batch_page_scan_prod(page, sizeof(page), &config, false, TQ_DISTANCE_COSINE, &lut,
-								   query, 2, &heap, errmsg, sizeof(errmsg)));
+								   query, 2, &heap, NULL, errmsg, sizeof(errmsg)));
 
 	assert(tq_candidate_heap_pop_best(&heap, &entry));
 	assert(entry.tid.offset_number == 1);
@@ -2318,9 +2318,9 @@ test_tq_batch_page_scan_l2_diverges_from_ip_on_non_normalized_input(void)
 	assert(tq_batch_page_set_code(page, sizeof(page), lane, packed, sizeof(packed), errmsg, sizeof(errmsg)));
 
 	assert(tq_batch_page_scan_prod(page, sizeof(page), &config, false, TQ_DISTANCE_IP, &lut,
-								   query, 2, &ip_heap, errmsg, sizeof(errmsg)));
+								   query, 2, &ip_heap, NULL, errmsg, sizeof(errmsg)));
 	assert(tq_batch_page_scan_prod(page, sizeof(page), &config, false, TQ_DISTANCE_L2, &lut,
-								   query, 2, &l2_heap, errmsg, sizeof(errmsg)));
+								   query, 2, &l2_heap, NULL, errmsg, sizeof(errmsg)));
 
 	assert(tq_candidate_heap_pop_best(&ip_heap, &ip_entry));
 	assert(ip_entry.tid.offset_number == 2);

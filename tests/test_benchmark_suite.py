@@ -136,12 +136,22 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
         self.assertIn("candidate_heap_insert_count", scenario["scan_stats"])
         self.assertIn("candidate_heap_replace_count", scenario["scan_stats"])
         self.assertIn("candidate_heap_reject_count", scenario["scan_stats"])
+        self.assertIn("shadow_decoded_vector_count", scenario["scan_stats"])
+        self.assertIn("shadow_decode_candidate_count", scenario["scan_stats"])
+        self.assertIn("shadow_decode_overlap_count", scenario["scan_stats"])
+        self.assertIn("shadow_decode_primary_only_count", scenario["scan_stats"])
+        self.assertIn("shadow_decode_only_count", scenario["scan_stats"])
         if scenario["query_mode"] == "ordered_rerank" and scenario["method"].startswith("turboquant_"):
             self.assertIn("avg_candidate_count", scenario["candidate_retention"])
             self.assertIn("avg_exact_top_10_retention", scenario["candidate_retention"])
             self.assertIn("avg_exact_top_100_retention", scenario["candidate_retention"])
             self.assertIn("avg_exact_top_100_miss_count", scenario["candidate_retention"])
             self.assertIn("worst_exact_top_100_retention", scenario["candidate_retention"])
+            self.assertIn("avg_shadow_candidate_count", scenario["candidate_retention"])
+            self.assertIn("avg_shadow_exact_top_10_retention", scenario["candidate_retention"])
+            self.assertIn("avg_shadow_exact_top_100_retention", scenario["candidate_retention"])
+            self.assertIn("avg_shadow_exact_top_100_miss_count", scenario["candidate_retention"])
+            self.assertIn("worst_shadow_exact_top_100_retention", scenario["candidate_retention"])
         if scenario["method"] in {"turboquant_flat", "turboquant_ivf"}:
             self.assertEqual(scenario["scan_stats"]["score_mode"], "code_domain")
             self.assertEqual(scenario["scan_stats"]["decoded_vector_count"], 0)
@@ -308,6 +318,66 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
         self.assertEqual(scenario["query_api"]["candidate_limit"], 32)
         self.assertEqual(scenario["query_api"]["final_limit"], 100)
 
+    def test_decode_rescore_extra_candidates_expand_effective_limit_only(self):
+        payload = self.run_suite(
+            "--profile",
+            "tiny",
+            "--corpus",
+            "hotpot_skewed",
+            "--methods",
+            "turboquant_ivf",
+            "--rerank-candidate-limit",
+            "32",
+            "--turboquant-decode-rescore-factor",
+            "4",
+            "--turboquant-decode-rescore-extra-candidates",
+            "16",
+        )
+
+        scenario = payload["scenarios"][0]
+        self.assertEqual(scenario["query_api"]["candidate_limit"], 32)
+        self.assertEqual(scenario["query_api"]["effective_candidate_limit"], 116)
+        self.assertEqual(scenario["query_knobs"]["turboquant.decode_rescore_extra_candidates"], 16)
+
+    def test_decode_rescore_extra_candidates_auto_band_activates_by_default(self):
+        payload = self.run_suite(
+            "--profile",
+            "tiny",
+            "--corpus",
+            "hotpot_skewed",
+            "--methods",
+            "turboquant_ivf",
+            "--rerank-candidate-limit",
+            "1024",
+            "--turboquant-decode-rescore-factor",
+            "4",
+        )
+
+        scenario = payload["scenarios"][0]
+        self.assertEqual(scenario["query_api"]["candidate_limit"], 1024)
+        self.assertEqual(scenario["query_api"]["effective_candidate_limit"], 1536)
+        self.assertEqual(scenario["query_knobs"]["turboquant.decode_rescore_extra_candidates"], 512)
+
+    def test_decode_rescore_extra_candidates_explicit_zero_disables_auto_band(self):
+        payload = self.run_suite(
+            "--profile",
+            "tiny",
+            "--corpus",
+            "hotpot_skewed",
+            "--methods",
+            "turboquant_ivf",
+            "--rerank-candidate-limit",
+            "1024",
+            "--turboquant-decode-rescore-factor",
+            "4",
+            "--turboquant-decode-rescore-extra-candidates",
+            "0",
+        )
+
+        scenario = payload["scenarios"][0]
+        self.assertEqual(scenario["query_api"]["effective_candidate_limit"], 1024)
+        self.assertEqual(scenario["query_knobs"]["turboquant.decode_rescore_extra_candidates"], 0)
+
     def test_bitmap_filter_scenario_contract(self):
         payload = self.run_suite(
             "--profile",
@@ -368,6 +438,76 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
         self.assertIn(scenario["scan_stats"]["score_kernel"], ("scalar", "avx2", "neon"))
         self.assertEqual(scenario["scan_stats"]["decoded_vector_count"], 0)
         self.assertEqual(scenario["simd"]["code_domain_kernel"], scenario["scan_stats"]["score_kernel"])
+
+    def test_shadow_decode_diagnostics_flag_surfaces_in_query_setup(self):
+        payload = self.run_suite(
+            "--profile",
+            "tiny",
+            "--corpus",
+            "hotpot_skewed",
+            "--methods",
+            "turboquant_ivf",
+            "--turboquant-shadow-decode-diagnostics",
+        )
+
+        scenario = payload["scenarios"][0]
+        self.assertTrue(scenario["query_knobs"]["turboquant.shadow_decode_diagnostics"])
+        self.assertEqual(scenario["scan_stats"]["shadow_decoded_vector_count"], 0)
+        self.assertEqual(scenario["scan_stats"]["shadow_decode_candidate_count"], 0)
+        self.assertEqual(scenario["scan_stats"]["shadow_decode_overlap_count"], 0)
+        self.assertEqual(scenario["scan_stats"]["shadow_decode_primary_only_count"], 0)
+        self.assertEqual(scenario["scan_stats"]["shadow_decode_only_count"], 0)
+
+    def test_force_decode_score_diagnostics_flag_surfaces_in_query_setup(self):
+        payload = self.run_suite(
+            "--profile",
+            "tiny",
+            "--corpus",
+            "hotpot_skewed",
+            "--methods",
+            "turboquant_ivf",
+            "--turboquant-force-decode-score-diagnostics",
+        )
+
+        scenario = payload["scenarios"][0]
+        self.assertTrue(scenario["query_knobs"]["turboquant.force_decode_score_diagnostics"])
+
+    def test_decode_rescore_factor_surfaces_in_query_setup(self):
+        payload = self.run_suite(
+            "--profile",
+            "tiny",
+            "--corpus",
+            "hotpot_skewed",
+            "--methods",
+            "turboquant_ivf",
+            "--turboquant-decode-rescore-factor",
+            "4",
+        )
+
+        scenario = payload["scenarios"][0]
+        self.assertEqual(scenario["query_knobs"]["turboquant.decode_rescore_factor"], 4)
+        self.assertEqual(scenario["scan_stats"]["score_mode"], "decode_rescore")
+
+    def test_decode_rescore_extra_candidates_surfaces_in_query_knobs(self):
+        payload = self.run_suite(
+            "--profile",
+            "tiny",
+            "--corpus",
+            "hotpot_skewed",
+            "--methods",
+            "turboquant_ivf",
+            "--turboquant-decode-rescore-factor",
+            "4",
+            "--turboquant-decode-rescore-extra-candidates",
+            "64",
+        )
+
+        scenario = payload["scenarios"][0]
+        self.assertEqual(scenario["query_knobs"]["turboquant.decode_rescore_extra_candidates"], 64)
+        self.assertEqual(
+            scenario["query_api"]["effective_candidate_limit"],
+            164,
+        )
 
     def test_synthetic_skew_probe_regression_prefers_lower_work_without_recall_loss(self):
         regression = BENCHMARK_SUITE.synthetic_skew_probe_regression()
@@ -438,6 +578,7 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
             return [
                 '{"reranked_ids":[11,7,3],"approx_candidate_ids":[11,7,3,5]}',
                 '{"mode":"ivf","score_mode":"code_domain","score_kernel":"scalar","visited_code_count":42}',
+                '[11,5,9]',
             ]
 
         with mock.patch.object(
@@ -445,17 +586,26 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
             "query_psql_commands",
             side_effect=fake_query_psql_commands,
         ):
-            query_ids, scan_stats, approx_candidate_ids = BENCHMARK_SUITE.query_turboquant_ordered_ids_and_scan_stats(
+            query_ids, scan_stats, approx_candidate_ids, shadow_candidate_ids = BENCHMARK_SUITE.query_turboquant_ordered_ids_and_scan_stats(
                 ["psql"],
                 "benchmark_items",
                 (0.25, 0.75),
                 10,
-                ["SET LOCAL enable_seqscan = off", "SET LOCAL turboquant.probes = 4"],
+                [
+                    "SET LOCAL enable_seqscan = off",
+                    "SET LOCAL turboquant.probes = 4",
+                    "SET LOCAL turboquant.shadow_decode_diagnostics = on",
+                    "SET LOCAL turboquant.force_decode_score_diagnostics = on",
+                    "SET LOCAL turboquant.decode_rescore_factor = 4",
+                    "SET LOCAL turboquant.decode_rescore_extra_candidates = 16",
+                ],
                 32,
+                16,
             )
 
         self.assertEqual(query_ids, [11, 7, 3])
         self.assertEqual(approx_candidate_ids, [11, 7, 3, 5])
+        self.assertEqual(shadow_candidate_ids, [11, 5, 9])
         self.assertEqual(scan_stats["visited_code_count"], 42)
         self.assertEqual(len(command_batches), 1)
         self.assertEqual(len(command_batches[0][1]), 1)
@@ -463,11 +613,16 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
         self.assertEqual(sql_batch.count("tq_rerank_candidates("), 0)
         self.assertEqual(sql_batch.count("ORDER BY embedding <=>"), 1)
         self.assertEqual(sql_batch.count("SELECT tq_last_scan_stats()::text"), 1)
+        self.assertEqual(sql_batch.count("SELECT coalesce(json_agg(source.id ORDER BY shadow.ordinality), '[]'::json)::text"), 1)
         self.assertIn("BEGIN;", sql_batch)
         self.assertIn("DO $$", sql_batch)
         self.assertIn("COMMIT;", sql_batch)
         self.assertIn("tq_resolve_query_knobs(", sql_batch)
         self.assertNotIn("SET LOCAL turboquant.probes = 4", sql_batch)
+        self.assertIn("SET LOCAL turboquant.shadow_decode_diagnostics = on", sql_batch)
+        self.assertIn("SET LOCAL turboquant.force_decode_score_diagnostics = on", sql_batch)
+        self.assertIn("SET LOCAL turboquant.decode_rescore_factor = 4", sql_batch)
+        self.assertIn("SET LOCAL turboquant.decode_rescore_extra_candidates = 16", sql_batch)
 
     def test_turboquant_single_batch_sql_resolves_helper_knobs_not_raw_turboquant_gucs(self):
         sql_batch = BENCHMARK_SUITE.turboquant_single_batch_rerank_ids_sql(
@@ -481,19 +636,29 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
                 "SET LOCAL turboquant.oversample_factor = 4",
                 "SET LOCAL turboquant.max_visited_codes = 4096",
                 "SET LOCAL turboquant.max_visited_pages = 0",
+                "SET LOCAL turboquant.shadow_decode_diagnostics = on",
+                "SET LOCAL turboquant.force_decode_score_diagnostics = on",
+                "SET LOCAL turboquant.decode_rescore_factor = 4",
+                "SET LOCAL turboquant.decode_rescore_extra_candidates = 16",
             ],
             None,
+            16,
         )
 
         self.assertIn("SET LOCAL enable_seqscan = off", sql_batch)
         self.assertIn("SET LOCAL enable_bitmapscan = off", sql_batch)
         self.assertIn("BEGIN;", sql_batch)
         self.assertIn("DO $$", sql_batch)
-        self.assertIn("tq_resolve_query_knobs(10, 10, NULL, NULL)", sql_batch)
+        self.assertIn("tq_effective_rerank_candidate_limit(10, 10)", sql_batch)
+        self.assertIn("FROM tq_resolve_query_knobs(effective_candidate_limit, 10, NULL, NULL)", sql_batch)
         self.assertIn("PERFORM set_config('turboquant.probes'", sql_batch)
         self.assertIn("PERFORM set_config('turboquant.oversample_factor'", sql_batch)
         self.assertIn("PERFORM set_config('turboquant.max_visited_codes'", sql_batch)
         self.assertIn("PERFORM set_config('turboquant.max_visited_pages'", sql_batch)
+        self.assertIn("SET LOCAL turboquant.shadow_decode_diagnostics = on", sql_batch)
+        self.assertIn("SET LOCAL turboquant.force_decode_score_diagnostics = on", sql_batch)
+        self.assertIn("SET LOCAL turboquant.decode_rescore_factor = 4", sql_batch)
+        self.assertIn("SET LOCAL turboquant.decode_rescore_extra_candidates = 16", sql_batch)
         self.assertNotIn("SET LOCAL turboquant.probes = 4", sql_batch)
         self.assertNotIn("SET LOCAL turboquant.oversample_factor = 4", sql_batch)
         self.assertNotIn("SET LOCAL turboquant.max_visited_codes = 4096", sql_batch)
@@ -520,6 +685,7 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
             limit,
             query_setup,
             requested_candidate_limit,
+            decode_rescore_extra_candidates=0,
             method="turboquant_ivf",
         ):
             helper_calls.append(
@@ -529,6 +695,7 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
                     "limit": limit,
                     "query_setup": tuple(query_setup),
                     "requested_candidate_limit": requested_candidate_limit,
+                    "decode_rescore_extra_candidates": decode_rescore_extra_candidates,
                     "method": method,
                 }
             )
@@ -537,7 +704,7 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
                 "score_mode": "code_domain",
                 "score_kernel": "scalar",
                 "visited_code_count": 8,
-            }, [1]
+            }, [1], [2]
 
         with (
             mock.patch.object(BENCHMARK_SUITE, "load_corpus"),
@@ -575,6 +742,10 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
                 turboquant_oversample_factor=None,
                 turboquant_max_visited_codes=None,
                 turboquant_max_visited_pages=None,
+                turboquant_shadow_decode_diagnostics=False,
+                turboquant_force_decode_score_diagnostics=False,
+                turboquant_decode_rescore_factor=1,
+                turboquant_decode_rescore_extra_candidates=0,
                 requested_rerank_candidate_limit=32,
             )
 
@@ -590,6 +761,10 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
         self.assertEqual(scenario["candidate_retention"]["avg_exact_top_10_retention"], 0.5)
         self.assertEqual(scenario["candidate_retention"]["avg_exact_top_100_retention"], 0.5)
         self.assertEqual(scenario["candidate_retention"]["avg_exact_top_100_miss_count"], 1.0)
+        self.assertEqual(scenario["candidate_retention"]["avg_shadow_candidate_count"], 1.0)
+        self.assertEqual(scenario["candidate_retention"]["avg_shadow_exact_top_10_retention"], 0.5)
+        self.assertEqual(scenario["candidate_retention"]["avg_shadow_exact_top_100_retention"], 0.5)
+        self.assertEqual(scenario["candidate_retention"]["avg_shadow_exact_top_100_miss_count"], 1.0)
 
     def test_run_scenario_non_turboquant_keeps_existing_ordered_path(self):
         corpus = BENCHMARK_SUITE.Corpus(
@@ -642,6 +817,10 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
                 turboquant_oversample_factor=None,
                 turboquant_max_visited_codes=None,
                 turboquant_max_visited_pages=None,
+                turboquant_shadow_decode_diagnostics=False,
+                turboquant_force_decode_score_diagnostics=False,
+                turboquant_decode_rescore_factor=1,
+                turboquant_decode_rescore_extra_candidates=0,
                 requested_rerank_candidate_limit=32,
             )
 
@@ -687,6 +866,7 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
                 return_value=[
                     '{"reranked_ids":[1,2],"approx_candidate_ids":[1,2]}',
                     '{"mode":"ivf","score_mode":"code_domain","score_kernel":"scalar","visited_code_count":8}',
+                    '[1,2]',
                 ],
             ) as query_psql_commands_mock,
         ):
@@ -700,6 +880,10 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
                 turboquant_oversample_factor=None,
                 turboquant_max_visited_codes=None,
                 turboquant_max_visited_pages=None,
+                turboquant_shadow_decode_diagnostics=False,
+                turboquant_force_decode_score_diagnostics=False,
+                turboquant_decode_rescore_factor=1,
+                turboquant_decode_rescore_extra_candidates=0,
                 requested_rerank_candidate_limit=32,
             )
 

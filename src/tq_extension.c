@@ -8,6 +8,7 @@
 #include "catalog/pg_am.h"
 #include "catalog/pg_index.h"
 #include "catalog/pg_opclass.h"
+#include "catalog/pg_type_d.h"
 #include "fmgr.h"
 #include "lib/stringinfo.h"
 #include "storage/bufmgr.h"
@@ -33,6 +34,7 @@ PG_FUNCTION_INFO_V1(tq_debug_router_metadata);
 PG_FUNCTION_INFO_V1(tq_debug_transform_metadata);
 PG_FUNCTION_INFO_V1(tq_index_metadata_core);
 PG_FUNCTION_INFO_V1(tq_last_scan_stats_core);
+PG_FUNCTION_INFO_V1(tq_last_shadow_decode_candidate_tids_core);
 PG_FUNCTION_INFO_V1(tq_runtime_simd_features_core);
 
 typedef struct TqListAggregate
@@ -759,6 +761,43 @@ tq_last_scan_stats_core(PG_FUNCTION_ARGS)
 				 errmsg("turboquant could not serialize last scan stats")));
 
 	PG_RETURN_TEXT_P(cstring_to_text(json));
+}
+
+Datum
+tq_last_shadow_decode_candidate_tids_core(PG_FUNCTION_ARGS)
+{
+	ArrayType  *result = NULL;
+	Datum	   *values = NULL;
+	TqTid	   *tids = NULL;
+	size_t		count = 0;
+	size_t		index = 0;
+
+	(void) fcinfo;
+
+	if (!tq_scan_stats_copy_shadow_decode_tids(NULL, 0, &count))
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("turboquant could not inspect shadow decode candidate tids")));
+
+	if (count == 0)
+		PG_RETURN_ARRAYTYPE_P(construct_empty_array(TEXTOID));
+
+	tids = (TqTid *) palloc(sizeof(TqTid) * count);
+	values = (Datum *) palloc(sizeof(Datum) * count);
+
+	if (!tq_scan_stats_copy_shadow_decode_tids(tids, count, &count))
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("turboquant could not copy shadow decode candidate tids")));
+
+	for (index = 0; index < count; index++)
+		values[index] = CStringGetTextDatum(
+			psprintf("(%u,%u)",
+					 tids[index].block_number,
+					 (unsigned int) tids[index].offset_number));
+
+	result = construct_array(values, (int) count, TEXTOID, -1, false, 'i');
+	PG_RETURN_ARRAYTYPE_P(result);
 }
 
 Datum

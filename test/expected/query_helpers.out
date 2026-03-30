@@ -130,6 +130,30 @@ ORDER BY exact_rank;
  2            |                2 |             0.006116 |          2 |       0.006116
 (2 rows)
 
+SET turboquant.decode_rescore_factor = 4;
+SET turboquant.decode_rescore_extra_candidates = 16;
+SELECT tq_effective_rerank_candidate_limit(32, 100);
+ tq_effective_rerank_candidate_limit 
+-------------------------------------
+                                 116
+(1 row)
+
+SET turboquant.decode_rescore_extra_candidates = 0;
+SELECT tq_effective_rerank_candidate_limit(32, 100);
+ tq_effective_rerank_candidate_limit 
+-------------------------------------
+                                 100
+(1 row)
+
+SET turboquant.decode_rescore_extra_candidates = -1;
+SELECT tq_effective_rerank_candidate_limit(1024, 100);
+ tq_effective_rerank_candidate_limit 
+-------------------------------------
+                                1536
+(1 row)
+
+RESET turboquant.decode_rescore_factor;
+RESET turboquant.decode_rescore_extra_candidates;
 SELECT * FROM tq_recommended_query_knobs(0, 1);
 ERROR:  invalid turboquant candidate_limit: 0
 HINT:  candidate_limit must be at least 1.
@@ -152,7 +176,7 @@ FROM tq_approx_candidates(
 ERROR:  invalid turboquant metric: angular
 HINT:  Use one of: cosine, ip, l2.
 CONTEXT:  PL/pgSQL function tq_metric_order_operator(text) line 11 at RAISE
-PL/pgSQL function tq_approx_candidates(regclass,name,name,vector,text,integer,integer,integer) line 10 at assignment
+PL/pgSQL function tq_approx_candidates(regclass,name,name,vector,text,integer,integer,integer) line 11 at assignment
 SELECT *
 FROM tq_rerank_candidates(
 	'tq_query_helper_docs'::regclass,
@@ -163,9 +187,31 @@ FROM tq_rerank_candidates(
 	2,
 	3
 );
-ERROR:  invalid turboquant limits: final_limit (3) exceeds candidate_limit (2)
-HINT:  final_limit must be less than or equal to candidate_limit.
-CONTEXT:  PL/pgSQL function tq_resolve_query_knobs(integer,integer,integer,integer) line 20 at RAISE
-SQL statement "SELECT knobs.probes, knobs.oversample_factor, knobs.max_visited_codes, knobs.max_visited_pages
-	                                                                                                   FROM tq_resolve_query_knobs(candidate_limit, final_limit, probes, oversample_factor) AS knobs"
-PL/pgSQL function tq_rerank_candidates(regclass,name,name,vector,text,integer,integer,integer,integer) line 12 at SQL statement
+ candidate_id | approximate_rank | approximate_distance | exact_rank | exact_distance 
+--------------+------------------+----------------------+------------+----------------
+ 1            |                1 |                    0 |          1 |              0
+ 2            |                2 |             0.006116 |          2 |       0.006116
+ 3            |                3 |                  0.4 |          3 |            0.4
+(3 rows)
+
+SET turboquant.decode_rescore_factor = 4;
+SET turboquant.decode_rescore_extra_candidates = 0;
+SELECT *
+FROM tq_rerank_candidates(
+	'tq_query_helper_docs'::regclass,
+	'id',
+	'embedding',
+	'[1,0,0,0]'::vector(4),
+	'cosine',
+	2,
+	3
+);
+ candidate_id | approximate_rank | approximate_distance | exact_rank | exact_distance 
+--------------+------------------+----------------------+------------+----------------
+ 1            |                1 |                    0 |          1 |              0
+ 2            |                2 |             0.006116 |          2 |       0.006116
+ 3            |                3 |                  0.4 |          3 |            0.4
+(3 rows)
+
+RESET turboquant.decode_rescore_factor;
+RESET turboquant.decode_rescore_extra_candidates;

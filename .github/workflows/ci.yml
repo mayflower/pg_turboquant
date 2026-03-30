@@ -51,3 +51,94 @@ jobs:
           make unitcheck
           make installcheck
           make tapcheck
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    env:
+      PG_CONFIG: /usr/lib/postgresql/17/bin/pg_config
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add PostgreSQL apt repository
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ca-certificates curl gnupg
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor -o /usr/share/keyrings/postgresql.gpg
+          echo "deb [signed-by=/usr/share/keyrings/postgresql.gpg] http://apt.postgresql.org/pub/repos/apt noble-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            perl \
+            postgresql-17 \
+            postgresql-client-17 \
+            postgresql-server-dev-17 \
+            postgresql-contrib-17 \
+            libipc-run-perl \
+            bear
+          pip install gcovr
+
+      - name: Bootstrap dependency
+        run: ./scripts/bootstrap_dev.sh
+
+      - name: Build extension with coverage
+        run: |
+          export PATH="/usr/lib/postgresql/17/bin:$PATH"
+          bear -- make COPT="--coverage"
+          make install
+
+      - name: Run integration tests
+        run: |
+          export PATH="/usr/lib/postgresql/17/bin:$PATH"
+          make installcheck
+          make tapcheck
+
+      - name: Collect integration coverage
+        run: gcovr --json coverage_integration.json -r . -f 'src/'
+
+      - name: Run unit tests with coverage
+        run: |
+          find src \( -name '*.gcda' -o -name '*.gcno' \) -delete
+          export PATH="/usr/lib/postgresql/17/bin:$PATH"
+          make unitcheck COPT="--coverage"
+
+      - name: Collect unit coverage
+        run: gcovr --json coverage_unit.json -r . -f 'src/'
+
+      - name: Merge coverage and generate SonarQube report
+        run: gcovr -a coverage_integration.json -a coverage_unit.json --sonarqube coverage.xml -r . -f 'src/'
+
+      - name: Upload coverage artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: |
+            coverage.xml
+            compile_commands.json
+
+  sonarqube:
+    name: SonarQube
+    runs-on: mayflower-k8s-runners
+    needs: [build-and-test, coverage]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download coverage artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage
+          path: .
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@v6
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_BASE_URL }}

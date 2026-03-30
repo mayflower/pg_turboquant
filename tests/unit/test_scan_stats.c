@@ -31,6 +31,11 @@ test_stats_initialize_to_zero_and_empty(void)
 	assert(stats.candidate_heap_insert_count == 0);
 	assert(stats.candidate_heap_replace_count == 0);
 	assert(stats.candidate_heap_reject_count == 0);
+	assert(stats.shadow_decoded_vector_count == 0);
+	assert(stats.shadow_decode_candidate_count == 0);
+	assert(stats.shadow_decode_overlap_count == 0);
+	assert(stats.shadow_decode_primary_only_count == 0);
+	assert(stats.shadow_decode_only_count == 0);
 	assert(stats.decoded_vector_count == 0);
 	assert(stats.bound_data_page_reads == 0);
 	assert(stats.page_prune_count == 0);
@@ -44,6 +49,11 @@ test_stats_initialize_to_zero_and_empty(void)
 	assert(strstr(json, "\"candidate_heap_insert_count\":0") != NULL);
 	assert(strstr(json, "\"candidate_heap_replace_count\":0") != NULL);
 	assert(strstr(json, "\"candidate_heap_reject_count\":0") != NULL);
+	assert(strstr(json, "\"shadow_decoded_vector_count\":0") != NULL);
+	assert(strstr(json, "\"shadow_decode_candidate_count\":0") != NULL);
+	assert(strstr(json, "\"shadow_decode_overlap_count\":0") != NULL);
+	assert(strstr(json, "\"shadow_decode_primary_only_count\":0") != NULL);
+	assert(strstr(json, "\"shadow_decode_only_count\":0") != NULL);
 }
 
 static void
@@ -77,6 +87,11 @@ test_stats_reset_between_scans(void)
 	assert(stats.candidate_heap_insert_count == 0);
 	assert(stats.candidate_heap_replace_count == 0);
 	assert(stats.candidate_heap_reject_count == 0);
+	assert(stats.shadow_decoded_vector_count == 0);
+	assert(stats.shadow_decode_candidate_count == 0);
+	assert(stats.shadow_decode_overlap_count == 0);
+	assert(stats.shadow_decode_primary_only_count == 0);
+	assert(stats.shadow_decode_only_count == 0);
 }
 
 static void
@@ -133,6 +148,56 @@ test_candidate_heap_event_counters_track_insert_replace_and_reject(void)
 }
 
 static void
+test_shadow_decode_metrics_track_heap_overlap(void)
+{
+	TqCandidateHeap primary;
+	TqCandidateHeap shadow;
+	TqScanStats stats;
+	TqTid copied[4];
+	size_t copied_count = 0;
+
+	memset(&primary, 0, sizeof(primary));
+	memset(&shadow, 0, sizeof(shadow));
+	memset(&stats, 0, sizeof(stats));
+	memset(copied, 0, sizeof(copied));
+
+	tq_scan_stats_begin(TQ_SCAN_MODE_IVF, 4);
+	assert(tq_candidate_heap_init(&primary, 3));
+	assert(tq_candidate_heap_init(&shadow, 3));
+
+	assert(tq_candidate_heap_push(&primary, 1.0f, 1, 1));
+	assert(tq_candidate_heap_push(&primary, 2.0f, 1, 2));
+	assert(tq_candidate_heap_push(&primary, 3.0f, 1, 3));
+
+	assert(tq_candidate_heap_push(&shadow, 2.0f, 1, 2));
+	assert(tq_candidate_heap_push(&shadow, 3.0f, 1, 3));
+	assert(tq_candidate_heap_push(&shadow, 4.0f, 1, 4));
+
+	tq_scan_stats_record_shadow_decoded_vector();
+	tq_scan_stats_record_shadow_decoded_vector();
+	tq_scan_stats_record_shadow_decoded_vector();
+	tq_scan_stats_set_shadow_decode_metrics(&primary, &shadow);
+	tq_scan_stats_snapshot(&stats);
+
+	assert(stats.shadow_decoded_vector_count == 3);
+	assert(stats.shadow_decode_candidate_count == 3);
+	assert(stats.shadow_decode_overlap_count == 2);
+	assert(stats.shadow_decode_primary_only_count == 1);
+	assert(stats.shadow_decode_only_count == 1);
+	assert(tq_scan_stats_copy_shadow_decode_tids(copied, 4, &copied_count));
+	assert(copied_count == 3);
+	assert((copied[0].block_number == 1 && copied[0].offset_number >= 2 && copied[0].offset_number <= 4)
+		   || (copied[1].block_number == 1 && copied[1].offset_number >= 2 && copied[1].offset_number <= 4)
+		   || (copied[2].block_number == 1 && copied[2].offset_number >= 2 && copied[2].offset_number <= 4));
+	assert((copied[0].offset_number == 2) || (copied[1].offset_number == 2) || (copied[2].offset_number == 2));
+	assert((copied[0].offset_number == 3) || (copied[1].offset_number == 3) || (copied[2].offset_number == 3));
+	assert((copied[0].offset_number == 4) || (copied[1].offset_number == 4) || (copied[2].offset_number == 4));
+
+	tq_candidate_heap_reset(&primary);
+	tq_candidate_heap_reset(&shadow);
+}
+
+static void
 test_serialization_exposes_stable_field_names(void)
 {
 	TqScanStats stats;
@@ -162,6 +227,11 @@ test_serialization_exposes_stable_field_names(void)
 	assert(strstr(json, "\"candidate_heap_insert_count\"") != NULL);
 	assert(strstr(json, "\"candidate_heap_replace_count\"") != NULL);
 	assert(strstr(json, "\"candidate_heap_reject_count\"") != NULL);
+	assert(strstr(json, "\"shadow_decoded_vector_count\"") != NULL);
+	assert(strstr(json, "\"shadow_decode_candidate_count\"") != NULL);
+	assert(strstr(json, "\"shadow_decode_overlap_count\"") != NULL);
+	assert(strstr(json, "\"shadow_decode_primary_only_count\"") != NULL);
+	assert(strstr(json, "\"shadow_decode_only_count\"") != NULL);
 	assert(strstr(json, "\"decoded_vector_count\"") != NULL);
 	assert(strstr(json, "\"bound_data_page_reads\"") != NULL);
 	assert(strstr(json, "\"page_prune_count\"") != NULL);
@@ -175,6 +245,7 @@ main(void)
 	test_stats_reset_between_scans();
 	test_visited_code_count_bounds_retained_candidates();
 	test_candidate_heap_event_counters_track_insert_replace_and_reject();
+	test_shadow_decode_metrics_track_heap_overlap();
 	test_serialization_exposes_stable_field_names();
 	return 0;
 }

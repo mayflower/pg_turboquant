@@ -110,8 +110,36 @@ def rerank_candidate_limit(limit: int, requested_limit: Optional[int]) -> int:
     return requested_limit
 
 
-def effective_candidate_limit(limit: int, requested_limit: Optional[int]) -> int:
-    return max(limit, rerank_candidate_limit(limit, requested_limit))
+def effective_candidate_limit(
+    limit: int,
+    requested_limit: Optional[int],
+    extra_candidates: int = 0,
+) -> int:
+    base_limit = max(limit, rerank_candidate_limit(limit, requested_limit))
+    if extra_candidates <= 0:
+        return base_limit
+    return base_limit + extra_candidates
+
+
+def auto_decode_rescore_extra_candidates(
+    limit: int,
+    requested_limit: Optional[int],
+) -> int:
+    base_limit = rerank_candidate_limit(limit, requested_limit)
+    return min(512, max(128, base_limit // 2))
+
+
+def resolve_decode_rescore_extra_candidates(
+    limit: int,
+    requested_limit: Optional[int],
+    decode_rescore_factor: int,
+    explicit_extra_candidates: Optional[int],
+) -> int:
+    if decode_rescore_factor <= 1:
+        return 0
+    if explicit_extra_candidates is not None:
+        return max(0, explicit_extra_candidates)
+    return auto_decode_rescore_extra_candidates(limit, requested_limit)
 
 
 def capability_metadata(spec: dict) -> dict:
@@ -581,10 +609,15 @@ def wal_bytes_since(base_cmd: list[str], start_lsn: str) -> int:
 def method_spec(
     method: str,
     corpus: Corpus,
+    requested_rerank_candidate_limit: Optional[int] = None,
     turboquant_probes: Optional[int] = None,
     turboquant_oversample_factor: Optional[int] = None,
     turboquant_max_visited_codes: Optional[int] = None,
     turboquant_max_visited_pages: Optional[int] = None,
+    turboquant_shadow_decode_diagnostics: bool = False,
+    turboquant_force_decode_score_diagnostics: bool = False,
+    turboquant_decode_rescore_factor: int = 1,
+    turboquant_decode_rescore_extra_candidates: Optional[int] = None,
 ) -> dict:
     hotpot_overlap = corpus.name == "hotpot_overlap"
     if hotpot_overlap:
@@ -604,6 +637,12 @@ def method_spec(
     )
     turboquant_max_pages_value = (
         turboquant_max_visited_pages if turboquant_max_visited_pages is not None else 0
+    )
+    turboquant_decode_rescore_extra_value = resolve_decode_rescore_extra_candidates(
+        TOP_K_VALUES[-1],
+        requested_rerank_candidate_limit,
+        turboquant_decode_rescore_factor,
+        turboquant_decode_rescore_extra_candidates,
     )
     ivfflat_probe_value = min(list_count, 8) if hotpot_overlap else min(list_count, 4)
     hnsw_ef_search_value = 80 if hotpot_overlap else 40
@@ -625,6 +664,18 @@ def method_spec(
                 f"SET LOCAL turboquant.oversample_factor = {turboquant_oversample_value}",
                 f"SET LOCAL turboquant.max_visited_codes = {turboquant_max_codes_value}",
                 f"SET LOCAL turboquant.max_visited_pages = {turboquant_max_pages_value}",
+                (
+                    "SET LOCAL turboquant.shadow_decode_diagnostics = on"
+                    if turboquant_shadow_decode_diagnostics
+                    else "SET LOCAL turboquant.shadow_decode_diagnostics = off"
+                ),
+                (
+                    "SET LOCAL turboquant.force_decode_score_diagnostics = on"
+                    if turboquant_force_decode_score_diagnostics
+                    else "SET LOCAL turboquant.force_decode_score_diagnostics = off"
+                ),
+                f"SET LOCAL turboquant.decode_rescore_factor = {turboquant_decode_rescore_factor}",
+                f"SET LOCAL turboquant.decode_rescore_extra_candidates = {turboquant_decode_rescore_extra_value}",
             ],
             "candidate_slots_bound": turboquant_probe_value * turboquant_oversample_value,
             "query_knobs": {
@@ -632,6 +683,10 @@ def method_spec(
                 "turboquant.oversample_factor": turboquant_oversample_value,
                 "turboquant.max_visited_codes": turboquant_max_codes_value,
                 "turboquant.max_visited_pages": turboquant_max_pages_value,
+                "turboquant.shadow_decode_diagnostics": turboquant_shadow_decode_diagnostics,
+                "turboquant.force_decode_score_diagnostics": turboquant_force_decode_score_diagnostics,
+                "turboquant.decode_rescore_factor": turboquant_decode_rescore_factor,
+                "turboquant.decode_rescore_extra_candidates": turboquant_decode_rescore_extra_value,
             },
         }
     if method == "turboquant_ivf":
@@ -652,6 +707,18 @@ def method_spec(
                 f"SET LOCAL turboquant.oversample_factor = {turboquant_oversample_value}",
                 f"SET LOCAL turboquant.max_visited_codes = {turboquant_max_codes_value}",
                 f"SET LOCAL turboquant.max_visited_pages = {turboquant_max_pages_value}",
+                (
+                    "SET LOCAL turboquant.shadow_decode_diagnostics = on"
+                    if turboquant_shadow_decode_diagnostics
+                    else "SET LOCAL turboquant.shadow_decode_diagnostics = off"
+                ),
+                (
+                    "SET LOCAL turboquant.force_decode_score_diagnostics = on"
+                    if turboquant_force_decode_score_diagnostics
+                    else "SET LOCAL turboquant.force_decode_score_diagnostics = off"
+                ),
+                f"SET LOCAL turboquant.decode_rescore_factor = {turboquant_decode_rescore_factor}",
+                f"SET LOCAL turboquant.decode_rescore_extra_candidates = {turboquant_decode_rescore_extra_value}",
             ],
             "candidate_slots_bound": turboquant_probe_value * turboquant_oversample_value,
             "query_knobs": {
@@ -659,6 +726,10 @@ def method_spec(
                 "turboquant.oversample_factor": turboquant_oversample_value,
                 "turboquant.max_visited_codes": turboquant_max_codes_value,
                 "turboquant.max_visited_pages": turboquant_max_pages_value,
+                "turboquant.shadow_decode_diagnostics": turboquant_shadow_decode_diagnostics,
+                "turboquant.force_decode_score_diagnostics": turboquant_force_decode_score_diagnostics,
+                "turboquant.decode_rescore_factor": turboquant_decode_rescore_factor,
+                "turboquant.decode_rescore_extra_candidates": turboquant_decode_rescore_extra_value,
             },
         }
     if method == "turboquant_bitmap":
@@ -779,18 +850,28 @@ def build_index(
     index_name: str,
     corpus: Corpus,
     method: str,
+    requested_rerank_candidate_limit: Optional[int],
     turboquant_probes: Optional[int],
     turboquant_oversample_factor: Optional[int],
     turboquant_max_visited_codes: Optional[int],
     turboquant_max_visited_pages: Optional[int],
+    turboquant_shadow_decode_diagnostics: bool,
+    turboquant_force_decode_score_diagnostics: bool,
+    turboquant_decode_rescore_factor: int,
+    turboquant_decode_rescore_extra_candidates: Optional[int],
 ) -> tuple[float, int, int, dict]:
     spec = method_spec(
         method,
         corpus,
+        requested_rerank_candidate_limit,
         turboquant_probes,
         turboquant_oversample_factor,
         turboquant_max_visited_codes,
         turboquant_max_visited_pages,
+        turboquant_shadow_decode_diagnostics,
+        turboquant_force_decode_score_diagnostics,
+        turboquant_decode_rescore_factor,
+        turboquant_decode_rescore_extra_candidates,
     )
     build_sql = f"""
     DROP INDEX IF EXISTS {index_name};
@@ -959,6 +1040,11 @@ def default_scan_stats(method: str) -> dict:
         "candidate_heap_insert_count": 0,
         "candidate_heap_replace_count": 0,
         "candidate_heap_reject_count": 0,
+        "shadow_decoded_vector_count": 0,
+        "shadow_decode_candidate_count": 0,
+        "shadow_decode_overlap_count": 0,
+        "shadow_decode_primary_only_count": 0,
+        "shadow_decode_only_count": 0,
         "decoded_vector_count": 0,
         "page_prune_count": 0,
         "early_stop_count": 0,
@@ -986,6 +1072,11 @@ def aggregate_scan_stats(scan_stats: list[dict], fallback_method: str) -> dict:
         "candidate_heap_insert_count",
         "candidate_heap_replace_count",
         "candidate_heap_reject_count",
+        "shadow_decoded_vector_count",
+        "shadow_decode_candidate_count",
+        "shadow_decode_overlap_count",
+        "shadow_decode_primary_only_count",
+        "shadow_decode_only_count",
         "decoded_vector_count",
         "page_prune_count",
         "early_stop_count",
@@ -1008,6 +1099,11 @@ def default_candidate_retention() -> dict:
         "avg_exact_top_100_retention": 0.0,
         "avg_exact_top_100_miss_count": 0.0,
         "worst_exact_top_100_retention": 0.0,
+        "avg_shadow_candidate_count": 0.0,
+        "avg_shadow_exact_top_10_retention": 0.0,
+        "avg_shadow_exact_top_100_retention": 0.0,
+        "avg_shadow_exact_top_100_miss_count": 0.0,
+        "worst_shadow_exact_top_100_retention": 0.0,
     }
 
 
@@ -1049,6 +1145,26 @@ def aggregate_candidate_retention(retention_stats: list[dict]) -> dict:
         ),
         "worst_exact_top_100_retention": round(
             min(float(item.get("exact_top_100_retention", 0.0)) for item in retention_stats),
+            6,
+        ),
+        "avg_shadow_candidate_count": round(
+            sum(float(item.get("shadow_candidate_count", 0.0)) for item in retention_stats) / len(retention_stats),
+            6,
+        ),
+        "avg_shadow_exact_top_10_retention": round(
+            sum(float(item.get("shadow_exact_top_10_retention", 0.0)) for item in retention_stats) / len(retention_stats),
+            6,
+        ),
+        "avg_shadow_exact_top_100_retention": round(
+            sum(float(item.get("shadow_exact_top_100_retention", 0.0)) for item in retention_stats) / len(retention_stats),
+            6,
+        ),
+        "avg_shadow_exact_top_100_miss_count": round(
+            sum(float(item.get("shadow_exact_top_100_miss_count", 0.0)) for item in retention_stats) / len(retention_stats),
+            6,
+        ),
+        "worst_shadow_exact_top_100_retention": round(
+            min(float(item.get("shadow_exact_top_100_retention", 0.0)) for item in retention_stats),
             6,
         ),
     }
@@ -1122,7 +1238,7 @@ def turboquant_rerank_ids_sql(
     query_setup: list[str],
     requested_candidate_limit: Optional[int],
 ) -> str:
-    helper_candidate_limit = effective_candidate_limit(limit, requested_candidate_limit)
+    requested_limit = rerank_candidate_limit(limit, requested_candidate_limit)
     return ";\n".join(
         query_setup
         + [
@@ -1131,7 +1247,7 @@ def turboquant_rerank_ids_sql(
                 "FROM tq_rerank_candidates("
                 f"'{table_name}'::regclass, 'id', 'embedding', "
                 f"'{vector_literal(query_vector)}'::vector, 'cosine', "
-                f"{helper_candidate_limit}, {limit})"
+                f"{requested_limit}, {limit})"
             )
         ]
     )
@@ -1143,21 +1259,34 @@ def turboquant_single_batch_rerank_ids_sql(
     limit: int,
     query_setup: list[str],
     requested_candidate_limit: Optional[int],
+    decode_rescore_extra_candidates: int = 0,
 ) -> str:
-    helper_candidate_limit = effective_candidate_limit(limit, requested_candidate_limit)
+    requested_limit = rerank_candidate_limit(limit, requested_candidate_limit)
     query_literal = vector_literal(query_vector)
-    session_setup = [statement for statement in query_setup if not statement.startswith("SET LOCAL turboquant.")]
+    resolved_knob_prefixes = (
+        "SET LOCAL turboquant.probes =",
+        "SET LOCAL turboquant.oversample_factor =",
+        "SET LOCAL turboquant.max_visited_codes =",
+        "SET LOCAL turboquant.max_visited_pages =",
+    )
+    session_setup = [
+        statement
+        for statement in query_setup
+        if not statement.startswith(resolved_knob_prefixes)
+    ]
     return ";\n".join(
         ["BEGIN"]
         + session_setup
         + [
             (
                 "DO $$ "
-                "DECLARE resolved record; "
+                "DECLARE effective_candidate_limit integer; resolved record; "
                 "BEGIN "
+                f"SELECT tq_effective_rerank_candidate_limit({requested_limit}, {limit}) "
+                "INTO effective_candidate_limit; "
                 "SELECT probes, oversample_factor, max_visited_codes, max_visited_pages "
                 "INTO resolved "
-                f"FROM tq_resolve_query_knobs({helper_candidate_limit}, {limit}, NULL, NULL); "
+                f"FROM tq_resolve_query_knobs(effective_candidate_limit, {limit}, NULL, NULL); "
                 "PERFORM set_config('turboquant.probes', resolved.probes::text, true); "
                 "PERFORM set_config('turboquant.oversample_factor', resolved.oversample_factor::text, true); "
                 "PERFORM set_config('turboquant.max_visited_codes', resolved.max_visited_codes::text, true); "
@@ -1169,7 +1298,7 @@ def turboquant_single_batch_rerank_ids_sql(
                 f"SELECT id, embedding, (embedding <=> '{query_literal}'::vector) AS approximate_distance "
                 f"FROM {table_name} "
                 f"ORDER BY embedding <=> '{query_literal}'::vector "
-                f"LIMIT {helper_candidate_limit}"
+                f"LIMIT tq_effective_rerank_candidate_limit({requested_limit}, {limit})"
                 "), approx AS MATERIALIZED ("
                 "SELECT "
                 "id::text AS candidate_id, "
@@ -1203,24 +1332,44 @@ def query_turboquant_ordered_ids_and_scan_stats(
     limit: int,
     query_setup: list[str],
     requested_candidate_limit: Optional[int],
+    decode_rescore_extra_candidates: int = 0,
     method: str = "turboquant_ivf",
-) -> tuple[list[int], dict, list[int]]:
+) -> tuple[list[int], dict, list[int], list[int]]:
+    shadow_decode_enabled = any(
+        statement == "SET LOCAL turboquant.shadow_decode_diagnostics = on"
+        for statement in query_setup
+    )
     query_sql = turboquant_single_batch_rerank_ids_sql(
         table_name,
         query_vector,
         limit,
         query_setup,
         requested_candidate_limit,
+        decode_rescore_extra_candidates,
     )
     rows = query_psql_commands(
         base_cmd,
-        query_sql + ";\nSELECT tq_last_scan_stats()::text;\nCOMMIT;",
+        (
+            query_sql
+            + ";\nSELECT tq_last_scan_stats()::text;\n"
+            + (
+                (
+                    "SELECT coalesce(json_agg(source.id ORDER BY shadow.ordinality), '[]'::json)::text "
+                    f"FROM unnest(tq_last_shadow_decode_candidate_tids_core()) WITH ORDINALITY AS shadow(candidate_tid_text, ordinality) "
+                    f"JOIN {table_name} source ON source.ctid = shadow.candidate_tid_text::tid;\n"
+                )
+                if shadow_decode_enabled
+                else ""
+            )
+            + "COMMIT;"
+        ),
     )
     payload = json.loads(rows[0]) if rows else {}
     query_ids = list(payload.get("reranked_ids", []))
     approx_candidate_ids = list(payload.get("approx_candidate_ids", []))
     scan_stats = json.loads(rows[1]) if len(rows) > 1 else default_scan_stats(method)
-    return query_ids, scan_stats, approx_candidate_ids
+    shadow_candidate_ids = list(json.loads(rows[2])) if len(rows) > 2 else []
+    return query_ids, scan_stats, approx_candidate_ids, shadow_candidate_ids
 
 
 def query_bitmap_ids_and_scan_stats(
@@ -1742,6 +1891,10 @@ def run_scenario(
     turboquant_oversample_factor: Optional[int],
     turboquant_max_visited_codes: Optional[int],
     turboquant_max_visited_pages: Optional[int],
+    turboquant_shadow_decode_diagnostics: bool,
+    turboquant_force_decode_score_diagnostics: bool,
+    turboquant_decode_rescore_factor: int,
+    turboquant_decode_rescore_extra_candidates: Optional[int],
     requested_rerank_candidate_limit: Optional[int],
 ) -> dict:
     table_name = f"tq_benchmark_{scenario_index:04d}"
@@ -1754,10 +1907,15 @@ def run_scenario(
         index_name,
         corpus,
         method,
+        requested_rerank_candidate_limit,
         turboquant_probes,
         turboquant_oversample_factor,
         turboquant_max_visited_codes,
         turboquant_max_visited_pages,
+        turboquant_shadow_decode_diagnostics,
+        turboquant_force_decode_score_diagnostics,
+        turboquant_decode_rescore_factor,
+        turboquant_decode_rescore_extra_candidates,
     )
 
     if corpus.name == "mixed_live_dead":
@@ -1819,16 +1977,23 @@ def run_scenario(
             best_latency_ms = None
             best_scan_stats = default_scan_stats(method)
             best_approx_candidate_ids = []
+            best_shadow_candidate_ids = []
             for _ in range(repetitions):
                 started = time.perf_counter()
                 if spec["index_method"] == "turboquant":
-                    query_ids, query_scan_stats, approx_candidate_ids = query_turboquant_ordered_ids_and_scan_stats(
+                    decode_rescore_extra_candidates = 0
+                    if int(spec["query_knobs"].get("turboquant.decode_rescore_factor", 1)) > 1:
+                        decode_rescore_extra_candidates = int(
+                            spec["query_knobs"].get("turboquant.decode_rescore_extra_candidates", 0)
+                        )
+                    query_ids, query_scan_stats, approx_candidate_ids, shadow_candidate_ids = query_turboquant_ordered_ids_and_scan_stats(
                         base_cmd,
                         table_name,
                         query,
                         TOP_K_VALUES[-1],
                         spec["query_setup"],
                         requested_rerank_candidate_limit,
+                        decode_rescore_extra_candidates,
                         method=method,
                     )
                 else:
@@ -1842,18 +2007,28 @@ def run_scenario(
                     )
                     query_scan_stats = default_scan_stats(method)
                     approx_candidate_ids = []
+                    shadow_candidate_ids = []
                 elapsed_ms = (time.perf_counter() - started) * 1000.0
                 if best_latency_ms is None or elapsed_ms < best_latency_ms:
                     best_latency_ms = elapsed_ms
                     best_ids = query_ids
                     best_scan_stats = query_scan_stats
                     best_approx_candidate_ids = approx_candidate_ids
+                    best_shadow_candidate_ids = shadow_candidate_ids
             approx_results.append(best_ids)
             latencies_ms.append(best_latency_ms or 0.0)
             scan_stats_results.append(best_scan_stats)
             if spec["index_method"] == "turboquant":
+                primary_retention = candidate_retention_for_query(exact_results[query_index], best_approx_candidate_ids)
+                shadow_retention = candidate_retention_for_query(exact_results[query_index], best_shadow_candidate_ids)
                 candidate_retention_results.append(
-                    candidate_retention_for_query(exact_results[query_index], best_approx_candidate_ids)
+                    primary_retention
+                    | {
+                        "shadow_candidate_count": shadow_retention["candidate_count"],
+                        "shadow_exact_top_10_retention": shadow_retention["exact_top_10_retention"],
+                        "shadow_exact_top_100_retention": shadow_retention["exact_top_100_retention"],
+                        "shadow_exact_top_100_miss_count": shadow_retention["exact_top_100_miss_count"],
+                    }
                 )
 
     insert_wal_bytes, inserted_rows = measure_insert_wal(base_cmd, table_name, corpus)
@@ -1943,11 +2118,23 @@ def run_scenario(
             "sealed_baseline_maintenance_wal_bytes": sealed_baseline_maintenance_wal_bytes,
         }
     else:
+        decode_rescore_extra_candidates = 0
+        if (
+            spec["index_method"] == "turboquant"
+            and int(spec["query_knobs"].get("turboquant.decode_rescore_factor", 1)) > 1
+        ):
+            decode_rescore_extra_candidates = int(
+                spec["query_knobs"].get("turboquant.decode_rescore_extra_candidates", 0)
+            )
         scenario["query_api"] = {
             "helper": "tq_rerank_candidates",
             "candidate_limit": rerank_candidate_limit(TOP_K_VALUES[-1], requested_rerank_candidate_limit),
             "final_limit": TOP_K_VALUES[-1],
-            "effective_candidate_limit": effective_candidate_limit(TOP_K_VALUES[-1], requested_rerank_candidate_limit),
+            "effective_candidate_limit": effective_candidate_limit(
+                TOP_K_VALUES[-1],
+                requested_rerank_candidate_limit,
+                decode_rescore_extra_candidates,
+            ),
         }
         scenario["metrics"] = {
             "recall_at_10": average_recall(exact_results, approx_results, 10),
@@ -1977,19 +2164,41 @@ def dry_run_scenario(
     turboquant_oversample_factor: Optional[int],
     turboquant_max_visited_codes: Optional[int],
     turboquant_max_visited_pages: Optional[int],
+    turboquant_shadow_decode_diagnostics: bool,
+    turboquant_force_decode_score_diagnostics: bool,
+    turboquant_decode_rescore_factor: int,
+    turboquant_decode_rescore_extra_candidates: Optional[int],
     requested_rerank_candidate_limit: Optional[int],
 ) -> dict:
     spec = method_spec(
         method,
         corpus,
+        requested_rerank_candidate_limit,
         turboquant_probes,
         turboquant_oversample_factor,
         turboquant_max_visited_codes,
         turboquant_max_visited_pages,
+        turboquant_shadow_decode_diagnostics,
+        turboquant_force_decode_score_diagnostics,
+        turboquant_decode_rescore_factor,
+        turboquant_decode_rescore_extra_candidates,
     )
     simd_metadata = synthetic_simd_metadata()
     scan_stats = default_scan_stats(method)
-    scan_stats["score_kernel"] = synthetic_code_domain_kernel(corpus, spec, simd_metadata)
+    if (
+        spec["index_method"] == "turboquant"
+        and spec["query_knobs"].get("turboquant.force_decode_score_diagnostics", False)
+    ):
+        scan_stats["score_mode"] = "decode"
+        scan_stats["score_kernel"] = "scalar"
+    elif (
+        spec["index_method"] == "turboquant"
+        and int(spec["query_knobs"].get("turboquant.decode_rescore_factor", 1)) > 1
+    ):
+        scan_stats["score_mode"] = "decode_rescore"
+        scan_stats["score_kernel"] = "scalar"
+    else:
+        scan_stats["score_kernel"] = synthetic_code_domain_kernel(corpus, spec, simd_metadata)
     simd_metadata["code_domain_kernel"] = scan_stats["score_kernel"]
 
     scenario = {
@@ -2050,11 +2259,23 @@ def dry_run_scenario(
             "sealed_baseline_maintenance_wal_bytes": 1,
         }
     else:
+        decode_rescore_extra_candidates = 0
+        if (
+            spec["index_method"] == "turboquant"
+            and int(spec["query_knobs"].get("turboquant.decode_rescore_factor", 1)) > 1
+        ):
+            decode_rescore_extra_candidates = int(
+                spec["query_knobs"].get("turboquant.decode_rescore_extra_candidates", 0)
+            )
         scenario["query_api"] = {
             "helper": "tq_rerank_candidates",
             "candidate_limit": rerank_candidate_limit(TOP_K_VALUES[-1], requested_rerank_candidate_limit),
             "final_limit": TOP_K_VALUES[-1],
-            "effective_candidate_limit": effective_candidate_limit(TOP_K_VALUES[-1], requested_rerank_candidate_limit),
+            "effective_candidate_limit": effective_candidate_limit(
+                TOP_K_VALUES[-1],
+                requested_rerank_candidate_limit,
+                decode_rescore_extra_candidates,
+            ),
         }
         scenario["metrics"] = {
             "recall_at_10": 0.0,
@@ -2091,6 +2312,10 @@ def main() -> None:
     parser.add_argument("--turboquant-oversample-factor", type=int)
     parser.add_argument("--turboquant-max-visited-codes", type=int)
     parser.add_argument("--turboquant-max-visited-pages", type=int)
+    parser.add_argument("--turboquant-shadow-decode-diagnostics", action="store_true")
+    parser.add_argument("--turboquant-force-decode-score-diagnostics", action="store_true")
+    parser.add_argument("--turboquant-decode-rescore-factor", type=int, default=1)
+    parser.add_argument("--turboquant-decode-rescore-extra-candidates", type=int)
     parser.add_argument("--rerank-candidate-limit", type=int)
     parser.add_argument("--report", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -2131,6 +2356,10 @@ def main() -> None:
                         args.turboquant_oversample_factor,
                         args.turboquant_max_visited_codes,
                         args.turboquant_max_visited_pages,
+                        args.turboquant_shadow_decode_diagnostics,
+                        args.turboquant_force_decode_score_diagnostics,
+                        args.turboquant_decode_rescore_factor,
+                        args.turboquant_decode_rescore_extra_candidates,
                         args.rerank_candidate_limit,
                     )
                 )
@@ -2146,6 +2375,10 @@ def main() -> None:
                         args.turboquant_oversample_factor,
                         args.turboquant_max_visited_codes,
                         args.turboquant_max_visited_pages,
+                        args.turboquant_shadow_decode_diagnostics,
+                        args.turboquant_force_decode_score_diagnostics,
+                        args.turboquant_decode_rescore_factor,
+                        args.turboquant_decode_rescore_extra_candidates,
                         args.rerank_candidate_limit,
                     )
                 )

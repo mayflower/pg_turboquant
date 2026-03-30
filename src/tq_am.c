@@ -71,12 +71,14 @@ typedef struct TqScanOpaque
 	TqTransformState transform_state;
 	TqProdLut	lut;
 	TqCandidateHeap candidates;
+	TqCandidateHeap shadow_decode_candidates;
 	TqProdCodecConfig prod_config;
 	float	   *query_values;
 	uint32_t	query_dimension;
 	TqDistanceKind distance_kind;
 	TqVectorInputKind input_kind;
 	bool		normalized;
+	bool		shadow_decode_diagnostics;
 	bool		prepared;
 } TqScanOpaque;
 
@@ -202,6 +204,8 @@ static void tq_summarize_index(Relation index_relation,
 static bool tq_scan_batch_block(Relation index_relation,
 								BlockNumber block_number,
 								TqScanOpaque *opaque,
+								TqCandidateHeap *heap,
+								TqCandidateHeap *shadow_decode_heap,
 								char *errmsg,
 								size_t errmsg_len);
 static bool tq_collect_bounded_pages_for_list(Relation index_relation,
@@ -349,11 +353,13 @@ tq_reset_scan_opaque(TqScanOpaque *opaque)
 	tq_transform_reset(&opaque->transform_state);
 	tq_prod_lut_reset(&opaque->lut);
 	tq_candidate_heap_reset(&opaque->candidates);
+	tq_candidate_heap_reset(&opaque->shadow_decode_candidates);
 	if (opaque->query_values != NULL)
 		pfree(opaque->query_values);
 	memset(&opaque->prod_config, 0, sizeof(opaque->prod_config));
 	opaque->query_values = NULL;
 	opaque->query_dimension = 0;
+	opaque->shadow_decode_diagnostics = false;
 	opaque->prepared = false;
 }
 
@@ -2620,6 +2626,8 @@ static bool
 tq_scan_batch_block(Relation index_relation,
 					BlockNumber block_number,
 					TqScanOpaque *opaque,
+					TqCandidateHeap *heap,
+					TqCandidateHeap *shadow_decode_heap,
 					char *errmsg,
 					size_t errmsg_len)
 {
@@ -2636,7 +2644,8 @@ tq_scan_batch_block(Relation index_relation,
 								 &opaque->lut,
 								 opaque->query_values,
 								 opaque->query_dimension,
-								 &opaque->candidates,
+								 heap,
+								 shadow_decode_heap,
 								 errmsg,
 								 errmsg_len))
 	{
@@ -2940,6 +2949,10 @@ tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque)
 	float	   *transformed_query;
 	uint32_t	query_dimension = 0;
 	size_t		total_live = 0;
+	TqCandidateHeap pre_candidates;
+	TqTid	   *pre_candidate_tids = NULL;
+	size_t		pre_candidate_tid_count = 0;
+	bool		decode_rescore_enabled = false;
 	char		error_buf[256];
 
 	if (scan->numberOfOrderBys != 1)
@@ -3014,6 +3027,13 @@ tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque)
 		   sizeof(float) * (size_t) meta_fields.transform_output_dimension);
 	opaque->query_dimension = meta_fields.transform_output_dimension;
 	opaque->normalized = meta_fields.normalized;
+	decode_rescore_enabled = tq_guc_decode_rescore_factor > 1
+		&& tq_scan_active_uses_prod_code_domain(opaque->normalized, opaque->distance_kind)
+		&& !tq_guc_force_decode_score_diagnostics;
+	opaque->shadow_decode_diagnostics = tq_guc_shadow_decode_diagnostics
+		&& !decode_rescore_enabled
+		&& !tq_guc_force_decode_score_diagnostics;
+	memset(&pre_candidates, 0, sizeof(pre_candidates));
 
 	if (!tq_prod_lut_build(&opaque->prod_config, transformed_query, &opaque->lut,
 						   error_buf, sizeof(error_buf)))
@@ -3026,13 +3046,38 @@ tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque)
 	{
 		BlockNumber block_number;
 		BlockNumber nblocks = RelationGetNumberOfBlocks(scan->indexRelation);
+		TqCandidateHeap *active_heap = &opaque->candidates;
+		TqCandidateHeap *shadow_heap = opaque->shadow_decode_diagnostics
+			? &opaque->shadow_decode_candidates
+			: NULL;
+		size_t final_capacity = tq_streaming_candidate_capacity(tq_guc_probes,
+															 tq_guc_oversample_factor);
 
-		if (!tq_candidate_heap_init(&opaque->candidates,
-									tq_streaming_candidate_capacity(tq_guc_probes,
-																 tq_guc_oversample_factor)))
+		if (!tq_candidate_heap_init(&opaque->candidates, final_capacity))
 			ereport(ERROR,
 					(errcode(ERRCODE_OUT_OF_MEMORY),
 					 errmsg("turboquant could not allocate scan candidate heap")));
+		if (decode_rescore_enabled)
+		{
+			size_t pre_capacity = final_capacity;
+
+			if (pre_capacity <= ((size_t) -1) / (size_t) tq_guc_decode_rescore_factor)
+				pre_capacity *= (size_t) tq_guc_decode_rescore_factor;
+			if (pre_capacity < final_capacity)
+				pre_capacity = final_capacity;
+			if (!tq_candidate_heap_init(&pre_candidates, pre_capacity))
+				ereport(ERROR,
+						(errcode(ERRCODE_OUT_OF_MEMORY),
+						 errmsg("turboquant could not allocate decode-rescore preheap")));
+			active_heap = &pre_candidates;
+			shadow_heap = NULL;
+		}
+		if (opaque->shadow_decode_diagnostics
+			&& !tq_candidate_heap_init(&opaque->shadow_decode_candidates,
+									   opaque->candidates.capacity))
+			ereport(ERROR,
+					(errcode(ERRCODE_OUT_OF_MEMORY),
+					 errmsg("turboquant could not allocate shadow decode candidate heap")));
 
 		for (block_number = 1; block_number < nblocks; block_number++)
 		{
@@ -3058,14 +3103,55 @@ tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque)
 										&opaque->lut,
 										opaque->query_values,
 										opaque->query_dimension,
-										&opaque->candidates,
+										active_heap,
+										shadow_heap,
 										error_buf,
 										sizeof(error_buf)))
 				elog(ERROR, "%s", error_buf);
 			ReleaseBuffer(buffer);
 		}
+		if (decode_rescore_enabled)
+		{
+			if (pre_candidates.count > 0)
+			{
+				pre_candidate_tids = (TqTid *) palloc(sizeof(TqTid) * pre_candidates.count);
+				if (!tq_candidate_heap_copy_sorted_tids(&pre_candidates,
+														pre_candidate_tids,
+														pre_candidates.count,
+														&pre_candidate_tid_count))
+					elog(ERROR, "turboquant could not materialize decode-rescore candidate tids");
+			}
+			tq_scan_stats_reset_candidate_heap_metrics();
+			for (block_number = 1; block_number < nblocks; block_number++)
+			{
+				buffer = ReadBufferExtended(scan->indexRelation, MAIN_FORKNUM, block_number, RBM_NORMAL, NULL);
+				if (!tq_batch_page_rescore_prod_candidates(tq_page_payload(BufferGetPage(buffer)),
+														   tq_page_payload_size(BufferGetPage(buffer)),
+														   &opaque->prod_config,
+														   opaque->normalized,
+														   opaque->distance_kind,
+														   opaque->query_values,
+														   opaque->query_dimension,
+														   pre_candidate_tids,
+														   pre_candidate_tid_count,
+														   &opaque->candidates,
+														   error_buf,
+														   sizeof(error_buf)))
+				{
+					ReleaseBuffer(buffer);
+					elog(ERROR, "%s", error_buf);
+				}
+				ReleaseBuffer(buffer);
+			}
+			tq_candidate_heap_reset(&pre_candidates);
+			if (pre_candidate_tids != NULL)
+				pfree(pre_candidate_tids);
+		}
 		tq_scan_stats_set_candidate_heap_metrics(opaque->candidates.capacity,
 												 opaque->candidates.count);
+		if (opaque->shadow_decode_diagnostics)
+			tq_scan_stats_set_shadow_decode_metrics(&opaque->candidates,
+													 &opaque->shadow_decode_candidates);
 	}
 	else
 	{
@@ -3085,6 +3171,10 @@ tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque)
 		uint32_t	index = 0;
 		size_t		page_count = 0;
 		size_t		max_pages = 0;
+		TqCandidateHeap *active_heap = &opaque->candidates;
+		TqCandidateHeap *shadow_heap = opaque->shadow_decode_diagnostics
+			? &opaque->shadow_decode_candidates
+			: NULL;
 
 		memset(&router_model, 0, sizeof(router_model));
 		if (!tq_load_router_model(scan->indexRelation, &meta_fields, &router_model,
@@ -3201,6 +3291,30 @@ tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque)
 			ereport(ERROR,
 					(errcode(ERRCODE_OUT_OF_MEMORY),
 					 errmsg("turboquant could not allocate scan candidate heap")));
+		if (total_live > 0 && decode_rescore_enabled)
+		{
+			size_t pre_capacity = opaque->candidates.capacity;
+
+			if (pre_capacity <= ((size_t) -1) / (size_t) tq_guc_decode_rescore_factor)
+				pre_capacity *= (size_t) tq_guc_decode_rescore_factor;
+			if (pre_capacity > total_live)
+				pre_capacity = total_live;
+			if (pre_capacity < opaque->candidates.capacity)
+				pre_capacity = opaque->candidates.capacity;
+			if (!tq_candidate_heap_init(&pre_candidates, pre_capacity))
+				ereport(ERROR,
+						(errcode(ERRCODE_OUT_OF_MEMORY),
+						 errmsg("turboquant could not allocate decode-rescore preheap")));
+			active_heap = &pre_candidates;
+			shadow_heap = NULL;
+		}
+		if (total_live > 0
+			&& opaque->shadow_decode_diagnostics
+			&& !tq_candidate_heap_init(&opaque->shadow_decode_candidates,
+									   opaque->candidates.capacity))
+			ereport(ERROR,
+					(errcode(ERRCODE_OUT_OF_MEMORY),
+					 errmsg("turboquant could not allocate shadow decode candidate heap")));
 
 		max_pages = (size_t) Max((BlockNumber) 1, RelationGetNumberOfBlocks(scan->indexRelation));
 		page_candidates = (TqBoundedPageCandidate *) palloc0(sizeof(TqBoundedPageCandidate) * max_pages);
@@ -3266,6 +3380,8 @@ tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque)
 			if (!tq_scan_batch_block(scan->indexRelation,
 									 page_candidates[index].block_number,
 									 opaque,
+									 active_heap,
+									 shadow_heap,
 									 error_buf,
 									 sizeof(error_buf)))
 			{
@@ -3281,8 +3397,62 @@ tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque)
 			}
 		}
 
+		if (decode_rescore_enabled)
+		{
+			if (pre_candidates.count > 0)
+			{
+				pre_candidate_tids = (TqTid *) palloc(sizeof(TqTid) * pre_candidates.count);
+				if (!tq_candidate_heap_copy_sorted_tids(&pre_candidates,
+														pre_candidate_tids,
+														pre_candidates.count,
+														&pre_candidate_tid_count))
+					elog(ERROR, "turboquant could not materialize decode-rescore candidate tids");
+			}
+			tq_scan_stats_reset_candidate_heap_metrics();
+
+			for (index = 0; index < page_count; index++)
+			{
+				buffer = ReadBufferExtended(scan->indexRelation,
+											MAIN_FORKNUM,
+											page_candidates[index].block_number,
+											RBM_NORMAL,
+											NULL);
+				if (!tq_batch_page_rescore_prod_candidates(tq_page_payload(BufferGetPage(buffer)),
+														   tq_page_payload_size(BufferGetPage(buffer)),
+														   &opaque->prod_config,
+														   opaque->normalized,
+														   opaque->distance_kind,
+														   opaque->query_values,
+														   opaque->query_dimension,
+														   pre_candidate_tids,
+														   pre_candidate_tid_count,
+														   &opaque->candidates,
+														   error_buf,
+														   sizeof(error_buf)))
+				{
+					ReleaseBuffer(buffer);
+					tq_router_reset(&router_model);
+					pfree(selected_entries);
+					pfree(ranked_scores);
+					pfree(ranked_live_counts);
+					pfree(ranked_page_counts);
+					pfree(selected_indexes);
+					pfree(page_candidates);
+					pfree(ranked_probes);
+					elog(ERROR, "%s", error_buf);
+				}
+				ReleaseBuffer(buffer);
+			}
+			tq_candidate_heap_reset(&pre_candidates);
+			if (pre_candidate_tids != NULL)
+				pfree(pre_candidate_tids);
+		}
+
 		tq_scan_stats_set_candidate_heap_metrics(opaque->candidates.capacity,
 												 opaque->candidates.count);
+		if (opaque->shadow_decode_diagnostics)
+			tq_scan_stats_set_shadow_decode_metrics(&opaque->candidates,
+													 &opaque->shadow_decode_candidates);
 
 		tq_router_reset(&router_model);
 		pfree(selected_entries);

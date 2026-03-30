@@ -291,7 +291,7 @@ test_ranking_equivalence_on_seeded_fixture(void)
 	preferred_kernel = tq_prod_code_domain_preferred_kernel(&config);
 	tq_scan_stats_begin(TQ_SCAN_MODE_FLAT, 1);
 	assert(tq_batch_page_scan_prod(page, sizeof(page), &config, true, TQ_DISTANCE_COSINE, &lut,
-								   query, 8, &heap, errmsg, sizeof(errmsg)));
+								   query, 8, &heap, NULL, errmsg, sizeof(errmsg)));
 	tq_scan_stats_snapshot(&stats);
 	assert(stats.score_mode == TQ_SCAN_SCORE_MODE_CODE_DOMAIN);
 	assert(stats.score_kernel == preferred_kernel);

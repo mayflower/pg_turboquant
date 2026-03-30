@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "src/tq_codec_prod.h"
+#include "src/tq_guc.h"
 #include "src/tq_page.h"
 #include "src/tq_scan.h"
 
@@ -189,7 +190,7 @@ test_ranking_matches_decode_baseline_for_normalized_cosine_and_ip(void)
 	tq_prod_decode_counter_reset();
 	tq_scan_stats_begin(TQ_SCAN_MODE_FLAT, 1);
 	assert(tq_batch_page_scan_prod(page, sizeof(page), &config, true, TQ_DISTANCE_COSINE, &lut,
-								   query, 8, &cosine_heap, errmsg, sizeof(errmsg)));
+								   query, 8, &cosine_heap, NULL, errmsg, sizeof(errmsg)));
 	assert(tq_prod_decode_counter_get() == 0);
 	tq_scan_stats_snapshot(&stats);
 	assert(stats.score_mode == TQ_SCAN_SCORE_MODE_CODE_DOMAIN);
@@ -198,7 +199,7 @@ test_ranking_matches_decode_baseline_for_normalized_cosine_and_ip(void)
 	tq_prod_decode_counter_reset();
 	tq_scan_stats_begin(TQ_SCAN_MODE_FLAT, 1);
 	assert(tq_batch_page_scan_prod(page, sizeof(page), &config, true, TQ_DISTANCE_IP, &lut,
-								   query, 8, &ip_heap, errmsg, sizeof(errmsg)));
+								   query, 8, &ip_heap, NULL, errmsg, sizeof(errmsg)));
 	assert(tq_prod_decode_counter_get() == 0);
 	tq_scan_stats_snapshot(&stats);
 	assert(stats.score_mode == TQ_SCAN_SCORE_MODE_CODE_DOMAIN);
@@ -237,11 +238,71 @@ test_distance_conversion_contract(void)
 	assert(fabsf(distance - 0.5f) <= 1e-6f);
 }
 
+static void
+test_force_decode_diagnostics_switches_active_scoring_path(void)
+{
+	TqProdCodecConfig config = {.dimension = 8, .bits = 4};
+	TqProdPackedLayout layout;
+	TqProdLut lut;
+	TqBatchPageParams params;
+	uint8_t page[TQ_DEFAULT_BLOCK_SIZE];
+	uint8_t packed[64];
+	float query[8];
+	float vector[8];
+	TqCandidateHeap heap;
+	TqScanStats stats;
+	uint16_t lane = 0;
+	char errmsg[256];
+	bool previous_force_decode = tq_guc_force_decode_score_diagnostics;
+
+	memset(&layout, 0, sizeof(layout));
+	memset(&lut, 0, sizeof(lut));
+	memset(&params, 0, sizeof(params));
+	memset(page, 0, sizeof(page));
+	memset(&stats, 0, sizeof(stats));
+	memset(query, 0, sizeof(query));
+	memset(vector, 0, sizeof(vector));
+
+	assert(tq_candidate_heap_init(&heap, 4));
+	assert(tq_prod_packed_layout(&config, &layout, errmsg, sizeof(errmsg)));
+	params.lane_count = 4;
+	params.code_bytes = (uint32_t) layout.total_bytes;
+	params.list_id = 0;
+	params.next_block = TQ_INVALID_BLOCK_NUMBER;
+	assert(tq_batch_page_init(page, sizeof(page), &params, errmsg, sizeof(errmsg)));
+
+	seeded_unit_vector(501, query, 8);
+	seeded_unit_vector(502, vector, 8);
+	assert(tq_prod_lut_build(&config, query, &lut, errmsg, sizeof(errmsg)));
+	assert(tq_prod_encode(&config, vector, packed, layout.total_bytes, errmsg, sizeof(errmsg)));
+	assert(tq_batch_page_append_lane(page, sizeof(page),
+									 &(TqTid){.block_number = 1, .offset_number = 1},
+									 &lane, errmsg, sizeof(errmsg)));
+	assert(tq_batch_page_set_code(page, sizeof(page), lane, packed, layout.total_bytes,
+								  errmsg, sizeof(errmsg)));
+
+	tq_guc_force_decode_score_diagnostics = true;
+	tq_prod_decode_counter_reset();
+	tq_scan_stats_begin(TQ_SCAN_MODE_FLAT, 1);
+	assert(tq_batch_page_scan_prod(page, sizeof(page), &config, true, TQ_DISTANCE_COSINE, &lut,
+								   query, 8, &heap, NULL, errmsg, sizeof(errmsg)));
+	tq_scan_stats_snapshot(&stats);
+
+	assert(stats.score_mode == TQ_SCAN_SCORE_MODE_DECODE);
+	assert(stats.decoded_vector_count == 1);
+	assert(tq_prod_decode_counter_get() == 1);
+
+	tq_guc_force_decode_score_diagnostics = previous_force_decode;
+	tq_candidate_heap_reset(&heap);
+	tq_prod_lut_reset(&lut);
+}
+
 int
 main(void)
 {
 	test_code_domain_score_matches_decode_baseline();
 	test_ranking_matches_decode_baseline_for_normalized_cosine_and_ip();
 	test_distance_conversion_contract();
+	test_force_decode_diagnostics_switches_active_scoring_path();
 	return 0;
 }

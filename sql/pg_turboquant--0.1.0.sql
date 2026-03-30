@@ -38,6 +38,11 @@ RETURNS text
 LANGUAGE C
 AS 'MODULE_PATHNAME', 'tq_last_scan_stats_core';
 
+CREATE FUNCTION tq_last_shadow_decode_candidate_tids_core()
+RETURNS text[]
+LANGUAGE C
+AS 'MODULE_PATHNAME', 'tq_last_shadow_decode_candidate_tids_core';
+
 CREATE FUNCTION tq_runtime_simd_features_core()
 RETURNS text
 LANGUAGE C STRICT
@@ -52,6 +57,8 @@ AS $$
 $$;
 
 COMMENT ON FUNCTION tq_last_scan_stats() IS 'Returns backend-local JSON metrics for the last turboquant scan in the current session.';
+
+COMMENT ON FUNCTION tq_last_shadow_decode_candidate_tids_core() IS 'Diagnostic helper that returns backend-local shadow decode candidate CTIDs from the last turboquant scan in the current session.';
 
 CREATE FUNCTION tq_runtime_simd_features()
 RETURNS jsonb
@@ -223,6 +230,51 @@ $$;
 
 COMMENT ON FUNCTION tq_recommended_query_knobs(integer, integer) IS 'Returns recommended turboquant probes, oversample_factor, and visit budgets for a two-stage query.';
 
+CREATE FUNCTION tq_effective_rerank_candidate_limit(candidate_limit integer,
+													final_limit integer)
+RETURNS integer
+LANGUAGE plpgsql
+AS $$
+DECLARE
+	decode_rescore_factor integer;
+	decode_rescore_extra_candidates integer;
+	base_candidate_limit integer;
+BEGIN
+	IF candidate_limit IS NULL OR candidate_limit < 1 THEN
+		RAISE EXCEPTION 'invalid turboquant candidate_limit: %', candidate_limit
+			USING ERRCODE = '22023',
+				  HINT = 'candidate_limit must be at least 1.';
+	END IF;
+
+	IF final_limit IS NULL THEN
+		final_limit := candidate_limit;
+	END IF;
+
+	IF final_limit < 1 THEN
+		RAISE EXCEPTION 'invalid turboquant final_limit: %', final_limit
+			USING ERRCODE = '22023',
+				  HINT = 'final_limit must be at least 1.';
+	END IF;
+
+	base_candidate_limit := GREATEST(candidate_limit, final_limit);
+	decode_rescore_factor := COALESCE(current_setting('turboquant.decode_rescore_factor', true), '1')::integer;
+
+	IF decode_rescore_factor <= 1 THEN
+		RETURN base_candidate_limit;
+	END IF;
+
+	decode_rescore_extra_candidates := COALESCE(current_setting('turboquant.decode_rescore_extra_candidates', true), '-1')::integer;
+
+	IF decode_rescore_extra_candidates < 0 THEN
+		decode_rescore_extra_candidates := LEAST(512, GREATEST(128, candidate_limit / 2));
+	END IF;
+
+	RETURN base_candidate_limit + decode_rescore_extra_candidates;
+END;
+$$;
+
+COMMENT ON FUNCTION tq_effective_rerank_candidate_limit(integer, integer) IS 'Returns the effective approximate candidate limit used by tq_rerank_candidates() after decode-rescore boundary-band expansion.';
+
 CREATE FUNCTION tq_approx_candidates(indexed_table regclass,
 									 id_column name,
 									 embedding_column name,
@@ -238,6 +290,7 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
 	order_operator text;
+	effective_candidate_limit integer;
 	resolved_probes integer;
 	resolved_oversample integer;
 	resolved_max_visited_codes integer;
@@ -289,6 +342,7 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
 	order_operator text;
+	effective_candidate_limit integer;
 	resolved_probes integer;
 	resolved_oversample integer;
 	resolved_max_visited_codes integer;
@@ -346,6 +400,7 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
 	order_operator text;
+	effective_candidate_limit integer;
 	resolved_probes integer;
 	resolved_oversample integer;
 	resolved_max_visited_codes integer;
@@ -353,10 +408,11 @@ DECLARE
 	helper_sql text;
 BEGIN
 	order_operator := tq_metric_order_operator(metric);
+	effective_candidate_limit := tq_effective_rerank_candidate_limit(candidate_limit, final_limit);
 
 	SELECT knobs.probes, knobs.oversample_factor, knobs.max_visited_codes, knobs.max_visited_pages
 	INTO resolved_probes, resolved_oversample, resolved_max_visited_codes, resolved_max_visited_pages
-	FROM tq_resolve_query_knobs(candidate_limit, final_limit, probes, oversample_factor) AS knobs;
+	FROM tq_resolve_query_knobs(effective_candidate_limit, final_limit, probes, oversample_factor) AS knobs;
 
 	EXECUTE format('SET LOCAL turboquant.probes = %s', resolved_probes);
 	EXECUTE format('SET LOCAL turboquant.oversample_factor = %s', resolved_oversample);
@@ -389,7 +445,7 @@ BEGIN
 		ORDER BY exact_rank
 	$fmt$, id_column, embedding_column, order_operator, indexed_table);
 
-	RETURN QUERY EXECUTE helper_sql USING query_vector, candidate_limit, final_limit;
+	RETURN QUERY EXECUTE helper_sql USING query_vector, effective_candidate_limit, final_limit;
 END;
 $$;
 
@@ -411,6 +467,7 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
 	order_operator text;
+	effective_candidate_limit integer;
 	resolved_probes integer;
 	resolved_oversample integer;
 	resolved_max_visited_codes integer;
@@ -418,10 +475,11 @@ DECLARE
 	helper_sql text;
 BEGIN
 	order_operator := tq_metric_order_operator(metric);
+	effective_candidate_limit := tq_effective_rerank_candidate_limit(candidate_limit, final_limit);
 
 	SELECT knobs.probes, knobs.oversample_factor, knobs.max_visited_codes, knobs.max_visited_pages
 	INTO resolved_probes, resolved_oversample, resolved_max_visited_codes, resolved_max_visited_pages
-	FROM tq_resolve_query_knobs(candidate_limit, final_limit, probes, oversample_factor) AS knobs;
+	FROM tq_resolve_query_knobs(effective_candidate_limit, final_limit, probes, oversample_factor) AS knobs;
 
 	EXECUTE format('SET LOCAL turboquant.probes = %s', resolved_probes);
 	EXECUTE format('SET LOCAL turboquant.oversample_factor = %s', resolved_oversample);
@@ -454,7 +512,7 @@ BEGIN
 		ORDER BY exact_rank
 	$fmt$, id_column, embedding_column, order_operator, indexed_table);
 
-	RETURN QUERY EXECUTE helper_sql USING query_vector, candidate_limit, final_limit;
+	RETURN QUERY EXECUTE helper_sql USING query_vector, effective_candidate_limit, final_limit;
 END;
 $$;
 

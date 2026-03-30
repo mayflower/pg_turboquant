@@ -105,6 +105,16 @@ FROM reranked
 WHERE exact_rank <= 2
 ORDER BY exact_rank;
 
+SET turboquant.decode_rescore_factor = 4;
+SET turboquant.decode_rescore_extra_candidates = 16;
+SELECT tq_effective_rerank_candidate_limit(32, 100);
+SET turboquant.decode_rescore_extra_candidates = 0;
+SELECT tq_effective_rerank_candidate_limit(32, 100);
+SET turboquant.decode_rescore_extra_candidates = -1;
+SELECT tq_effective_rerank_candidate_limit(1024, 100);
+RESET turboquant.decode_rescore_factor;
+RESET turboquant.decode_rescore_extra_candidates;
+
 SELECT * FROM tq_recommended_query_knobs(0, 1);
 SELECT * FROM tq_recommended_query_knobs(4, 8);
 
@@ -128,3 +138,18 @@ FROM tq_rerank_candidates(
 	2,
 	3
 );
+
+SET turboquant.decode_rescore_factor = 4;
+SET turboquant.decode_rescore_extra_candidates = 0;
+SELECT *
+FROM tq_rerank_candidates(
+	'tq_query_helper_docs'::regclass,
+	'id',
+	'embedding',
+	'[1,0,0,0]'::vector(4),
+	'cosine',
+	2,
+	3
+);
+RESET turboquant.decode_rescore_factor;
+RESET turboquant.decode_rescore_extra_candidates;

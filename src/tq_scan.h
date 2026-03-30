@@ -36,6 +36,7 @@ typedef enum TqScanScoreMode
 {
 	TQ_SCAN_SCORE_MODE_NONE = 0,
 	TQ_SCAN_SCORE_MODE_DECODE,
+	TQ_SCAN_SCORE_MODE_DECODE_RESCORE,
 	TQ_SCAN_SCORE_MODE_CODE_DOMAIN,
 	TQ_SCAN_SCORE_MODE_BITMAP_FILTER
 } TqScanScoreMode;
@@ -61,6 +62,11 @@ typedef struct TqScanStats
 	size_t		candidate_heap_insert_count;
 	size_t		candidate_heap_replace_count;
 	size_t		candidate_heap_reject_count;
+	size_t		shadow_decoded_vector_count;
+	size_t		shadow_decode_candidate_count;
+	size_t		shadow_decode_overlap_count;
+	size_t		shadow_decode_primary_only_count;
+	size_t		shadow_decode_only_count;
 	size_t		decoded_vector_count;
 	size_t		bound_data_page_reads;
 	size_t		page_prune_count;
@@ -114,6 +120,7 @@ extern void tq_scan_stats_reset_last(void);
 extern void tq_scan_stats_begin(TqScanMode mode, size_t configured_probe_count);
 extern void tq_scan_stats_set_score_mode(TqScanScoreMode score_mode);
 extern void tq_scan_stats_set_score_kernel(TqProdScoreKernel score_kernel);
+extern void tq_scan_stats_reset_candidate_heap_metrics(void);
 extern void tq_scan_stats_set_probe_budget(size_t nominal_probe_count,
 										   size_t effective_probe_count,
 										   size_t max_visited_codes,
@@ -129,11 +136,23 @@ extern void tq_scan_stats_add_early_stops(size_t count);
 extern void tq_scan_stats_record_candidate_heap_insert(void);
 extern void tq_scan_stats_record_candidate_heap_replace(void);
 extern void tq_scan_stats_record_candidate_heap_reject(void);
+extern void tq_scan_stats_record_decoded_vector_only(void);
+extern void tq_scan_stats_record_shadow_decoded_vector(void);
 extern void tq_scan_stats_set_candidate_heap_metrics(size_t capacity, size_t count);
+extern void tq_scan_stats_set_shadow_decode_metrics(const TqCandidateHeap *primary,
+													const TqCandidateHeap *shadow);
+extern bool tq_candidate_heap_copy_sorted_tids(const TqCandidateHeap *heap,
+											   TqTid *dest,
+											   size_t capacity,
+											   size_t *count);
+extern bool tq_scan_stats_copy_shadow_decode_tids(TqTid *dest,
+												  size_t capacity,
+												  size_t *count);
 extern void tq_scan_stats_snapshot(TqScanStats *stats);
 extern bool tq_scan_stats_serialize_json(const TqScanStats *stats,
 										 char *buffer,
 										 size_t buffer_len);
+extern bool tq_scan_active_uses_prod_code_domain(bool normalized, TqDistanceKind distance);
 extern bool tq_batch_page_scan_prod(const void *page,
 									size_t page_size,
 									const TqProdCodecConfig *config,
@@ -143,8 +162,21 @@ extern bool tq_batch_page_scan_prod(const void *page,
 									const float *query_values,
 									size_t query_len,
 									TqCandidateHeap *heap,
+									TqCandidateHeap *shadow_decode_heap,
 									char *errmsg,
 									size_t errmsg_len);
+extern bool tq_batch_page_rescore_prod_candidates(const void *page,
+												  size_t page_size,
+												  const TqProdCodecConfig *config,
+												  bool normalized,
+												  TqDistanceKind distance,
+												  const float *query_values,
+												  size_t query_len,
+												  const TqTid *candidate_tids,
+												  size_t candidate_tid_count,
+												  TqCandidateHeap *heap,
+												  char *errmsg,
+												  size_t errmsg_len);
 extern bool tq_batch_page_scan_prod_cosine(const void *page,
 										   size_t page_size,
 										   const TqProdCodecConfig *config,
@@ -153,6 +185,7 @@ extern bool tq_batch_page_scan_prod_cosine(const void *page,
 										   const float *query_values,
 										   size_t query_len,
 										   TqCandidateHeap *heap,
+										   TqCandidateHeap *shadow_decode_heap,
 										   char *errmsg,
 										   size_t errmsg_len);
 
