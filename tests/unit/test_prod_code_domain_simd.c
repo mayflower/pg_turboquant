@@ -10,12 +10,6 @@
 #include "src/tq_scan.h"
 #include "src/tq_simd_avx2.h"
 
-typedef struct RankedDistance
-{
-	uint16_t	offset;
-	float		distance;
-} RankedDistance;
-
 static void
 normalize(float *values, size_t len)
 {
@@ -44,23 +38,6 @@ seeded_unit_vector(uint32_t seed, float *values, size_t len)
 	}
 
 	normalize(values, len);
-}
-
-static int
-compare_ranked_distance(const void *left, const void *right)
-{
-	const RankedDistance *lhs = (const RankedDistance *) left;
-	const RankedDistance *rhs = (const RankedDistance *) right;
-
-	if (lhs->distance < rhs->distance)
-		return -1;
-	if (lhs->distance > rhs->distance)
-		return 1;
-	if (lhs->offset < rhs->offset)
-		return -1;
-	if (lhs->offset > rhs->offset)
-		return 1;
-	return 0;
 }
 
 static TqProdScoreKernel
@@ -216,6 +193,120 @@ test_supported_shape_neon_matches_scalar_scores_when_available(void)
 }
 
 static void
+test_randomized_avx2_property_matches_scalar_when_available(void)
+{
+	const uint32_t dimensions[] = {8u, 32u, 128u};
+	size_t config_index = 0;
+
+	if (!tq_simd_avx2_runtime_available())
+		return;
+
+	for (config_index = 0; config_index < (sizeof(dimensions) / sizeof(dimensions[0])); config_index++)
+	{
+		TqProdCodecConfig config = {
+			.dimension = dimensions[config_index],
+			.bits = 4,
+			.qjl_dimension = dimensions[config_index],
+			.qjl_seed = 12345u + dimensions[config_index]
+		};
+		TqProdPackedLayout layout;
+		TqProdLut lut;
+		uint8_t packed[512];
+		float query[128];
+		float input[128];
+		uint32_t seed = 0;
+		char errmsg[256];
+
+		memset(&layout, 0, sizeof(layout));
+		memset(&lut, 0, sizeof(lut));
+		memset(packed, 0, sizeof(packed));
+		memset(query, 0, sizeof(query));
+		memset(input, 0, sizeof(input));
+
+		seeded_unit_vector(5000u + dimensions[config_index], query, config.dimension);
+		assert(tq_prod_packed_layout(&config, &layout, errmsg, sizeof(errmsg)));
+		assert(layout.total_bytes <= sizeof(packed));
+		assert(tq_prod_lut_build(&config, query, &lut, errmsg, sizeof(errmsg)));
+
+		for (seed = 0; seed < 96u; seed++)
+		{
+			float scalar_score = 0.0f;
+			float avx2_score = 0.0f;
+			TqProdScoreKernel used_kernel = TQ_PROD_SCORE_SCALAR;
+
+			seeded_unit_vector(7000u + dimensions[config_index] + seed, input, config.dimension);
+			assert(tq_prod_encode(&config, input, packed, layout.total_bytes, errmsg, sizeof(errmsg)));
+			assert(tq_prod_score_code_from_lut(&config, &lut, packed, layout.total_bytes,
+											   &scalar_score, errmsg, sizeof(errmsg)));
+			assert(tq_prod_score_code_from_lut_dispatch(&config, &lut, packed, layout.total_bytes,
+														TQ_PROD_SCORE_AVX2, &avx2_score, &used_kernel,
+														errmsg, sizeof(errmsg)));
+			assert(used_kernel == TQ_PROD_SCORE_AVX2);
+			assert(fabsf(avx2_score - scalar_score) <= 1e-5f);
+		}
+
+		tq_prod_lut_reset(&lut);
+	}
+}
+
+static void
+test_randomized_neon_property_matches_scalar_when_available(void)
+{
+	const uint32_t dimensions[] = {8u, 32u, 128u};
+	size_t config_index = 0;
+
+	if (!tq_simd_neon_runtime_available())
+		return;
+
+	for (config_index = 0; config_index < (sizeof(dimensions) / sizeof(dimensions[0])); config_index++)
+	{
+		TqProdCodecConfig config = {
+			.dimension = dimensions[config_index],
+			.bits = 4,
+			.qjl_dimension = dimensions[config_index],
+			.qjl_seed = 22345u + dimensions[config_index]
+		};
+		TqProdPackedLayout layout;
+		TqProdLut lut;
+		uint8_t packed[512];
+		float query[128];
+		float input[128];
+		uint32_t seed = 0;
+		char errmsg[256];
+
+		memset(&layout, 0, sizeof(layout));
+		memset(&lut, 0, sizeof(lut));
+		memset(packed, 0, sizeof(packed));
+		memset(query, 0, sizeof(query));
+		memset(input, 0, sizeof(input));
+
+		seeded_unit_vector(8000u + dimensions[config_index], query, config.dimension);
+		assert(tq_prod_packed_layout(&config, &layout, errmsg, sizeof(errmsg)));
+		assert(layout.total_bytes <= sizeof(packed));
+		assert(tq_prod_lut_build(&config, query, &lut, errmsg, sizeof(errmsg)));
+
+		for (seed = 0; seed < 96u; seed++)
+		{
+			float scalar_score = 0.0f;
+			float neon_score = 0.0f;
+			TqProdScoreKernel used_kernel = TQ_PROD_SCORE_SCALAR;
+
+			seeded_unit_vector(9000u + dimensions[config_index] + seed, input, config.dimension);
+			assert(tq_prod_encode(&config, input, packed, layout.total_bytes, errmsg, sizeof(errmsg)));
+			assert(tq_prod_score_code_from_lut(&config, &lut, packed, layout.total_bytes,
+											   &scalar_score, errmsg, sizeof(errmsg)));
+			assert(tq_prod_score_code_from_lut_dispatch(&config, &lut, packed, layout.total_bytes,
+														TQ_PROD_SCORE_NEON, &neon_score, &used_kernel,
+														errmsg, sizeof(errmsg)));
+			assert(used_kernel == TQ_PROD_SCORE_NEON);
+			assert(fabsf(neon_score - scalar_score) <= 1e-5f);
+		}
+
+		tq_prod_lut_reset(&lut);
+	}
+}
+
+static void
 test_preferred_kernel_matches_supported_runtime(void)
 {
 	TqProdCodecConfig supported_config = {.dimension = 8, .bits = 4};
@@ -227,7 +318,134 @@ test_preferred_kernel_matches_supported_runtime(void)
 }
 
 static void
-test_ranking_equivalence_on_seeded_fixture(void)
+test_explicit_kernel_selection_reports_requested_or_scalar_fallback(void)
+{
+	TqProdCodecConfig config = {.dimension = 8, .bits = 4};
+	TqProdPackedLayout layout;
+	TqProdLut lut;
+	uint8_t packed[64];
+	float query[8];
+	float input[8];
+	float scalar_score = 0.0f;
+	float explicit_score = 0.0f;
+	TqProdScoreKernel used_kernel = TQ_PROD_SCORE_AUTO;
+	char errmsg[256];
+
+	memset(&layout, 0, sizeof(layout));
+	memset(&lut, 0, sizeof(lut));
+	memset(packed, 0, sizeof(packed));
+	memset(query, 0, sizeof(query));
+	memset(input, 0, sizeof(input));
+
+	seeded_unit_vector(901u, query, 8);
+	seeded_unit_vector(902u, input, 8);
+
+	assert(tq_prod_packed_layout(&config, &layout, errmsg, sizeof(errmsg)));
+	assert(tq_prod_lut_build(&config, query, &lut, errmsg, sizeof(errmsg)));
+	assert(tq_prod_encode(&config, input, packed, layout.total_bytes, errmsg, sizeof(errmsg)));
+	assert(tq_prod_score_code_from_lut_dispatch(&config,
+											   &lut,
+											   packed,
+											   layout.total_bytes,
+											   TQ_PROD_SCORE_SCALAR,
+											   &scalar_score,
+											   &used_kernel,
+											   errmsg,
+											   sizeof(errmsg)));
+	assert(used_kernel == TQ_PROD_SCORE_SCALAR);
+
+	assert(tq_prod_score_code_from_lut_dispatch(&config,
+											   &lut,
+											   packed,
+											   layout.total_bytes,
+											   TQ_PROD_SCORE_AVX2,
+											   &explicit_score,
+											   &used_kernel,
+											   errmsg,
+											   sizeof(errmsg)));
+	assert(fabsf(explicit_score - scalar_score) <= 1e-5f);
+	if (tq_simd_avx2_runtime_available())
+		assert(used_kernel == TQ_PROD_SCORE_AVX2);
+	else
+		assert(used_kernel == TQ_PROD_SCORE_SCALAR);
+
+	assert(tq_prod_score_code_from_lut_dispatch(&config,
+											   &lut,
+											   packed,
+											   layout.total_bytes,
+											   TQ_PROD_SCORE_NEON,
+											   &explicit_score,
+											   &used_kernel,
+											   errmsg,
+											   sizeof(errmsg)));
+	assert(fabsf(explicit_score - scalar_score) <= 1e-5f);
+	if (tq_simd_neon_runtime_available())
+		assert(used_kernel == TQ_PROD_SCORE_NEON);
+	else
+		assert(used_kernel == TQ_PROD_SCORE_SCALAR);
+
+	tq_prod_lut_reset(&lut);
+}
+
+static void
+test_score_decompose_stays_consistent_with_packed_ip(void)
+{
+	TqProdCodecConfig config = {.dimension = 32, .qjl_dimension = 16, .bits = 4, .qjl_seed = 91u};
+	TqProdPackedLayout layout;
+	TqProdLut lut;
+	uint8_t packed[256];
+	float query[32];
+	char errmsg[256];
+	uint32_t seed = 0;
+
+	memset(&layout, 0, sizeof(layout));
+	memset(&lut, 0, sizeof(lut));
+	memset(packed, 0, sizeof(packed));
+	memset(query, 0, sizeof(query));
+
+	seeded_unit_vector(701u, query, 32);
+	assert(tq_prod_packed_layout(&config, &layout, errmsg, sizeof(errmsg)));
+	assert(layout.total_bytes <= sizeof(packed));
+	assert(tq_prod_lut_build(&config, query, &lut, errmsg, sizeof(errmsg)));
+
+	for (seed = 0; seed < 24u; seed++)
+	{
+		float input[32];
+		float mse_contribution = 0.0f;
+		float qjl_contribution = 0.0f;
+		float combined_score = 0.0f;
+		float packed_score = 0.0f;
+
+		memset(input, 0, sizeof(input));
+		memset(packed, 0, sizeof(packed));
+
+		seeded_unit_vector(1700u + seed, input, 32);
+		assert(tq_prod_encode(&config, input, packed, layout.total_bytes, errmsg, sizeof(errmsg)));
+		assert(tq_prod_score_decompose_ip(&config,
+										  &lut,
+										  packed,
+										  layout.total_bytes,
+										  &mse_contribution,
+										  &qjl_contribution,
+										  &combined_score,
+										  errmsg,
+										  sizeof(errmsg)));
+		assert(tq_prod_score_packed_ip(&config,
+									   &lut,
+									   packed,
+									   layout.total_bytes,
+									   &packed_score,
+									   errmsg,
+									   sizeof(errmsg)));
+		assert(fabsf(combined_score - (mse_contribution + qjl_contribution)) <= 1e-5f);
+		assert(fabsf(combined_score - packed_score) <= 1e-5f);
+	}
+
+	tq_prod_lut_reset(&lut);
+}
+
+static void
+test_code_domain_and_decode_fallback_match_ordering_on_seeded_fixture(void)
 {
 	TqProdCodecConfig config = {.dimension = 8, .bits = 4};
 	TqProdPackedLayout layout;
@@ -236,14 +454,16 @@ test_ranking_equivalence_on_seeded_fixture(void)
 	uint8_t page[TQ_DEFAULT_BLOCK_SIZE];
 	uint8_t packed[64];
 	float query[8];
-	RankedDistance expected[8];
-	TqCandidateHeap heap;
-	TqCandidateEntry entry;
+	TqCandidateHeap primary_heap;
+	TqCandidateHeap shadow_decode_heap;
+	TqCandidateEntry primary_entry;
+	TqCandidateEntry shadow_entry;
 	TqScanStats stats;
 	TqProdScoreKernel preferred_kernel = TQ_PROD_SCORE_SCALAR;
 	char errmsg[256];
 	uint16_t lane = 0;
 	size_t i = 0;
+	const float ordering_tolerance = 1e-5f;
 
 	memset(&layout, 0, sizeof(layout));
 	memset(&lut, 0, sizeof(lut));
@@ -251,15 +471,17 @@ test_ranking_equivalence_on_seeded_fixture(void)
 	memset(page, 0, sizeof(page));
 	memset(packed, 0, sizeof(packed));
 	memset(query, 0, sizeof(query));
-	memset(expected, 0, sizeof(expected));
-	memset(&heap, 0, sizeof(heap));
-	memset(&entry, 0, sizeof(entry));
+	memset(&primary_heap, 0, sizeof(primary_heap));
+	memset(&shadow_decode_heap, 0, sizeof(shadow_decode_heap));
+	memset(&primary_entry, 0, sizeof(primary_entry));
+	memset(&shadow_entry, 0, sizeof(shadow_entry));
 	memset(&stats, 0, sizeof(stats));
 
 	seeded_unit_vector(3u, query, 8);
 	assert(tq_prod_packed_layout(&config, &layout, errmsg, sizeof(errmsg)));
 	assert(tq_prod_lut_build(&config, query, &lut, errmsg, sizeof(errmsg)));
-	assert(tq_candidate_heap_init(&heap, 8));
+	assert(tq_candidate_heap_init(&primary_heap, 8));
+	assert(tq_candidate_heap_init(&shadow_decode_heap, 8));
 
 	params.lane_count = 8;
 	params.code_bytes = (uint32_t) layout.total_bytes;
@@ -270,15 +492,9 @@ test_ranking_equivalence_on_seeded_fixture(void)
 	for (i = 0; i < 8; i++)
 	{
 		float input[8];
-		float score = 0.0f;
 
 		seeded_unit_vector((uint32_t) (100 + i), input, 8);
 		assert(tq_prod_encode(&config, input, packed, layout.total_bytes, errmsg, sizeof(errmsg)));
-		assert(tq_prod_score_code_from_lut(&config, &lut, packed, layout.total_bytes,
-										   &score, errmsg, sizeof(errmsg)));
-		expected[i].offset = (uint16_t) (i + 1);
-		expected[i].distance = 1.0f - score;
-
 		assert(tq_batch_page_append_lane(page, sizeof(page),
 										 &(TqTid){.block_number = 1, .offset_number = (uint16_t) (i + 1)},
 										 &lane, errmsg, sizeof(errmsg)));
@@ -286,23 +502,41 @@ test_ranking_equivalence_on_seeded_fixture(void)
 									  errmsg, sizeof(errmsg)));
 	}
 
-	qsort(expected, 8, sizeof(expected[0]), compare_ranked_distance);
-
 	preferred_kernel = tq_prod_code_domain_preferred_kernel(&config);
 	tq_scan_stats_begin(TQ_SCAN_MODE_FLAT, 1);
-	assert(tq_batch_page_scan_prod(page, sizeof(page), &config, true, TQ_DISTANCE_COSINE, &lut,
-								   query, 8, &heap, NULL, errmsg, sizeof(errmsg)));
+	assert(tq_batch_page_scan_prod(page,
+								   sizeof(page),
+								   &config,
+								   true,
+								   TQ_DISTANCE_IP,
+								   &lut,
+								   query,
+								   8,
+								   &primary_heap,
+								   &shadow_decode_heap,
+								   errmsg,
+								   sizeof(errmsg)));
+	tq_scan_stats_set_shadow_decode_metrics(&primary_heap, &shadow_decode_heap);
 	tq_scan_stats_snapshot(&stats);
 	assert(stats.score_mode == TQ_SCAN_SCORE_MODE_CODE_DOMAIN);
 	assert(stats.score_kernel == preferred_kernel);
+	assert(stats.faithful_fast_path);
+	assert(!stats.compatibility_fallback);
+	assert(stats.shadow_decode_candidate_count == 8);
+	assert(stats.shadow_decoded_vector_count == 8);
+	assert(stats.decoded_vector_count == 0);
 
 	for (i = 0; i < 8; i++)
 	{
-		assert(tq_candidate_heap_pop_best(&heap, &entry));
-		assert(entry.tid.offset_number == expected[i].offset);
+		assert(tq_candidate_heap_pop_best(&primary_heap, &primary_entry));
+		assert(tq_candidate_heap_pop_best(&shadow_decode_heap, &shadow_entry));
+		assert(primary_entry.tid.block_number == shadow_entry.tid.block_number);
+		assert(primary_entry.tid.offset_number == shadow_entry.tid.offset_number);
+		assert(fabsf(primary_entry.score - shadow_entry.score) <= ordering_tolerance);
 	}
 
-	tq_candidate_heap_reset(&heap);
+	tq_candidate_heap_reset(&primary_heap);
+	tq_candidate_heap_reset(&shadow_decode_heap);
 	tq_prod_lut_reset(&lut);
 }
 
@@ -424,8 +658,12 @@ main(void)
 	test_supported_shape_matches_scalar_scores();
 	test_supported_shape_avx2_matches_scalar_scores_for_multiple_dimensions_when_available();
 	test_supported_shape_neon_matches_scalar_scores_when_available();
+	test_randomized_avx2_property_matches_scalar_when_available();
+	test_randomized_neon_property_matches_scalar_when_available();
 	test_preferred_kernel_matches_supported_runtime();
-	test_ranking_equivalence_on_seeded_fixture();
+	test_explicit_kernel_selection_reports_requested_or_scalar_fallback();
+	test_score_decompose_stays_consistent_with_packed_ip();
+	test_code_domain_and_decode_fallback_match_ordering_on_seeded_fixture();
 	test_dispatch_falls_back_to_scalar_for_unsupported_shape_or_disabled_runtime();
 	test_malformed_packed_input_rejected_cleanly();
 	return 0;

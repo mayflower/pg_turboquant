@@ -314,6 +314,13 @@ extern bool tq_batch_page_get_code(const void *page,
 								   size_t code_len,
 								   char *errmsg,
 								   size_t errmsg_len);
+extern bool tq_batch_page_code_view(const void *page,
+									size_t page_size,
+									uint16_t lane_index,
+									const uint8_t **code,
+									size_t *code_len,
+									char *errmsg,
+									size_t errmsg_len);
 extern bool tq_batch_page_mark_dead(void *page,
 									size_t page_size,
 									uint16_t lane_index,

@@ -298,6 +298,9 @@ tq_batch_validate_header(const uint8_t *page,
 	uint16_t	lane_count = 0;
 	uint32_t	code_bytes = 0;
 	uint16_t	total_bytes = 0;
+	uint16_t	flags = 0;
+	uint16_t	expected_tid_offset = 0;
+	uint16_t	expected_code_offset = 0;
 
 	if (!tq_validate_page_common(page, page_size, TQ_PAGE_KIND_BATCH,
 								 TQ_BATCH_PAGE_HEADER_BYTES, errmsg, errmsg_len))
@@ -306,6 +309,7 @@ tq_batch_validate_header(const uint8_t *page,
 	lane_count = tq_read_u16(page, TQ_BATCH_LANE_COUNT_OFFSET);
 	code_bytes = tq_read_u32(page, TQ_BATCH_CODE_BYTES_OFFSET);
 	total_bytes = tq_read_u16(page, TQ_BATCH_TOTAL_BYTES_OFFSET);
+	flags = tq_read_u16(page, TQ_BATCH_FLAGS_OFFSET);
 
 	if (lane_count == 0 || code_bytes == 0)
 	{
@@ -325,6 +329,13 @@ tq_batch_validate_header(const uint8_t *page,
 	{
 		tq_set_error(errmsg, errmsg_len,
 					 "invalid turboquant batch page: layout exceeds page size");
+		return false;
+	}
+
+	if (flags != 0)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant batch page: unsupported flags");
 		return false;
 	}
 
@@ -357,16 +368,18 @@ tq_batch_validate_header(const uint8_t *page,
 		return false;
 	}
 
-	if (tq_read_u16(page, TQ_BATCH_TID_OFFSET_OFFSET)
-		!= (uint16_t) (TQ_BATCH_PAGE_HEADER_BYTES + tq_bitmap_bytes_for_lanes(lane_count)))
+	expected_tid_offset = (uint16_t) (TQ_BATCH_PAGE_HEADER_BYTES
+									   + tq_bitmap_bytes_for_lanes(lane_count));
+	expected_code_offset = (uint16_t) (expected_tid_offset + TQ_TID_STORAGE_BYTES);
+
+	if (tq_read_u16(page, TQ_BATCH_TID_OFFSET_OFFSET) != expected_tid_offset)
 	{
 		tq_set_error(errmsg, errmsg_len,
 					 "invalid turboquant batch page: unexpected entry offset");
 		return false;
 	}
 
-	if (tq_read_u16(page, TQ_BATCH_CODE_OFFSET_OFFSET)
-		!= (uint16_t) (tq_read_u16(page, TQ_BATCH_TID_OFFSET_OFFSET) + TQ_TID_STORAGE_BYTES))
+	if (tq_read_u16(page, TQ_BATCH_CODE_OFFSET_OFFSET) != expected_code_offset)
 	{
 		tq_set_error(errmsg, errmsg_len,
 					 "invalid turboquant batch page: unexpected code offset");
@@ -718,6 +731,12 @@ tq_meta_page_read(const void *page,
 	fields->transform = (TqTransformKind) tq_read_u16(bytes, TQ_META_TRANSFORM_OFFSET);
 	fields->transform_version = tq_read_u16(bytes, TQ_META_TRANSFORM_VERSION_OFFSET);
 	fields->normalized = (tq_read_u16(bytes, TQ_META_FLAGS_OFFSET) & TQ_FLAG_NORMALIZED) != 0;
+	if ((tq_read_u16(bytes, TQ_META_FLAGS_OFFSET) & ~TQ_FLAG_NORMALIZED) != 0)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant meta page: unsupported flags");
+		return false;
+	}
 	fields->list_count = tq_read_u32(bytes, TQ_META_LIST_COUNT_OFFSET);
 	fields->directory_root_block = tq_read_u32(bytes, TQ_META_DIRECTORY_ROOT_OFFSET);
 	fields->centroid_root_block = tq_read_u32(bytes, TQ_META_CENTROID_ROOT_OFFSET);
@@ -1274,6 +1293,7 @@ tq_batch_page_init(void *page,
 	size_t		tid_offset = 0;
 	size_t		code_offset = 0;
 	size_t		total_bytes = 0;
+	uint16_t	flags = 0;
 
 	if (page == NULL || params == NULL)
 	{
@@ -1292,6 +1312,7 @@ tq_batch_page_init(void *page,
 	tid_offset = bitmap_offset + tq_bitmap_bytes_for_lanes(params->lane_count);
 	code_offset = tid_offset + (size_t) TQ_TID_STORAGE_BYTES;
 	total_bytes = tq_batch_page_required_bytes(params->lane_count, params->code_bytes);
+	flags = 0;
 
 	memset(page, 0, page_size);
 	tq_write_page_common(bytes, TQ_PAGE_KIND_BATCH, TQ_BATCH_PAGE_HEADER_BYTES);
@@ -1299,7 +1320,7 @@ tq_batch_page_init(void *page,
 	tq_write_u16(bytes, TQ_BATCH_OCCUPIED_COUNT_OFFSET, 0);
 	tq_write_u16(bytes, TQ_BATCH_LIVE_COUNT_OFFSET, 0);
 	tq_write_u16(bytes, TQ_BATCH_REPRESENTATIVE_LANE_OFFSET, TQ_BATCH_PAGE_NO_REPRESENTATIVE);
-	tq_write_u16(bytes, TQ_BATCH_FLAGS_OFFSET, 0);
+	tq_write_u16(bytes, TQ_BATCH_FLAGS_OFFSET, flags);
 	tq_write_u32(bytes, TQ_BATCH_LIST_ID_OFFSET, params->list_id);
 	tq_write_u32(bytes, TQ_BATCH_NEXT_BLOCK_OFFSET, params->next_block);
 	tq_write_u32(bytes, TQ_BATCH_CODE_BYTES_OFFSET, params->code_bytes);
@@ -1320,7 +1341,6 @@ tq_batch_page_used_bytes(const void *page,
 {
 	const uint8_t *bytes = (const uint8_t *) page;
 	size_t		entry_offset = 0;
-	size_t		entry_stride = 0;
 	uint16_t	occupied_count = 0;
 
 	if (page == NULL || used_bytes == NULL)
@@ -1334,10 +1354,13 @@ tq_batch_page_used_bytes(const void *page,
 		return false;
 
 	entry_offset = (size_t) tq_read_u16(bytes, TQ_BATCH_TID_OFFSET_OFFSET);
-	entry_stride = (size_t) TQ_TID_STORAGE_BYTES
-		+ (size_t) tq_read_u32(bytes, TQ_BATCH_CODE_BYTES_OFFSET);
 	occupied_count = tq_read_u16(bytes, TQ_BATCH_OCCUPIED_COUNT_OFFSET);
-	*used_bytes = entry_offset + (entry_stride * (size_t) occupied_count);
+	{
+		size_t entry_stride = (size_t) TQ_TID_STORAGE_BYTES
+			+ (size_t) tq_read_u32(bytes, TQ_BATCH_CODE_BYTES_OFFSET);
+
+		*used_bytes = entry_offset + (entry_stride * (size_t) occupied_count);
+	}
 	return true;
 }
 
@@ -1663,6 +1686,43 @@ tq_batch_page_get_code(const void *page,
 
 	offset = tq_batch_code_offset(bytes, lane_index);
 	memcpy(code, bytes + offset, stored_len);
+	return true;
+}
+
+bool
+tq_batch_page_code_view(const void *page,
+						size_t page_size,
+						uint16_t lane_index,
+						const uint8_t **code,
+						size_t *code_len,
+						char *errmsg,
+						size_t errmsg_len)
+{
+	const uint8_t *bytes = (const uint8_t *) page;
+	size_t stored_len = 0;
+	size_t offset = 0;
+
+	if (page == NULL || code == NULL || code_len == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant batch page: page, code view, and code length must be non-null");
+		return false;
+	}
+
+	if (!tq_batch_validate_header(bytes, page_size, errmsg, errmsg_len))
+		return false;
+
+	if (lane_index >= tq_read_u16(bytes, TQ_BATCH_OCCUPIED_COUNT_OFFSET))
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant batch page: lane index is not occupied");
+		return false;
+	}
+
+	stored_len = (size_t) tq_read_u32(bytes, TQ_BATCH_CODE_BYTES_OFFSET);
+	offset = tq_batch_code_offset(bytes, lane_index);
+	*code = bytes + offset;
+	*code_len = stored_len;
 	return true;
 }
 

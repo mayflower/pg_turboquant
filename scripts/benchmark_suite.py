@@ -3,6 +3,7 @@ import argparse
 import html
 import json
 import math
+import os
 import platform
 import random
 import subprocess
@@ -258,6 +259,508 @@ def environment_metadata() -> dict:
         "system": platform.system(),
         "release": platform.release(),
     }
+
+
+def make_synthetic_microbench_row(
+    benchmark: str,
+    requested_kernel: str,
+    kernel: str,
+    qjl_lut_mode: str,
+    iterations: int,
+    visited_code_count: int,
+    visited_page_count: int,
+    total_ns: int,
+    *,
+    requested_kernel_honored: bool = True,
+    runtime_available: bool = True,
+    dimension: int = 32,
+    bits: int = 4,
+    lane_count: int = 1,
+    candidate_heap_insert_count: int = 0,
+    candidate_heap_replace_count: int = 0,
+    candidate_heap_reject_count: int = 0,
+    local_candidate_heap_insert_count: int = 0,
+    local_candidate_heap_replace_count: int = 0,
+    local_candidate_heap_reject_count: int = 0,
+    local_candidate_merge_count: int = 0,
+    scratch_allocations: int = 0,
+    decoded_buffer_reuses: int = 0,
+    code_view_uses: int = 0,
+    code_copy_uses: int = 0,
+    list_count: int = 0,
+    probe_count: int = 0,
+    scan_layout: str = "row_major",
+) -> dict:
+    return {
+        "benchmark": benchmark,
+        "requested_kernel": requested_kernel,
+        "kernel": kernel,
+        "qjl_lut_mode": qjl_lut_mode,
+        "requested_kernel_honored": requested_kernel_honored,
+        "dimension": dimension,
+        "bits": bits,
+        "iterations": iterations,
+        "lane_count": lane_count,
+        "visited_code_count": visited_code_count,
+        "visited_page_count": visited_page_count,
+        "candidate_heap_insert_count": candidate_heap_insert_count,
+        "candidate_heap_replace_count": candidate_heap_replace_count,
+        "candidate_heap_reject_count": candidate_heap_reject_count,
+        "local_candidate_heap_insert_count": local_candidate_heap_insert_count,
+        "local_candidate_heap_replace_count": local_candidate_heap_replace_count,
+        "local_candidate_heap_reject_count": local_candidate_heap_reject_count,
+        "local_candidate_merge_count": local_candidate_merge_count,
+        "scratch_allocations": scratch_allocations,
+        "decoded_buffer_reuses": decoded_buffer_reuses,
+        "code_view_uses": code_view_uses,
+        "code_copy_uses": code_copy_uses,
+        "scan_layout": scan_layout,
+        "list_count": list_count,
+        "probe_count": probe_count,
+        "total_ns": total_ns,
+        "ns_per_op": round(total_ns / max(1, iterations), 3),
+        "codes_per_second": round((visited_code_count * 1_000_000_000.0) / max(1, total_ns), 3),
+        "pages_per_second": round((visited_page_count * 1_000_000_000.0) / max(1, total_ns), 3),
+        "runtime_available": runtime_available,
+    }
+
+
+def synthetic_microbenchmarks() -> dict:
+    simd = synthetic_simd_metadata()
+    preferred = simd["preferred_kernel"]
+    list_count = 256
+    probe_count = 8
+    results = [
+        make_synthetic_microbench_row(
+            "score_code_from_lut",
+            "scalar",
+            "scalar",
+            "float",
+            25000,
+            25000,
+            0,
+            7_000_000,
+        ),
+        make_synthetic_microbench_row(
+            "score_code_from_lut",
+            "auto",
+            preferred,
+            "quantized" if preferred != "scalar" else "float",
+            25000,
+            25000,
+            0,
+            4_100_000 if preferred != "scalar" else 7_000_000,
+            runtime_available=True,
+        ),
+        make_synthetic_microbench_row(
+            "score_code_from_lut",
+            "avx2",
+            "avx2" if bool(simd["runtime_available"].get("avx2")) else "scalar",
+            "quantized" if bool(simd["runtime_available"].get("avx2")) else "float",
+            25000,
+            25000,
+            0,
+            3_800_000 if bool(simd["runtime_available"].get("avx2")) else 7_200_000,
+            requested_kernel_honored=bool(simd["runtime_available"].get("avx2")),
+            runtime_available=bool(simd["runtime_available"].get("avx2")),
+        ),
+        make_synthetic_microbench_row(
+            "score_code_from_lut",
+            "neon",
+            "neon" if bool(simd["runtime_available"].get("neon")) else "scalar",
+            "quantized" if bool(simd["runtime_available"].get("neon")) else "float",
+            25000,
+            25000,
+            0,
+            3_900_000 if bool(simd["runtime_available"].get("neon")) else 7_200_000,
+            requested_kernel_honored=bool(simd["runtime_available"].get("neon")),
+            runtime_available=bool(simd["runtime_available"].get("neon")),
+        ),
+        make_synthetic_microbench_row(
+            "score_code_from_lut_quantized_reference",
+            "scalar",
+            "scalar",
+            "quantized",
+            25000,
+            25000,
+            0,
+            6_200_000,
+        ),
+        make_synthetic_microbench_row(
+            "page_scan",
+            "auto",
+            preferred,
+            "quantized" if preferred != "scalar" else "float",
+            1024,
+            32768,
+            1024,
+            5_000_000 if preferred != "scalar" else 7_800_000,
+            runtime_available=True,
+            lane_count=32,
+            candidate_heap_insert_count=8192,
+            local_candidate_heap_insert_count=8192,
+            local_candidate_heap_replace_count=4096,
+            local_candidate_heap_reject_count=20480,
+            local_candidate_merge_count=8192,
+            scratch_allocations=1,
+            decoded_buffer_reuses=1023,
+            code_view_uses=32768,
+        ),
+        make_synthetic_microbench_row(
+            "page_scan_global_heap_only",
+            "auto",
+            preferred,
+            "quantized" if preferred != "scalar" else "float",
+            1024,
+            32768,
+            1024,
+            7_800_000 if preferred != "scalar" else 8_400_000,
+            runtime_available=True,
+            lane_count=32,
+            candidate_heap_insert_count=8,
+            candidate_heap_replace_count=11264,
+            candidate_heap_reject_count=21496,
+            code_view_uses=32768,
+        ),
+        make_synthetic_microbench_row(
+            "router_top_probes_full_sort",
+            "scalar",
+            "scalar",
+            "float",
+            10000,
+            list_count * 10000,
+            0,
+            26_000_000,
+            bits=0,
+            lane_count=0,
+            list_count=list_count,
+            probe_count=probe_count,
+        ),
+        make_synthetic_microbench_row(
+            "router_top_probes_partial",
+            "scalar",
+            "scalar",
+            "float",
+            10000,
+            list_count * 10000,
+            0,
+            9_000_000,
+            bits=0,
+            lane_count=0,
+            list_count=list_count,
+            probe_count=probe_count,
+        ),
+    ]
+    return {
+        "architecture": environment_metadata()["cpu_arch"],
+        "simd": {
+            "scalar": {
+                "compiled": True,
+                "runtime_available": True,
+            },
+            "avx2": {
+                "compiled": bool(simd["compiled"].get("avx2")),
+                "runtime_available": bool(simd["runtime_available"].get("avx2")),
+            },
+            "avx512": {
+                "compiled": bool(simd["compiled"].get("avx512")),
+                "runtime_available": bool(simd["runtime_available"].get("avx512")),
+            },
+            "neon": {
+                "compiled": bool(simd["compiled"].get("neon")),
+                "runtime_available": bool(simd["runtime_available"].get("neon")),
+            },
+        },
+        "results": results,
+    }
+
+
+def microbench_lookup(
+    results: list[dict],
+    benchmark: str,
+    *,
+    requested_kernel: Optional[str] = None,
+    qjl_lut_mode: Optional[str] = None,
+) -> Optional[dict]:
+    for row in results:
+        if row.get("benchmark") != benchmark:
+            continue
+        if requested_kernel is not None and row.get("requested_kernel") != requested_kernel:
+            continue
+        if qjl_lut_mode is not None and row.get("qjl_lut_mode") != qjl_lut_mode:
+            continue
+        return row
+    return None
+
+
+def microbench_ratio(candidate_value: object, baseline_value: object) -> Optional[float]:
+    baseline = float(baseline_value)
+    if baseline == 0.0:
+        return None
+    return round(float(candidate_value) / baseline, 6)
+
+
+def microbench_delta(candidate: dict, baseline: dict, key: str) -> float:
+    return round(float(candidate.get(key, 0.0)) - float(baseline.get(key, 0.0)), 6)
+
+
+def build_microbench_comparison(
+    comparison: str,
+    comparison_kind: str,
+    baseline: Optional[dict],
+    candidate: Optional[dict],
+) -> Optional[dict]:
+    if baseline is None or candidate is None:
+        return None
+
+    return {
+        "comparison": comparison,
+        "comparison_kind": comparison_kind,
+        "baseline_benchmark": baseline["benchmark"],
+        "candidate_benchmark": candidate["benchmark"],
+        "baseline_requested_kernel": baseline.get("requested_kernel"),
+        "candidate_requested_kernel": candidate.get("requested_kernel"),
+        "baseline_kernel": baseline.get("kernel"),
+        "candidate_kernel": candidate.get("kernel"),
+        "baseline": baseline,
+        "candidate": candidate,
+        "metrics": {
+            "codes_per_second_ratio": microbench_ratio(
+                candidate.get("codes_per_second", 0.0),
+                baseline.get("codes_per_second", 0.0),
+            ),
+            "ns_per_op_ratio": microbench_ratio(
+                candidate.get("ns_per_op", 0.0),
+                baseline.get("ns_per_op", 0.0),
+            ),
+            "visited_code_count_delta": microbench_delta(candidate, baseline, "visited_code_count"),
+            "visited_page_count_delta": microbench_delta(candidate, baseline, "visited_page_count"),
+            "candidate_heap_insert_delta": microbench_delta(
+                candidate, baseline, "candidate_heap_insert_count"
+            ),
+            "candidate_heap_replace_delta": microbench_delta(
+                candidate, baseline, "candidate_heap_replace_count"
+            ),
+            "candidate_heap_reject_delta": microbench_delta(
+                candidate, baseline, "candidate_heap_reject_count"
+            ),
+            "local_candidate_heap_insert_delta": microbench_delta(
+                candidate, baseline, "local_candidate_heap_insert_count"
+            ),
+            "local_candidate_heap_replace_delta": microbench_delta(
+                candidate, baseline, "local_candidate_heap_replace_count"
+            ),
+            "local_candidate_heap_reject_delta": microbench_delta(
+                candidate, baseline, "local_candidate_heap_reject_count"
+            ),
+            "local_candidate_merge_delta": microbench_delta(
+                candidate, baseline, "local_candidate_merge_count"
+            ),
+        },
+    }
+
+
+def build_microbench_gate(
+    gate: str,
+    comparison: Optional[dict],
+    category: str,
+    *,
+    requires_runtime_row: bool = False,
+    require_quantized_transition: bool = False,
+    require_reduced_global_heap_churn: bool = False,
+) -> dict:
+    if comparison is None:
+        return {
+            "gate": gate,
+            "comparison": None,
+            "category": category,
+            "status": "not_applicable",
+            "checks": {
+                "same_workload": False,
+                "throughput_directional_signal": False,
+            },
+        }
+
+    baseline = comparison["baseline"]
+    candidate = comparison["candidate"]
+    metrics = comparison["metrics"]
+    global_heap_baseline = (
+        float(baseline.get("candidate_heap_insert_count", 0))
+        + float(baseline.get("candidate_heap_replace_count", 0))
+    )
+    global_heap_candidate = (
+        float(candidate.get("candidate_heap_insert_count", 0))
+        + float(candidate.get("candidate_heap_replace_count", 0))
+    )
+    same_workload = (
+        baseline.get("dimension") == candidate.get("dimension")
+        and baseline.get("bits") == candidate.get("bits")
+        and baseline.get("visited_code_count") == candidate.get("visited_code_count")
+        and baseline.get("visited_page_count") == candidate.get("visited_page_count")
+        and baseline.get("iterations") == candidate.get("iterations")
+    )
+    throughput_directional_signal = (
+        metrics.get("codes_per_second_ratio") is not None
+        and float(metrics["codes_per_second_ratio"]) >= 1.0
+    )
+    checks = {
+        "same_workload": same_workload,
+        "throughput_directional_signal": throughput_directional_signal,
+        "ns_per_op_directional_signal": (
+            metrics.get("ns_per_op_ratio") is not None and float(metrics["ns_per_op_ratio"]) <= 1.0
+        ),
+    }
+
+    if requires_runtime_row:
+        checks["runtime_available"] = bool(candidate.get("runtime_available"))
+        checks["requested_kernel_honored"] = bool(candidate.get("requested_kernel_honored"))
+
+    if require_quantized_transition:
+        checks["quantized_transition"] = (
+            baseline.get("qjl_lut_mode") == "float" and candidate.get("qjl_lut_mode") == "quantized"
+        )
+
+    if require_reduced_global_heap_churn:
+        checks["reduced_global_heap_churn"] = global_heap_candidate < global_heap_baseline
+        checks["local_merge_present"] = float(candidate.get("local_candidate_merge_count", 0)) > 0.0
+
+    if not same_workload:
+        status = "warn"
+    elif requires_runtime_row and (
+        not checks["runtime_available"] or not checks["requested_kernel_honored"]
+    ):
+        status = "not_applicable"
+    else:
+        required_checks = ["throughput_directional_signal", "ns_per_op_directional_signal"]
+        if require_reduced_global_heap_churn:
+            required_checks = ["reduced_global_heap_churn", "local_merge_present"]
+        if require_quantized_transition:
+            required_checks.append("quantized_transition")
+        status = "pass" if all(bool(checks.get(key)) for key in required_checks) else "warn"
+
+    return {
+        "gate": gate,
+        "comparison": comparison["comparison"],
+        "category": category,
+        "status": status,
+        "checks": checks,
+    }
+
+
+def augment_microbenchmarks(section: dict) -> dict:
+    results = section.get("results", [])
+    comparisons = [
+        build_microbench_comparison(
+            "score_code_from_lut_avx2_vs_scalar",
+            "kernel_speedup",
+            microbench_lookup(results, "score_code_from_lut", requested_kernel="scalar"),
+            microbench_lookup(results, "score_code_from_lut", requested_kernel="avx2"),
+        ),
+        build_microbench_comparison(
+            "score_code_from_lut_neon_vs_scalar",
+            "kernel_speedup",
+            microbench_lookup(results, "score_code_from_lut", requested_kernel="scalar"),
+            microbench_lookup(results, "score_code_from_lut", requested_kernel="neon"),
+        ),
+        build_microbench_comparison(
+            "qjl_lut_quantized_vs_float_reference",
+            "lut_mode",
+            microbench_lookup(
+                results,
+                "score_code_from_lut",
+                requested_kernel="scalar",
+                qjl_lut_mode="float",
+            ),
+            microbench_lookup(results, "score_code_from_lut_quantized_reference"),
+        ),
+        build_microbench_comparison(
+            "page_scan_block_local_vs_global_heap",
+            "selection_strategy",
+            microbench_lookup(results, "page_scan_global_heap_only"),
+            microbench_lookup(results, "page_scan"),
+        ),
+    ]
+    comparisons = [comparison for comparison in comparisons if comparison is not None]
+    regression_gates = [
+        build_microbench_gate(
+            "avx2_kernel_speedup_signal",
+            next(
+                (
+                    row
+                    for row in comparisons
+                    if row["comparison"] == "score_code_from_lut_avx2_vs_scalar"
+                ),
+                None,
+            ),
+            "kernel",
+            requires_runtime_row=True,
+        ),
+        build_microbench_gate(
+            "neon_kernel_speedup_signal",
+            next(
+                (
+                    row
+                    for row in comparisons
+                    if row["comparison"] == "score_code_from_lut_neon_vs_scalar"
+                ),
+                None,
+            ),
+            "kernel",
+            requires_runtime_row=True,
+        ),
+        build_microbench_gate(
+            "quantized_qjl_lut_signal",
+            next(
+                (
+                    row
+                    for row in comparisons
+                    if row["comparison"] == "qjl_lut_quantized_vs_float_reference"
+                ),
+                None,
+            ),
+            "lut",
+            require_quantized_transition=True,
+        ),
+        build_microbench_gate(
+            "block_local_selection_signal",
+            next(
+                (
+                    row
+                    for row in comparisons
+                    if row["comparison"] == "page_scan_block_local_vs_global_heap"
+                ),
+                None,
+            ),
+            "selection",
+            require_reduced_global_heap_churn=True,
+        ),
+    ]
+    interpretation_notes = [
+        "Use the regression-gate rows as directional checks: they compare equal-workload rows and keep scan-work counters alongside throughput.",
+        "Kernel-specific gates may report not_applicable when the requested SIMD path is unavailable on the current machine.",
+        "Heap-selection gates are expected to lower global heap churn and preserve visited-code/page counts, not just lower wall-clock time.",
+    ]
+
+    enriched = dict(section)
+    enriched["comparisons"] = comparisons
+    enriched["regression_gates"] = regression_gates
+    enriched["interpretation_notes"] = interpretation_notes
+    return enriched
+
+
+def run_microbenchmarks(dry_run: bool) -> dict:
+    if dry_run:
+        return augment_microbenchmarks(synthetic_microbenchmarks())
+
+    helper = Path(__file__).resolve().parent / "prod_score_microbench.py"
+    result = subprocess.run(
+        [sys.executable, str(helper)],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**os.environ},
+    )
+    return augment_microbenchmarks(json.loads(result.stdout))
 
 
 def scenario_matrix_metadata(
@@ -1138,28 +1641,34 @@ def default_scan_stats(method: str) -> dict:
         score_mode = "code_domain"
         score_kernel = "scalar"
         page_bound_mode = "disabled"
+        scan_orchestration = "flat_streaming"
     elif method == "turboquant_ivf":
         mode = "ivf"
         score_mode = "code_domain"
         score_kernel = "scalar"
         page_bound_mode = "safe_summary_pruning"
+        scan_orchestration = "ivf_bounded_pages"
     elif method == "turboquant_bitmap":
         mode = "bitmap"
         score_mode = "bitmap_filter"
         score_kernel = "none"
         page_bound_mode = "disabled"
+        scan_orchestration = "bitmap_filter"
     else:
         mode = "none"
         score_mode = "none"
         score_kernel = "none"
         page_bound_mode = "disabled"
+        scan_orchestration = "none"
 
     return {
         "mode": mode,
         "score_mode": score_mode,
         "score_kernel": score_kernel,
         "page_bound_mode": page_bound_mode,
+        "scan_orchestration": scan_orchestration,
         "safe_pruning_enabled": method == "turboquant_ivf",
+        "near_exhaustive_crossover": False,
         "configured_probe_count": 0,
         "nominal_probe_count": 0,
         "effective_probe_count": 0,
@@ -1176,6 +1685,10 @@ def default_scan_stats(method: str) -> dict:
         "candidate_heap_insert_count": 0,
         "candidate_heap_replace_count": 0,
         "candidate_heap_reject_count": 0,
+        "local_candidate_heap_insert_count": 0,
+        "local_candidate_heap_replace_count": 0,
+        "local_candidate_heap_reject_count": 0,
+        "local_candidate_merge_count": 0,
         "shadow_decoded_vector_count": 0,
         "shadow_decode_candidate_count": 0,
         "shadow_decode_overlap_count": 0,
@@ -1184,6 +1697,10 @@ def default_scan_stats(method: str) -> dict:
         "decoded_vector_count": 0,
         "page_prune_count": 0,
         "early_stop_count": 0,
+        "scratch_allocations": 0,
+        "decoded_buffer_reuses": 0,
+        "code_view_uses": 0,
+        "code_copy_uses": 0,
         "faithful_fast_path": False,
         "compatibility_fallback": False,
     }
@@ -1211,6 +1728,10 @@ def aggregate_scan_stats(scan_stats: list[dict], fallback_method: str) -> dict:
         "candidate_heap_insert_count",
         "candidate_heap_replace_count",
         "candidate_heap_reject_count",
+        "local_candidate_heap_insert_count",
+        "local_candidate_heap_replace_count",
+        "local_candidate_heap_reject_count",
+        "local_candidate_merge_count",
         "shadow_decoded_vector_count",
         "shadow_decode_candidate_count",
         "shadow_decode_overlap_count",
@@ -1219,14 +1740,23 @@ def aggregate_scan_stats(scan_stats: list[dict], fallback_method: str) -> dict:
         "decoded_vector_count",
         "page_prune_count",
         "early_stop_count",
+        "scratch_allocations",
+        "decoded_buffer_reuses",
+        "code_view_uses",
+        "code_copy_uses",
     )
     aggregated = {
         "mode": scan_stats[0].get("mode", defaults["mode"]),
         "score_mode": scan_stats[0].get("score_mode", defaults["score_mode"]),
         "score_kernel": scan_stats[0].get("score_kernel", defaults["score_kernel"]),
         "page_bound_mode": scan_stats[0].get("page_bound_mode", defaults["page_bound_mode"]),
+        "scan_orchestration": scan_stats[0].get("scan_orchestration", defaults["scan_orchestration"]),
         "safe_pruning_enabled": any(
             bool(item.get("safe_pruning_enabled", defaults["safe_pruning_enabled"]))
+            for item in scan_stats
+        ),
+        "near_exhaustive_crossover": any(
+            bool(item.get("near_exhaustive_crossover", defaults["near_exhaustive_crossover"]))
             for item in scan_stats
         ),
         "faithful_fast_path": any(
@@ -1243,6 +1773,11 @@ def aggregate_scan_stats(scan_stats: list[dict], fallback_method: str) -> dict:
         for item in scan_stats[1:]
     ):
         aggregated["page_bound_mode"] = "mixed"
+    if any(
+        item.get("scan_orchestration", defaults["scan_orchestration"]) != aggregated["scan_orchestration"]
+        for item in scan_stats[1:]
+    ):
+        aggregated["scan_orchestration"] = "mixed"
     for key in numeric_keys:
         values = [float(item.get(key, 0)) for item in scan_stats]
         aggregated[key] = round(sum(values) / max(1, len(values)), 6)
@@ -1463,36 +1998,10 @@ def turboquant_single_batch_rerank_ids_sql(
     requested_limit = rerank_candidate_limit(limit, requested_candidate_limit)
     query_literal = vector_literal(query_vector)
     order_operator = metric_order_operator(benchmark_metric)
-    resolved_knob_prefixes = (
-        "SET LOCAL turboquant.probes =",
-        "SET LOCAL turboquant.oversample_factor =",
-        "SET LOCAL turboquant.max_visited_codes =",
-        "SET LOCAL turboquant.max_visited_pages =",
-    )
-    session_setup = [
-        statement
-        for statement in query_setup
-        if not statement.startswith(resolved_knob_prefixes)
-    ]
     return ";\n".join(
         ["BEGIN"]
-        + session_setup
+        + query_setup
         + [
-            (
-                "DO $$ "
-                "DECLARE effective_candidate_limit integer; resolved record; "
-                "BEGIN "
-                f"SELECT tq_effective_rerank_candidate_limit({requested_limit}, {limit}) "
-                "INTO effective_candidate_limit; "
-                "SELECT probes, oversample_factor, max_visited_codes, max_visited_pages "
-                "INTO resolved "
-                f"FROM tq_resolve_query_knobs(effective_candidate_limit, {limit}, NULL, NULL); "
-                "PERFORM set_config('turboquant.probes', resolved.probes::text, true); "
-                "PERFORM set_config('turboquant.oversample_factor', resolved.oversample_factor::text, true); "
-                "PERFORM set_config('turboquant.max_visited_codes', resolved.max_visited_codes::text, true); "
-                "PERFORM set_config('turboquant.max_visited_pages', resolved.max_visited_pages::text, true); "
-                "END $$ LANGUAGE plpgsql"
-            ),
             (
                 "WITH approx_scan AS MATERIALIZED ("
                 f"SELECT id, embedding, (embedding {order_operator} '{query_literal}'::vector) AS approximate_distance "
@@ -1911,7 +2420,7 @@ def generate_report(payload: dict) -> dict:
                 }
             )
 
-    return {
+    report = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "summary": {
             "scenario_count": len(scenarios),
@@ -1926,6 +2435,13 @@ def generate_report(payload: dict) -> dict:
         "conclusions": conclusions,
         "leaderboards": leaderboards,
     }
+    if payload.get("microbenchmarks"):
+        report["microbenchmark_regression"] = {
+            "comparisons": payload["microbenchmarks"].get("comparisons", []),
+            "regression_gates": payload["microbenchmarks"].get("regression_gates", []),
+            "interpretation_notes": payload["microbenchmarks"].get("interpretation_notes", []),
+        }
+    return report
 
 
 def render_report_markdown(report: dict) -> str:
@@ -1982,6 +2498,32 @@ def render_report_markdown(report: dict) -> str:
                 f"avg_abs_rank_shift delta={_report_fmt(metrics['avg_abs_rank_shift_delta'])})"
             )
 
+    if report.get("microbenchmark_regression"):
+        lines.extend(["", "## Microbenchmark Regression", ""])
+        lines.extend(
+            f"- {note}" for note in report["microbenchmark_regression"].get("interpretation_notes", [])
+        )
+        lines.append("")
+        for comparison in report["microbenchmark_regression"].get("comparisons", []):
+            metrics = comparison["metrics"]
+            lines.append(
+                f"- {comparison['comparison']} [{comparison['comparison_kind']}]: "
+                f"{comparison['candidate_benchmark']} vs {comparison['baseline_benchmark']} "
+                f"(codes/sec ratio={_report_fmt(metrics['codes_per_second_ratio'])}, "
+                f"ns/op ratio={_report_fmt(metrics['ns_per_op_ratio'])}, "
+                f"visited_code_count delta={_report_fmt(metrics['visited_code_count_delta'])}, "
+                f"visited_page_count delta={_report_fmt(metrics['visited_page_count_delta'])}, "
+                f"candidate_heap_insert delta={_report_fmt(metrics['candidate_heap_insert_delta'])})"
+            )
+        for gate in report["microbenchmark_regression"].get("regression_gates", []):
+            checks = ", ".join(
+                f"{key}={value}" for key, value in sorted(gate.get("checks", {}).items())
+            )
+            lines.append(
+                f"- {gate['gate']} [{gate['category']}] status={gate['status']} "
+                f"comparison={gate['comparison']} checks: {checks}"
+            )
+
     lines.extend(["", "## Hotpot Conclusions", ""])
     if not report["conclusions"]:
         lines.append("- No corpus-specific conclusions were generated for the selected matrix.")
@@ -2002,6 +2544,16 @@ def render_report_html(report: dict) -> str:
     note_items = "".join(f"<li>{html.escape(note)}</li>" for note in report["measurement_notes"])
     method_rows = "".join(_render_report_method_row(row) for row in report["method_rows"])
     comparison_rows = "".join(_render_report_comparison_row(row) for row in report["comparisons"])
+    microbench = report.get("microbenchmark_regression", {})
+    microbench_note_items = "".join(
+        f"<li>{html.escape(note)}</li>" for note in microbench.get("interpretation_notes", [])
+    )
+    microbench_comparison_rows = "".join(
+        _render_microbench_comparison_row(row) for row in microbench.get("comparisons", [])
+    )
+    microbench_gate_rows = "".join(
+        _render_microbench_gate_row(row) for row in microbench.get("regression_gates", [])
+    )
     conclusion_blocks = "".join(
         (
             "<article class=\"card\">"
@@ -2140,6 +2692,37 @@ def render_report_html(report: dict) -> str:
       </table>
     </section>
     <section>
+      <h2>Microbenchmark Regression</h2>
+      <ul>{microbench_note_items}</ul>
+      <table>
+        <thead>
+          <tr>
+            <th>comparison</th>
+            <th>kind</th>
+            <th>candidate</th>
+            <th>baseline</th>
+            <th>codes/sec ratio</th>
+            <th>ns/op ratio</th>
+            <th>visited_code_count delta</th>
+            <th>candidate_heap_insert delta</th>
+          </tr>
+        </thead>
+        <tbody>{microbench_comparison_rows}</tbody>
+      </table>
+      <table>
+        <thead>
+          <tr>
+            <th>gate</th>
+            <th>category</th>
+            <th>status</th>
+            <th>comparison</th>
+            <th>checks</th>
+          </tr>
+        </thead>
+        <tbody>{microbench_gate_rows}</tbody>
+      </table>
+    </section>
+    <section>
       <h2>Hotpot Conclusions</h2>
       <div class="grid">{conclusion_blocks}</div>
     </section>
@@ -2181,6 +2764,37 @@ def _render_report_comparison_row(row: dict) -> str:
         f"<td>{_report_fmt(metrics['index_size_bytes_delta'])}</td>"
         f"<td>{_report_fmt(metrics['visited_code_count_delta'])}</td>"
         f"<td>{_report_fmt(metrics['selected_page_count_delta'])}</td>"
+        "</tr>"
+    )
+
+
+def _render_microbench_comparison_row(row: dict) -> str:
+    metrics = row["metrics"]
+    return (
+        "<tr>"
+        f"<td class=\"mono\">{html.escape(str(row['comparison']))}</td>"
+        f"<td>{html.escape(str(row['comparison_kind']))}</td>"
+        f"<td class=\"mono\">{html.escape(str(row['candidate_benchmark']))}</td>"
+        f"<td class=\"mono\">{html.escape(str(row['baseline_benchmark']))}</td>"
+        f"<td>{_report_fmt(metrics['codes_per_second_ratio'])}</td>"
+        f"<td>{_report_fmt(metrics['ns_per_op_ratio'])}</td>"
+        f"<td>{_report_fmt(metrics['visited_code_count_delta'])}</td>"
+        f"<td>{_report_fmt(metrics['candidate_heap_insert_delta'])}</td>"
+        "</tr>"
+    )
+
+
+def _render_microbench_gate_row(row: dict) -> str:
+    checks = "<br>".join(
+        html.escape(f"{key}={value}") for key, value in sorted(row.get("checks", {}).items())
+    )
+    return (
+        "<tr>"
+        f"<td class=\"mono\">{html.escape(str(row['gate']))}</td>"
+        f"<td>{html.escape(str(row['category']))}</td>"
+        f"<td>{html.escape(str(row['status']))}</td>"
+        f"<td class=\"mono\">{html.escape(str(row['comparison']))}</td>"
+        f"<td>{checks}</td>"
         "</tr>"
     )
 
@@ -2682,6 +3296,7 @@ def main() -> None:
     parser.add_argument("--turboquant-decode-rescore-extra-candidates", type=int)
     parser.add_argument("--rerank-candidate-limit", type=int)
     parser.add_argument("--report", action="store_true")
+    parser.add_argument("--microbench", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -2767,6 +3382,9 @@ def main() -> None:
         "scenario_matrix": scenario_matrix_metadata(args.profile, corpora, methods, metrics, turboquant_qjl_sketch_dims),
         "scenarios": scenarios,
     }
+
+    if args.microbench:
+        payload["microbenchmarks"] = run_microbenchmarks(args.dry_run)
 
     if args.report:
         payload["report"] = generate_report(payload)

@@ -25,11 +25,11 @@ PERL5_LOCAL_LIB := $(CURDIR)/third_party/perl5
 
 PG_CPPFLAGS += -Wall -Werror
 
-UNIT_TEST_BINS = tests/unit/test_smoke tests/unit/test_scan_stats tests/unit/test_prod_code_domain tests/unit/test_prod_code_domain_simd tests/unit/test_batch_bounds tests/unit/test_probe_budgeting tests/unit/test_router_balance tests/unit/test_probe_inputs
-PERF_TEST_BINS = tests/perf/test_prod_code_domain_avx2
+UNIT_TEST_BINS = tests/unit/test_smoke tests/unit/test_scan_stats tests/unit/test_prod_code_domain tests/unit/test_prod_code_domain_simd tests/unit/test_batch_bounds tests/unit/test_probe_budgeting tests/unit/test_router_balance tests/unit/test_probe_inputs tests/unit/test_router_top_probes
+PERF_TEST_BINS = tests/perf/test_prod_code_domain_avx2 tests/perf/test_prod_score_microbench
 UNIT_TEST_COMMON_SRCS = src/tq_am_routine.c src/tq_am_routine.h src/tq_options.c src/tq_options.h src/tq_page.c src/tq_page.h src/tq_transform.c src/tq_transform.h src/tq_codec_mse.c src/tq_codec_mse.h src/tq_codec_prod.c src/tq_codec_prod.h src/tq_pgvector_compat.c src/tq_pgvector_compat.h src/tq_scan.c src/tq_scan.h src/tq_query_tuning.c src/tq_query_tuning.h src/tq_guc.c src/tq_guc.h src/tq_simd_avx2.c src/tq_simd_avx2.h src/tq_router.c src/tq_router.h src/tq_probe_input.c src/tq_probe_input.h
 
-.PHONY: unitcheck tapcheck clean-unit installcheck install-pgvector perf-prod-code-domain-avx2
+.PHONY: unitcheck tapcheck clean-unit installcheck install-pgvector perf-prod-code-domain-avx2 perf-prod-score-microbench
 
 install-pgvector:
 	./scripts/install_pgvector.sh "$(PG_CONFIG)"
@@ -47,6 +47,9 @@ unitcheck: $(UNIT_TEST_BINS)
 
 perf-prod-code-domain-avx2: tests/perf/test_prod_code_domain_avx2
 	./tests/perf/test_prod_code_domain_avx2
+
+perf-prod-score-microbench: tests/perf/test_prod_score_microbench
+	./tests/perf/test_prod_score_microbench
 
 tapcheck: install-pgvector
 	./scripts/fetch_postgres_test_libs.sh

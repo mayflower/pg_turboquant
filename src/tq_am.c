@@ -72,6 +72,7 @@ typedef struct TqScanOpaque
 	TqProdLut	lut;
 	TqCandidateHeap candidates;
 	TqCandidateHeap shadow_decode_candidates;
+	TqScanScratch scan_scratch;
 	TqProdCodecConfig prod_config;
 	float	   *query_values;
 	uint32_t	query_dimension;
@@ -214,6 +215,20 @@ static bool tq_scan_batch_block(Relation index_relation,
 								TqCandidateHeap *shadow_decode_heap,
 								char *errmsg,
 								size_t errmsg_len);
+static bool tq_collect_live_pages_for_list(Relation index_relation,
+										   const TqListDirEntry *entry,
+										   TqBoundedPageCandidate *pages,
+										   size_t max_pages,
+										   size_t *page_count,
+										   char *errmsg,
+										   size_t errmsg_len);
+static bool tq_collect_live_pages_for_chain(Relation index_relation,
+											BlockNumber head_block,
+											TqBoundedPageCandidate *pages,
+											size_t max_pages,
+											size_t *page_count,
+											char *errmsg,
+											size_t errmsg_len);
 static bool tq_collect_bounded_pages_for_list(Relation index_relation,
 											  const TqListDirEntry *entry,
 											  TqScanOpaque *opaque,
@@ -323,7 +338,7 @@ tq_input_kind_from_index(Relation index_relation)
 static void
 tq_load_option_config(Relation index_relation, TqOptionConfig *config)
 {
-	TqAmOptions *options = (TqAmOptions *) index_relation->rd_options;
+	TqAmOptions *options = index_relation == NULL ? NULL : (TqAmOptions *) index_relation->rd_options;
 
 	memset(config, 0, sizeof(*config));
 	config->bits = 4;
@@ -362,6 +377,7 @@ tq_reset_scan_opaque(TqScanOpaque *opaque)
 	tq_prod_lut_reset(&opaque->lut);
 	tq_candidate_heap_reset(&opaque->candidates);
 	tq_candidate_heap_reset(&opaque->shadow_decode_candidates);
+	tq_scan_scratch_reset(&opaque->scan_scratch);
 	if (opaque->query_values != NULL)
 		pfree(opaque->query_values);
 	memset(&opaque->prod_config, 0, sizeof(opaque->prod_config));
@@ -2658,24 +2674,106 @@ tq_scan_batch_block(Relation index_relation,
 
 	buffer = ReadBufferExtended(index_relation, MAIN_FORKNUM, block_number, RBM_NORMAL, NULL);
 	page = BufferGetPage(buffer);
-	if (!tq_batch_page_scan_prod(tq_page_payload(page),
-								 tq_page_payload_size(page),
-								 &opaque->prod_config,
-								 opaque->normalized,
-								 opaque->distance_kind,
-								 &opaque->lut,
-								 opaque->query_values,
-								 opaque->query_dimension,
-								 heap,
-								 shadow_decode_heap,
-								 errmsg,
-								 errmsg_len))
+	if (!tq_batch_page_scan_prod_with_scratch(tq_page_payload(page),
+											  tq_page_payload_size(page),
+											  &opaque->prod_config,
+											  opaque->normalized,
+											  opaque->distance_kind,
+											  &opaque->lut,
+											  opaque->query_values,
+											  opaque->query_dimension,
+											  heap,
+											  shadow_decode_heap,
+											  &opaque->scan_scratch,
+											  errmsg,
+											  errmsg_len))
 	{
 		ReleaseBuffer(buffer);
 		return false;
 	}
 
 	ReleaseBuffer(buffer);
+	return true;
+}
+
+static bool
+tq_collect_live_pages_for_list(Relation index_relation,
+							   const TqListDirEntry *entry,
+							   TqBoundedPageCandidate *pages,
+							   size_t max_pages,
+							   size_t *page_count,
+							   char *errmsg,
+							   size_t errmsg_len)
+{
+	if (entry == NULL)
+	{
+		snprintf(errmsg, errmsg_len,
+				 "invalid turboquant scan: live page collection requires a list entry");
+		return false;
+	}
+
+	return tq_collect_live_pages_for_chain(index_relation,
+										   entry->head_block,
+										   pages,
+										   max_pages,
+										   page_count,
+										   errmsg,
+										   errmsg_len);
+}
+
+static bool
+tq_collect_live_pages_for_chain(Relation index_relation,
+								BlockNumber head_block,
+								TqBoundedPageCandidate *pages,
+								size_t max_pages,
+								size_t *page_count,
+								char *errmsg,
+								size_t errmsg_len)
+{
+	BlockNumber block_number = head_block;
+
+	if (pages == NULL || page_count == NULL)
+	{
+		snprintf(errmsg, errmsg_len,
+				 "invalid turboquant scan: live page collection requires a page array and count");
+		return false;
+	}
+
+	while (block_number != TQ_INVALID_BLOCK_NUMBER)
+	{
+		Buffer buffer;
+		Page page;
+		TqBatchPageHeaderView header;
+
+		buffer = ReadBufferExtended(index_relation, MAIN_FORKNUM, block_number, RBM_NORMAL, NULL);
+		page = BufferGetPage(buffer);
+		memset(&header, 0, sizeof(header));
+		if (!tq_batch_page_read_header(tq_page_payload(page), tq_page_payload_size(page),
+									   &header, errmsg, errmsg_len))
+		{
+			ReleaseBuffer(buffer);
+			return false;
+		}
+		block_number = header.next_block;
+
+		if (header.live_count > 0)
+		{
+			if (*page_count >= max_pages)
+			{
+				snprintf(errmsg, errmsg_len,
+						 "invalid turboquant scan: live page array exceeded capacity");
+				ReleaseBuffer(buffer);
+				return false;
+			}
+
+			pages[*page_count].block_number = BufferGetBlockNumber(buffer);
+			pages[*page_count].optimistic_distance = 0.0f;
+			*page_count += 1;
+		}
+
+		ReleaseBuffer(buffer);
+	}
+
 	return true;
 }
 
@@ -3084,6 +3182,8 @@ tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque)
 		size_t final_capacity = tq_streaming_candidate_capacity(tq_guc_probes,
 															 tq_guc_oversample_factor);
 
+		tq_scan_stats_set_scan_orchestration(TQ_SCAN_ORCHESTRATION_FLAT_STREAMING,
+											 false);
 		if (!tq_candidate_heap_init(&opaque->candidates, final_capacity))
 			ereport(ERROR,
 					(errcode(ERRCODE_OUT_OF_MEMORY),
@@ -3126,18 +3226,19 @@ tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque)
 				elog(ERROR, "%s", error_buf);
 			}
 			tq_scan_stats_add_selected_live((size_t) header.live_count);
-			if (!tq_batch_page_scan_prod(tq_page_payload(BufferGetPage(buffer)),
-										tq_page_payload_size(BufferGetPage(buffer)),
-										&opaque->prod_config,
-										opaque->normalized,
-										opaque->distance_kind,
-										&opaque->lut,
-										opaque->query_values,
-										opaque->query_dimension,
-										active_heap,
-										shadow_heap,
-										error_buf,
-										sizeof(error_buf)))
+			if (!tq_batch_page_scan_prod_with_scratch(tq_page_payload(BufferGetPage(buffer)),
+													 tq_page_payload_size(BufferGetPage(buffer)),
+													 &opaque->prod_config,
+													 opaque->normalized,
+													 opaque->distance_kind,
+													 &opaque->lut,
+													 opaque->query_values,
+													 opaque->query_dimension,
+													 active_heap,
+													 shadow_heap,
+													 &opaque->scan_scratch,
+													 error_buf,
+													 sizeof(error_buf)))
 				elog(ERROR, "%s", error_buf);
 			ReleaseBuffer(buffer);
 		}
@@ -3156,18 +3257,19 @@ tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque)
 			for (block_number = 1; block_number < nblocks; block_number++)
 			{
 				buffer = ReadBufferExtended(scan->indexRelation, MAIN_FORKNUM, block_number, RBM_NORMAL, NULL);
-				if (!tq_batch_page_rescore_prod_candidates(tq_page_payload(BufferGetPage(buffer)),
-														   tq_page_payload_size(BufferGetPage(buffer)),
-														   &opaque->prod_config,
-														   opaque->normalized,
-														   opaque->distance_kind,
-														   opaque->query_values,
-														   opaque->query_dimension,
-														   pre_candidate_tids,
-														   pre_candidate_tid_count,
-														   &opaque->candidates,
-														   error_buf,
-														   sizeof(error_buf)))
+				if (!tq_batch_page_rescore_prod_candidates_with_scratch(tq_page_payload(BufferGetPage(buffer)),
+																	   tq_page_payload_size(BufferGetPage(buffer)),
+																	   &opaque->prod_config,
+																	   opaque->normalized,
+																	   opaque->distance_kind,
+																	   opaque->query_values,
+																	   opaque->query_dimension,
+																	   pre_candidate_tids,
+																	   pre_candidate_tid_count,
+																	   &opaque->candidates,
+																	   &opaque->scan_scratch,
+																	   error_buf,
+																	   sizeof(error_buf)))
 				{
 					ReleaseBuffer(buffer);
 					elog(ERROR, "%s", error_buf);
@@ -3189,6 +3291,7 @@ tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque)
 		TqRouterModel router_model;
 		TqProbeBudgetResult probe_budget;
 		TqRouterProbeScore *ranked_probes;
+		TqListDirEntry *all_entries = NULL;
 		TqListDirEntry *selected_entries = NULL;
 		double	   *ranked_scores = NULL;
 		uint32_t   *ranked_live_counts = NULL;
@@ -3198,10 +3301,15 @@ tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque)
 		TqProbePageCountFallbackContext fallback_context;
 		size_t		ranked_count = 0;
 		size_t		selected_count = 0;
+		size_t		total_ranked_live = 0;
+		size_t		total_ranked_pages = 0;
 		uint32_t	effective_count = 0;
 		uint32_t	index = 0;
+		uint32_t	list_id = 0;
 		size_t		page_count = 0;
 		size_t		max_pages = 0;
+		bool		near_exhaustive_scan = false;
+		bool		adaptive_probe_budget = false;
 		TqCandidateHeap *active_heap = &opaque->candidates;
 		TqCandidateHeap *shadow_heap = opaque->shadow_decode_diagnostics
 			? &opaque->shadow_decode_candidates
@@ -3212,8 +3320,14 @@ tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque)
 								  error_buf, sizeof(error_buf)))
 			elog(ERROR, "%s", error_buf);
 
-		ranked_count = (size_t) meta_fields.list_count;
+		adaptive_probe_budget = tq_adaptive_probe_budget_enabled(meta_fields.list_count,
+																 tq_guc_max_visited_codes,
+																 tq_guc_max_visited_pages);
+		ranked_count = adaptive_probe_budget
+			? (size_t) meta_fields.list_count
+			: Min((size_t) meta_fields.list_count, (size_t) tq_guc_probes);
 		ranked_probes = (TqRouterProbeScore *) palloc0(sizeof(TqRouterProbeScore) * ranked_count);
+		all_entries = (TqListDirEntry *) palloc0(sizeof(TqListDirEntry) * (size_t) meta_fields.list_count);
 		if (!tq_router_rank_probes(&router_model,
 								   opaque->query_values,
 								   ranked_probes,
@@ -3233,19 +3347,20 @@ tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque)
 		memset(&fallback_context, 0, sizeof(fallback_context));
 		fallback_context.index_relation = scan->indexRelation;
 
-		for (index = 0; index < (uint32_t) ranked_count; index++)
+		for (list_id = 0; list_id < meta_fields.list_count; list_id++)
 		{
-			TqListDirEntry *entry = &selected_entries[index];
+			TqListDirEntry *entry = &all_entries[list_id];
+			uint32_t page_count_hint = 0;
 
 			memset(entry, 0, sizeof(*entry));
-			ranked_scores[index] = (double) ranked_probes[index].score;
 			if (!tq_read_list_directory_entry(scan->indexRelation,
 											  meta_fields.directory_root_block,
-											  ranked_probes[index].list_id,
+											  list_id,
 											  entry,
 											  error_buf, sizeof(error_buf)))
 			{
 				tq_router_reset(&router_model);
+				pfree(all_entries);
 				pfree(selected_entries);
 				pfree(ranked_scores);
 				pfree(ranked_live_counts);
@@ -3254,6 +3369,33 @@ tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque)
 				pfree(ranked_probes);
 				elog(ERROR, "%s", error_buf);
 			}
+
+			total_ranked_live += (size_t) entry->live_count;
+			if (entry->batch_page_count > 0 || entry->head_block == TQ_INVALID_BLOCK_NUMBER)
+				page_count_hint = entry->batch_page_count;
+			else if (!tq_probe_page_count_fallback(entry,
+												   &page_count_hint,
+												   &fallback_context,
+												   error_buf,
+												   sizeof(error_buf)))
+			{
+				tq_router_reset(&router_model);
+				pfree(all_entries);
+				pfree(selected_entries);
+				pfree(ranked_scores);
+				pfree(ranked_live_counts);
+				pfree(ranked_page_counts);
+				pfree(selected_indexes);
+				pfree(ranked_probes);
+				elog(ERROR, "%s", error_buf);
+			}
+			total_ranked_pages += (size_t) page_count_hint;
+		}
+
+		for (index = 0; index < (uint32_t) ranked_count; index++)
+		{
+			selected_entries[index] = all_entries[ranked_probes[index].list_id];
+			ranked_scores[index] = (double) ranked_probes[index].score;
 		}
 
 		if (!tq_build_probe_budget_inputs(selected_entries,
@@ -3266,6 +3408,7 @@ tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque)
 										  sizeof(error_buf)))
 		{
 			tq_router_reset(&router_model);
+			pfree(all_entries);
 			pfree(selected_entries);
 			pfree(ranked_scores);
 			pfree(ranked_live_counts);
@@ -3291,6 +3434,7 @@ tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque)
 										 sizeof(error_buf)))
 		{
 			tq_router_reset(&router_model);
+			pfree(all_entries);
 			pfree(selected_entries);
 			pfree(ranked_scores);
 			pfree(ranked_live_counts);
@@ -3304,6 +3448,15 @@ tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque)
 									   probe_budget.effective_probe_count,
 									   probe_budget.max_visited_codes,
 									   probe_budget.max_visited_pages);
+		near_exhaustive_scan = tq_should_use_near_exhaustive_scan(
+			probe_budget.selected_live_count,
+			total_ranked_live,
+			probe_budget.selected_page_count,
+			total_ranked_pages);
+		tq_scan_stats_set_scan_orchestration(
+			near_exhaustive_scan ? TQ_SCAN_ORCHESTRATION_IVF_NEAR_EXHAUSTIVE
+			: TQ_SCAN_ORCHESTRATION_IVF_BOUNDED_PAGES,
+			near_exhaustive_scan);
 
 		for (index = 0; index < effective_count; index++)
 		{
@@ -3350,33 +3503,36 @@ tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque)
 		max_pages = (size_t) Max((BlockNumber) 1, RelationGetNumberOfBlocks(scan->indexRelation));
 		page_candidates = (TqBoundedPageCandidate *) palloc0(sizeof(TqBoundedPageCandidate) * max_pages);
 
-		for (index = 0; index < effective_count; index++)
+		if (!near_exhaustive_scan)
 		{
-			size_t ranked_index = selected_indexes[index];
-
-			if (!tq_collect_bounded_pages_for_list(scan->indexRelation,
-												  &selected_entries[ranked_index],
-												  opaque,
-												  page_candidates,
-												  max_pages,
-												  &page_count,
-												  error_buf,
-												  sizeof(error_buf)))
+			for (index = 0; index < effective_count; index++)
 			{
-				tq_router_reset(&router_model);
-				pfree(selected_entries);
-				pfree(ranked_scores);
-				pfree(ranked_live_counts);
-				pfree(ranked_page_counts);
-				pfree(selected_indexes);
-				pfree(page_candidates);
-				pfree(ranked_probes);
-				elog(ERROR, "%s", error_buf);
-			}
-		}
+				size_t ranked_index = selected_indexes[index];
 
-		qsort(page_candidates, page_count, sizeof(page_candidates[0]),
-			  tq_bounded_page_candidate_compare);
+				if (!tq_collect_bounded_pages_for_list(scan->indexRelation,
+													  &selected_entries[ranked_index],
+													  opaque,
+													  page_candidates,
+													  max_pages,
+													  &page_count,
+													  error_buf,
+													  sizeof(error_buf)))
+				{
+					tq_router_reset(&router_model);
+					pfree(all_entries);
+					pfree(selected_entries);
+					pfree(ranked_scores);
+					pfree(ranked_live_counts);
+					pfree(ranked_page_counts);
+					pfree(selected_indexes);
+					pfree(page_candidates);
+					pfree(ranked_probes);
+					elog(ERROR, "%s", error_buf);
+				}
+			}
+
+			qsort(page_candidates, page_count, sizeof(page_candidates[0]),
+				  tq_bounded_page_candidate_compare);
 
 			for (index = 0; index < page_count; index++)
 			{
@@ -3391,40 +3547,92 @@ tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque)
 												  sizeof(error_buf)))
 				{
 					tq_router_reset(&router_model);
+					pfree(all_entries);
 					pfree(selected_entries);
 					pfree(ranked_scores);
-				pfree(ranked_live_counts);
-				pfree(ranked_page_counts);
-				pfree(selected_indexes);
-				pfree(page_candidates);
-				pfree(ranked_probes);
-				elog(ERROR, "%s", error_buf);
+					pfree(ranked_live_counts);
+					pfree(ranked_page_counts);
+					pfree(selected_indexes);
+					pfree(page_candidates);
+					pfree(ranked_probes);
+					elog(ERROR, "%s", error_buf);
+				}
+
+				if (should_prune)
+				{
+					tq_scan_stats_add_page_prunes(page_count - (size_t) index);
+					tq_scan_stats_add_early_stops(1);
+					break;
+				}
+
+				if (!tq_scan_batch_block(scan->indexRelation,
+										 page_candidates[index].block_number,
+										 opaque,
+										 active_heap,
+										 shadow_heap,
+										 error_buf,
+										 sizeof(error_buf)))
+				{
+					tq_router_reset(&router_model);
+					pfree(all_entries);
+					pfree(selected_entries);
+					pfree(ranked_scores);
+					pfree(ranked_live_counts);
+					pfree(ranked_page_counts);
+					pfree(selected_indexes);
+					pfree(page_candidates);
+					pfree(ranked_probes);
+					elog(ERROR, "%s", error_buf);
+				}
+			}
+		}
+		else
+		{
+			for (index = 0; index < effective_count; index++)
+			{
+				size_t ranked_index = selected_indexes[index];
+
+				if (!tq_collect_live_pages_for_list(scan->indexRelation,
+												   &selected_entries[ranked_index],
+												   page_candidates,
+												   max_pages,
+												   &page_count,
+										 error_buf,
+										 sizeof(error_buf)))
+				{
+					tq_router_reset(&router_model);
+					pfree(all_entries);
+					pfree(selected_entries);
+					pfree(ranked_scores);
+					pfree(ranked_live_counts);
+					pfree(ranked_page_counts);
+					pfree(selected_indexes);
+					pfree(ranked_probes);
+					elog(ERROR, "%s", error_buf);
+				}
 			}
 
-			if (should_prune)
+			for (index = 0; index < page_count; index++)
 			{
-				tq_scan_stats_add_page_prunes(page_count - (size_t) index);
-				tq_scan_stats_add_early_stops(1);
-				break;
-			}
-
-			if (!tq_scan_batch_block(scan->indexRelation,
-									 page_candidates[index].block_number,
-									 opaque,
-									 active_heap,
-									 shadow_heap,
-									 error_buf,
-									 sizeof(error_buf)))
-			{
-				tq_router_reset(&router_model);
-				pfree(selected_entries);
-				pfree(ranked_scores);
-				pfree(ranked_live_counts);
-				pfree(ranked_page_counts);
-				pfree(selected_indexes);
-				pfree(page_candidates);
-				pfree(ranked_probes);
-				elog(ERROR, "%s", error_buf);
+				if (!tq_scan_batch_block(scan->indexRelation,
+										 page_candidates[index].block_number,
+										 opaque,
+										 active_heap,
+										 shadow_heap,
+										 error_buf,
+										 sizeof(error_buf)))
+				{
+					tq_router_reset(&router_model);
+					pfree(all_entries);
+					pfree(selected_entries);
+					pfree(ranked_scores);
+					pfree(ranked_live_counts);
+					pfree(ranked_page_counts);
+					pfree(selected_indexes);
+					pfree(page_candidates);
+					pfree(ranked_probes);
+					elog(ERROR, "%s", error_buf);
+				}
 			}
 		}
 
@@ -3441,38 +3649,81 @@ tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque)
 			}
 			tq_scan_stats_reset_candidate_heap_metrics();
 
-			for (index = 0; index < page_count; index++)
+			if (near_exhaustive_scan)
 			{
-				buffer = ReadBufferExtended(scan->indexRelation,
-											MAIN_FORKNUM,
-											page_candidates[index].block_number,
-											RBM_NORMAL,
-											NULL);
-				if (!tq_batch_page_rescore_prod_candidates(tq_page_payload(BufferGetPage(buffer)),
-														   tq_page_payload_size(BufferGetPage(buffer)),
-														   &opaque->prod_config,
-														   opaque->normalized,
-														   opaque->distance_kind,
-														   opaque->query_values,
-														   opaque->query_dimension,
-														   pre_candidate_tids,
-														   pre_candidate_tid_count,
-														   &opaque->candidates,
-														   error_buf,
-														   sizeof(error_buf)))
+				for (index = 0; index < page_count; index++)
 				{
+					buffer = ReadBufferExtended(scan->indexRelation,
+												MAIN_FORKNUM,
+												page_candidates[index].block_number,
+												RBM_NORMAL,
+												NULL);
+					if (!tq_batch_page_rescore_prod_candidates_with_scratch(tq_page_payload(BufferGetPage(buffer)),
+																		   tq_page_payload_size(BufferGetPage(buffer)),
+																		   &opaque->prod_config,
+																		   opaque->normalized,
+																		   opaque->distance_kind,
+																		   opaque->query_values,
+																		   opaque->query_dimension,
+																		   pre_candidate_tids,
+																		   pre_candidate_tid_count,
+																		   &opaque->candidates,
+																		   &opaque->scan_scratch,
+																		   error_buf,
+																		   sizeof(error_buf)))
+					{
+						ReleaseBuffer(buffer);
+						tq_router_reset(&router_model);
+						pfree(all_entries);
+						pfree(selected_entries);
+						pfree(ranked_scores);
+						pfree(ranked_live_counts);
+						pfree(ranked_page_counts);
+						pfree(selected_indexes);
+						pfree(page_candidates);
+						pfree(ranked_probes);
+						elog(ERROR, "%s", error_buf);
+					}
 					ReleaseBuffer(buffer);
-					tq_router_reset(&router_model);
-					pfree(selected_entries);
-					pfree(ranked_scores);
-					pfree(ranked_live_counts);
-					pfree(ranked_page_counts);
-					pfree(selected_indexes);
-					pfree(page_candidates);
-					pfree(ranked_probes);
-					elog(ERROR, "%s", error_buf);
 				}
-				ReleaseBuffer(buffer);
+			}
+			else
+			{
+				for (index = 0; index < page_count; index++)
+				{
+					buffer = ReadBufferExtended(scan->indexRelation,
+												MAIN_FORKNUM,
+												page_candidates[index].block_number,
+												RBM_NORMAL,
+												NULL);
+					if (!tq_batch_page_rescore_prod_candidates_with_scratch(tq_page_payload(BufferGetPage(buffer)),
+																		   tq_page_payload_size(BufferGetPage(buffer)),
+																		   &opaque->prod_config,
+																		   opaque->normalized,
+																		   opaque->distance_kind,
+																		   opaque->query_values,
+																		   opaque->query_dimension,
+																		   pre_candidate_tids,
+																		   pre_candidate_tid_count,
+																		   &opaque->candidates,
+																		   &opaque->scan_scratch,
+																		   error_buf,
+																		   sizeof(error_buf)))
+					{
+						ReleaseBuffer(buffer);
+						tq_router_reset(&router_model);
+						pfree(all_entries);
+						pfree(selected_entries);
+						pfree(ranked_scores);
+						pfree(ranked_live_counts);
+						pfree(ranked_page_counts);
+						pfree(selected_indexes);
+						pfree(page_candidates);
+						pfree(ranked_probes);
+						elog(ERROR, "%s", error_buf);
+					}
+					ReleaseBuffer(buffer);
+				}
 			}
 			tq_candidate_heap_reset(&pre_candidates);
 			if (pre_candidate_tids != NULL)
@@ -3486,6 +3737,7 @@ tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque)
 													 &opaque->shadow_decode_candidates);
 
 		tq_router_reset(&router_model);
+		pfree(all_entries);
 		pfree(selected_entries);
 		pfree(ranked_scores);
 		pfree(ranked_live_counts);
@@ -3640,6 +3892,8 @@ tq_amgetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	memset(error_buf, 0, sizeof(error_buf));
 	tq_scan_stats_begin(TQ_SCAN_MODE_BITMAP, 0);
 	tq_scan_stats_set_score_mode(TQ_SCAN_SCORE_MODE_BITMAP_FILTER);
+	tq_scan_stats_set_scan_orchestration(TQ_SCAN_ORCHESTRATION_BITMAP_FILTER,
+										 false);
 	if (!tq_read_meta_page(scan->indexRelation, &meta_fields, error_buf, sizeof(error_buf)))
 		elog(ERROR, "%s", error_buf);
 

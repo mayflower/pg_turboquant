@@ -564,6 +564,57 @@ tq_router_probe_compare(const void *left, const void *right)
 	return 0;
 }
 
+static bool
+tq_router_probe_is_better(const TqRouterProbeScore *left, const TqRouterProbeScore *right)
+{
+	return tq_router_probe_compare(left, right) < 0;
+}
+
+static void
+tq_router_probe_swap(TqRouterProbeScore *left, TqRouterProbeScore *right)
+{
+	TqRouterProbeScore tmp = *left;
+
+	*left = *right;
+	*right = tmp;
+}
+
+static void
+tq_router_worst_heap_sift_up(TqRouterProbeScore *heap, size_t index)
+{
+	while (index > 0)
+	{
+		size_t parent = (index - 1) / 2;
+
+		if (!tq_router_probe_is_better(&heap[parent], &heap[index]))
+			break;
+
+		tq_router_probe_swap(&heap[parent], &heap[index]);
+		index = parent;
+	}
+}
+
+static void
+tq_router_worst_heap_sift_down(TqRouterProbeScore *heap, size_t count, size_t index)
+{
+	for (;;)
+	{
+		size_t worst = index;
+		size_t left = (index * 2) + 1;
+		size_t right = left + 1;
+
+		if (left < count && tq_router_probe_is_better(&heap[worst], &heap[left]))
+			worst = left;
+		if (right < count && tq_router_probe_is_better(&heap[worst], &heap[right]))
+			worst = right;
+		if (worst == index)
+			break;
+
+		tq_router_probe_swap(&heap[index], &heap[worst]);
+		index = worst;
+	}
+}
+
 void
 tq_router_reset(TqRouterModel *model)
 {
@@ -805,23 +856,53 @@ tq_router_rank_probes(const TqRouterModel *model,
 		return false;
 	}
 
-	if (out_capacity < model->list_count)
+	if (out_capacity == 0)
 	{
 		tq_set_error(errmsg, errmsg_len,
-					 "invalid turboquant router: output buffer is too small");
+					 "invalid turboquant router: output buffer must be non-empty");
 		return false;
+	}
+
+	if (out_capacity >= model->list_count)
+	{
+		for (i = 0; i < model->list_count; i++)
+		{
+			out_scores[i].list_id = i;
+			out_scores[i].score = -tq_router_squared_l2_distance(
+				query,
+				model->centroids + (i * (size_t) model->dimension),
+				model->dimension);
+		}
+
+		qsort(out_scores, model->list_count, sizeof(TqRouterProbeScore), tq_router_probe_compare);
+		return true;
 	}
 
 	for (i = 0; i < model->list_count; i++)
 	{
-		out_scores[i].list_id = i;
-		out_scores[i].score = -tq_router_squared_l2_distance(
+		TqRouterProbeScore current;
+
+		current.list_id = i;
+		current.score = -tq_router_squared_l2_distance(
 			query,
 			model->centroids + (i * (size_t) model->dimension),
 			model->dimension);
+
+		if ((size_t) i < out_capacity)
+		{
+			out_scores[i] = current;
+			tq_router_worst_heap_sift_up(out_scores, (size_t) i);
+			continue;
+		}
+
+		if (tq_router_probe_is_better(&current, &out_scores[0]))
+		{
+			out_scores[0] = current;
+			tq_router_worst_heap_sift_down(out_scores, out_capacity, 0);
+		}
 	}
 
-	qsort(out_scores, model->list_count, sizeof(TqRouterProbeScore), tq_router_probe_compare);
+	qsort(out_scores, out_capacity, sizeof(TqRouterProbeScore), tq_router_probe_compare);
 	return true;
 }
 
@@ -861,7 +942,7 @@ tq_router_select_probes(const TqRouterModel *model,
 		return false;
 	}
 
-	scores = (TqRouterProbeScore *) calloc(model->list_count, sizeof(TqRouterProbeScore));
+	scores = (TqRouterProbeScore *) calloc(count, sizeof(TqRouterProbeScore));
 	if (scores == NULL)
 	{
 		tq_set_error(errmsg, errmsg_len,
@@ -869,7 +950,7 @@ tq_router_select_probes(const TqRouterModel *model,
 		return false;
 	}
 
-	if (!tq_router_rank_probes(model, query, scores, model->list_count, errmsg, errmsg_len))
+	if (!tq_router_rank_probes(model, query, scores, count, errmsg, errmsg_len))
 	{
 		free(scores);
 		return false;

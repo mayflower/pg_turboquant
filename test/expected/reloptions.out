@@ -1,5 +1,7 @@
 DROP EXTENSION IF EXISTS pg_turboquant CASCADE;
+NOTICE:  extension "pg_turboquant" does not exist, skipping
 DROP EXTENSION IF EXISTS vector CASCADE;
+NOTICE:  extension "vector" does not exist, skipping
 CREATE EXTENSION vector;
 CREATE EXTENSION pg_turboquant;
 CREATE OPERATOR FAMILY tq_int4_test_fam USING turboquant;

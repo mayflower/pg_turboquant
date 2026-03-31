@@ -1,6 +1,7 @@
 #include "src/tq_codec_prod.h"
 #include "src/tq_transform.h"
 
+#include <limits.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,6 +10,7 @@
 #define TQ_PROD_CODEBOOK_GRID 8192u
 #define TQ_PROD_LLOYD_MAX_ITERATIONS 64u
 #define TQ_PROD_QJL_SCALE ((float) 1.253314137315500251f)
+#define TQ_PROD_QJL_QUANT_RELATIVE_TOLERANCE (1.0f / 16384.0f)
 
 typedef struct TqProdCodebook
 {
@@ -31,6 +33,19 @@ static TqProdCodebook tq_prod_cached_codebook = {0};
 static TqProdSketch tq_prod_cached_sketch = {0};
 
 static uint32_t tq_prod_qjl_dimension(const TqProdCodecConfig *config);
+
+static void
+tq_prod_disable_quantized_qjl(TqProdLut *lut)
+{
+	if (lut == NULL)
+		return;
+
+	free(lut->qjl_quantized_values);
+	lut->qjl_quantized_values = NULL;
+	lut->qjl_quantization_scale = 0.0f;
+	lut->qjl_quantization_max_error = 0.0f;
+	lut->qjl_quantized_enabled = false;
+}
 
 static void
 tq_set_error(char *errmsg, size_t errmsg_len, const char *message)
@@ -996,7 +1011,76 @@ tq_prod_lut_reset(TqProdLut *lut)
 
 	free(lut->values);
 	free(lut->qjl_values);
+	free(lut->qjl_quantized_values);
 	memset(lut, 0, sizeof(*lut));
+}
+
+static bool
+tq_prod_build_quantized_qjl_lut(TqProdLut *lut,
+								  char *errmsg,
+								  size_t errmsg_len)
+{
+	int16_t *quantized = NULL;
+	float max_abs = 0.0f;
+	float max_error = 0.0f;
+	float scale = 1.0f;
+	uint32_t dim = 0;
+
+	if (lut == NULL || lut->qjl_values == NULL || lut->qjl_dimension == 0)
+		return true;
+
+	quantized = (int16_t *) malloc(sizeof(int16_t) * (size_t) lut->qjl_dimension);
+	if (quantized == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid tq_prod lut: out of memory");
+		return false;
+	}
+
+	for (dim = 0; dim < lut->qjl_dimension; dim++)
+	{
+		float magnitude = fabsf(lut->qjl_values[dim]);
+
+		if (magnitude > max_abs)
+			max_abs = magnitude;
+	}
+
+	if (max_abs > 0.0f)
+		scale = max_abs / (float) INT16_MAX;
+
+	for (dim = 0; dim < lut->qjl_dimension; dim++)
+	{
+		float value = lut->qjl_values[dim];
+		float reconstructed = 0.0f;
+		float error = 0.0f;
+		long quantized_value = 0;
+
+		quantized_value = lroundf(value / scale);
+		if (quantized_value > INT16_MAX)
+			quantized_value = INT16_MAX;
+		else if (quantized_value < INT16_MIN)
+			quantized_value = INT16_MIN;
+		quantized[dim] = (int16_t) quantized_value;
+		reconstructed = (float) quantized[dim] * scale;
+		error = fabsf(reconstructed - value);
+		if (error > max_error)
+			max_error = error;
+	}
+
+	if (max_abs > 0.0f
+		&& (max_error / max_abs) > TQ_PROD_QJL_QUANT_RELATIVE_TOLERANCE)
+	{
+		free(quantized);
+		tq_prod_disable_quantized_qjl(lut);
+		return true;
+	}
+
+	tq_prod_disable_quantized_qjl(lut);
+	lut->qjl_quantized_values = quantized;
+	lut->qjl_quantization_scale = scale;
+	lut->qjl_quantization_max_error = max_error;
+	lut->qjl_quantized_enabled = true;
+	return true;
 }
 
 bool
@@ -1073,6 +1157,8 @@ tq_prod_lut_build(const TqProdCodecConfig *config,
 	}
 
 	lut->feature_weight_norm = (float) sqrt(weight_norm_sq);
+	if (!tq_prod_build_quantized_qjl_lut(lut, errmsg, errmsg_len))
+		goto cleanup;
 
 	ok = true;
 

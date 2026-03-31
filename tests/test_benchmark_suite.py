@@ -133,6 +133,7 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
         self.assertIn("mode", scenario["scan_stats"])
         self.assertIn("score_mode", scenario["scan_stats"])
         self.assertIn("score_kernel", scenario["scan_stats"])
+        self.assertIn("scan_orchestration", scenario["scan_stats"])
         self.assertIn("selected_list_count", scenario["scan_stats"])
         self.assertIn("selected_live_count", scenario["scan_stats"])
         self.assertIn("selected_page_count", scenario["scan_stats"])
@@ -146,6 +147,10 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
         self.assertIn("candidate_heap_insert_count", scenario["scan_stats"])
         self.assertIn("candidate_heap_replace_count", scenario["scan_stats"])
         self.assertIn("candidate_heap_reject_count", scenario["scan_stats"])
+        self.assertIn("local_candidate_heap_insert_count", scenario["scan_stats"])
+        self.assertIn("local_candidate_heap_replace_count", scenario["scan_stats"])
+        self.assertIn("local_candidate_heap_reject_count", scenario["scan_stats"])
+        self.assertIn("local_candidate_merge_count", scenario["scan_stats"])
         self.assertIn("shadow_decoded_vector_count", scenario["scan_stats"])
         self.assertIn("shadow_decode_candidate_count", scenario["scan_stats"])
         self.assertIn("shadow_decode_overlap_count", scenario["scan_stats"])
@@ -155,6 +160,7 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
         self.assertIn("safe_pruning_enabled", scenario["scan_stats"])
         self.assertIn("faithful_fast_path", scenario["scan_stats"])
         self.assertIn("compatibility_fallback", scenario["scan_stats"])
+        self.assertIn("near_exhaustive_crossover", scenario["scan_stats"])
         if scenario["query_mode"] == "ordered_rerank" and scenario["method"].startswith("turboquant_"):
             self.assertIn("avg_candidate_count", scenario["candidate_retention"])
             self.assertIn("avg_exact_top_10_retention", scenario["candidate_retention"])
@@ -184,6 +190,10 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
                 self.assertTrue(scenario["index_metadata"]["page_summary"]["safe_pruning"])
                 self.assertEqual(scenario["scan_stats"]["page_bound_mode"], "safe_summary_pruning")
                 self.assertTrue(scenario["scan_stats"]["safe_pruning_enabled"])
+                self.assertIn(
+                    scenario["scan_stats"]["scan_orchestration"],
+                    ("ivf_bounded_pages", "ivf_near_exhaustive"),
+                )
         self.assertIn("python_version", payload["environment"])
         self.assertIn("platform", payload["environment"])
         self.assertIn("cpu_arch", payload["environment"])
@@ -362,6 +372,194 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
         self.assertIn("Hotpot Conclusions", html)
         self.assertIn("hotpot_overlap", html)
         self.assertNotIn("should be no slower", html)
+
+    def test_microbenchmark_section_is_machine_readable_when_requested(self):
+        payload = self.run_suite(
+            "--profile",
+            "tiny",
+            "--corpus",
+            "normalized_dense",
+            "--methods",
+            "turboquant_flat",
+            "--microbench",
+        )
+
+        self.assertIn("microbenchmarks", payload)
+        self.assertIn("results", payload["microbenchmarks"])
+        self.assertGreater(len(payload["microbenchmarks"]["results"]), 0)
+
+        first = payload["microbenchmarks"]["results"][0]
+        self.assertIn("benchmark", first)
+        self.assertIn("kernel", first)
+        self.assertIn("iterations", first)
+        self.assertIn("total_ns", first)
+        self.assertIn("ns_per_op", first)
+        self.assertIn("visited_code_count", first)
+        self.assertIn("visited_page_count", first)
+        self.assertIn("candidate_heap_insert_count", first)
+        self.assertIn("candidate_heap_replace_count", first)
+        self.assertIn("candidate_heap_reject_count", first)
+        self.assertIn("local_candidate_heap_insert_count", first)
+        self.assertIn("local_candidate_heap_replace_count", first)
+        self.assertIn("local_candidate_heap_reject_count", first)
+        self.assertIn("local_candidate_merge_count", first)
+        self.assertIn("codes_per_second", first)
+        self.assertIn("pages_per_second", first)
+        self.assertIn("scratch_allocations", first)
+        self.assertIn("decoded_buffer_reuses", first)
+        self.assertIn("code_view_uses", first)
+        self.assertIn("code_copy_uses", first)
+        self.assertIn("list_count", first)
+        self.assertIn("probe_count", first)
+        self.assertIn("requested_kernel", first)
+        self.assertIn("qjl_lut_mode", first)
+        self.assertIn("scan_layout", first)
+        self.assertIn("requested_kernel_honored", first)
+        self.assertIn("dimension", first)
+        self.assertIn("bits", first)
+        self.assertIsInstance(first["kernel"], str)
+        self.assertIsInstance(first["requested_kernel"], str)
+        self.assertIn(first["qjl_lut_mode"], ("float", "quantized"))
+        page_scan = next(
+            row for row in payload["microbenchmarks"]["results"] if row["benchmark"] == "page_scan"
+        )
+        scalar_requested = next(
+            row
+            for row in payload["microbenchmarks"]["results"]
+            if row["benchmark"] == "score_code_from_lut" and row["requested_kernel"] == "scalar"
+        )
+        avx2_requested = next(
+            row
+            for row in payload["microbenchmarks"]["results"]
+            if row["benchmark"] == "score_code_from_lut" and row["requested_kernel"] == "avx2"
+        )
+        neon_requested = next(
+            row
+            for row in payload["microbenchmarks"]["results"]
+            if row["benchmark"] == "score_code_from_lut" and row["requested_kernel"] == "neon"
+        )
+        router_full_sort = next(
+            row
+            for row in payload["microbenchmarks"]["results"]
+            if row["benchmark"] == "router_top_probes_full_sort"
+        )
+        router_partial = next(
+            row
+            for row in payload["microbenchmarks"]["results"]
+            if row["benchmark"] == "router_top_probes_partial"
+        )
+        self.assertGreater(page_scan["visited_page_count"], 0)
+        self.assertGreater(page_scan["visited_code_count"], 0)
+        self.assertGreater(page_scan["candidate_heap_insert_count"], 0)
+        self.assertGreater(page_scan["local_candidate_heap_insert_count"], 0)
+        self.assertGreater(page_scan["local_candidate_merge_count"], 0)
+        self.assertLess(page_scan["candidate_heap_insert_count"], page_scan["visited_code_count"])
+        self.assertEqual(
+            page_scan["local_candidate_heap_insert_count"]
+            + page_scan["local_candidate_heap_replace_count"]
+            + page_scan["local_candidate_heap_reject_count"],
+            page_scan["visited_code_count"],
+        )
+        self.assertGreaterEqual(page_scan["scratch_allocations"], 0)
+        self.assertGreaterEqual(page_scan["decoded_buffer_reuses"], 0)
+        self.assertEqual(page_scan["scan_layout"], "row_major")
+        self.assertGreater(page_scan["code_view_uses"], 0)
+        self.assertEqual(page_scan["code_copy_uses"], 0)
+        self.assertEqual(scalar_requested["qjl_lut_mode"], "float")
+        self.assertEqual(avx2_requested["requested_kernel"], "avx2")
+        self.assertIn(avx2_requested["kernel"], ("scalar", "avx2"))
+        self.assertIn(avx2_requested["qjl_lut_mode"], ("float", "quantized"))
+        self.assertEqual(
+            avx2_requested["requested_kernel_honored"],
+            avx2_requested["kernel"] == "avx2",
+        )
+        self.assertEqual(neon_requested["requested_kernel"], "neon")
+        self.assertIn(neon_requested["kernel"], ("scalar", "neon"))
+        self.assertIn(neon_requested["qjl_lut_mode"], ("float", "quantized"))
+        self.assertEqual(
+            neon_requested["requested_kernel_honored"],
+            neon_requested["kernel"] == "neon",
+        )
+        self.assertGreater(router_full_sort["iterations"], 0)
+        self.assertGreater(router_partial["iterations"], 0)
+        self.assertGreater(router_full_sort["visited_code_count"], 0)
+        self.assertGreater(router_partial["visited_code_count"], 0)
+        self.assertGreater(router_full_sort["list_count"], router_full_sort["probe_count"])
+        self.assertEqual(router_partial["list_count"], router_full_sort["list_count"])
+        self.assertEqual(router_partial["probe_count"], router_full_sort["probe_count"])
+        self.assertEqual(router_full_sort["visited_page_count"], 0)
+        self.assertEqual(router_partial["visited_page_count"], 0)
+        if payload["microbenchmarks"]["simd"]["avx2"]["runtime_available"] or payload["microbenchmarks"]["simd"]["neon"]["runtime_available"]:
+            self.assertTrue(
+                any(
+                    row["benchmark"] == "score_code_from_lut" and row["qjl_lut_mode"] == "quantized"
+                    for row in payload["microbenchmarks"]["results"]
+                )
+        )
+        self.assertNotIn("skipped", json.dumps(payload["microbenchmarks"]).lower())
+
+    def test_microbenchmark_comparisons_and_regression_gates_are_reported(self):
+        payload = self.run_suite(
+            "--profile",
+            "tiny",
+            "--corpus",
+            "normalized_dense",
+            "--methods",
+            "turboquant_flat",
+            "--microbench",
+            "--report",
+        )
+
+        self.assertIn("comparisons", payload["microbenchmarks"])
+        self.assertIn("regression_gates", payload["microbenchmarks"])
+        self.assertIn("interpretation_notes", payload["microbenchmarks"])
+        self.assertGreater(len(payload["microbenchmarks"]["comparisons"]), 0)
+        self.assertGreater(len(payload["microbenchmarks"]["regression_gates"]), 0)
+        self.assertGreater(len(payload["microbenchmarks"]["interpretation_notes"]), 0)
+
+        comparison_names = {row["comparison"] for row in payload["microbenchmarks"]["comparisons"]}
+        self.assertIn("score_code_from_lut_avx2_vs_scalar", comparison_names)
+        self.assertIn("score_code_from_lut_neon_vs_scalar", comparison_names)
+        self.assertIn("qjl_lut_quantized_vs_float_reference", comparison_names)
+        self.assertIn("page_scan_block_local_vs_global_heap", comparison_names)
+
+        first_comparison = payload["microbenchmarks"]["comparisons"][0]
+        self.assertIn("comparison", first_comparison)
+        self.assertIn("comparison_kind", first_comparison)
+        self.assertIn("baseline_benchmark", first_comparison)
+        self.assertIn("candidate_benchmark", first_comparison)
+        self.assertIn("metrics", first_comparison)
+        self.assertIn("codes_per_second_ratio", first_comparison["metrics"])
+        self.assertIn("ns_per_op_ratio", first_comparison["metrics"])
+        self.assertIn("visited_code_count_delta", first_comparison["metrics"])
+        self.assertIn("visited_page_count_delta", first_comparison["metrics"])
+
+        gate_names = {row["gate"] for row in payload["microbenchmarks"]["regression_gates"]}
+        self.assertIn("avx2_kernel_speedup_signal", gate_names)
+        self.assertIn("neon_kernel_speedup_signal", gate_names)
+        self.assertIn("quantized_qjl_lut_signal", gate_names)
+        self.assertIn("block_local_selection_signal", gate_names)
+
+        first_gate = payload["microbenchmarks"]["regression_gates"][0]
+        self.assertIn("gate", first_gate)
+        self.assertIn("comparison", first_gate)
+        self.assertIn("category", first_gate)
+        self.assertIn("status", first_gate)
+        self.assertIn("checks", first_gate)
+        self.assertIn(first_gate["status"], ("pass", "warn", "not_applicable"))
+        self.assertIn("same_workload", first_gate["checks"])
+        self.assertIn("throughput_directional_signal", first_gate["checks"])
+
+        self.assertIn("microbenchmark_regression", payload["report"])
+        self.assertIn("comparisons", payload["report"]["microbenchmark_regression"])
+        self.assertIn("regression_gates", payload["report"]["microbenchmark_regression"])
+
+        markdown = BENCHMARK_SUITE.render_report_markdown(payload["report"])
+        html = BENCHMARK_SUITE.render_report_html(payload["report"])
+        self.assertIn("Microbenchmark Regression", markdown)
+        self.assertIn("block_local_selection_signal", markdown)
+        self.assertIn("Microbenchmark Regression", html)
+        self.assertIn("block_local_selection_signal", html)
 
     def test_large_profile_matrix_contract(self):
         payload = self.run_suite(
@@ -543,6 +741,8 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
         self.assertIn("selected_page_count", scenario["scan_stats"])
         self.assertIn("visited_page_count", scenario["scan_stats"])
         self.assertIn("visited_code_count", scenario["scan_stats"])
+        self.assertIn("scan_orchestration", scenario["scan_stats"])
+        self.assertIn("near_exhaustive_crossover", scenario["scan_stats"])
         self.assertIn("nominal_probe_count", scenario["scan_stats"])
         self.assertIn("effective_probe_count", scenario["scan_stats"])
         self.assertIn("max_visited_codes", scenario["scan_stats"])
@@ -794,16 +994,16 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
         self.assertEqual(sql_batch.count("SELECT tq_last_scan_stats()::text"), 1)
         self.assertEqual(sql_batch.count("SELECT coalesce(json_agg(source.id ORDER BY shadow.ordinality), '[]'::json)::text"), 1)
         self.assertIn("BEGIN;", sql_batch)
-        self.assertIn("DO $$", sql_batch)
         self.assertIn("COMMIT;", sql_batch)
-        self.assertIn("tq_resolve_query_knobs(", sql_batch)
-        self.assertNotIn("SET LOCAL turboquant.probes = 4", sql_batch)
+        self.assertIn("SET LOCAL turboquant.probes = 4", sql_batch)
         self.assertIn("SET LOCAL turboquant.shadow_decode_diagnostics = on", sql_batch)
         self.assertIn("SET LOCAL turboquant.force_decode_score_diagnostics = on", sql_batch)
         self.assertIn("SET LOCAL turboquant.decode_rescore_factor = 4", sql_batch)
         self.assertIn("SET LOCAL turboquant.decode_rescore_extra_candidates = 16", sql_batch)
+        self.assertNotIn("DO $$", sql_batch)
+        self.assertNotIn("tq_resolve_query_knobs(", sql_batch)
 
-    def test_turboquant_single_batch_sql_resolves_helper_knobs_not_raw_turboquant_gucs(self):
+    def test_turboquant_single_batch_sql_preserves_requested_turboquant_gucs(self):
         sql_batch = BENCHMARK_SUITE.turboquant_single_batch_rerank_ids_sql(
             "benchmark_items",
             (0.25, 0.75),
@@ -827,20 +1027,17 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
         self.assertIn("SET LOCAL enable_seqscan = off", sql_batch)
         self.assertIn("SET LOCAL enable_bitmapscan = off", sql_batch)
         self.assertIn("BEGIN;", sql_batch)
-        self.assertIn("DO $$", sql_batch)
         self.assertIn("tq_effective_rerank_candidate_limit(10, 10)", sql_batch)
-        self.assertIn("FROM tq_resolve_query_knobs(effective_candidate_limit, 10, NULL, NULL)", sql_batch)
-        self.assertIn("PERFORM set_config('turboquant.probes'", sql_batch)
-        self.assertIn("PERFORM set_config('turboquant.oversample_factor'", sql_batch)
-        self.assertIn("PERFORM set_config('turboquant.max_visited_codes'", sql_batch)
-        self.assertIn("PERFORM set_config('turboquant.max_visited_pages'", sql_batch)
+        self.assertIn("SET LOCAL turboquant.probes = 4", sql_batch)
+        self.assertIn("SET LOCAL turboquant.oversample_factor = 4", sql_batch)
+        self.assertIn("SET LOCAL turboquant.max_visited_codes = 4096", sql_batch)
+        self.assertIn("SET LOCAL turboquant.max_visited_pages = 0", sql_batch)
         self.assertIn("SET LOCAL turboquant.shadow_decode_diagnostics = on", sql_batch)
         self.assertIn("SET LOCAL turboquant.force_decode_score_diagnostics = on", sql_batch)
         self.assertIn("SET LOCAL turboquant.decode_rescore_factor = 4", sql_batch)
         self.assertIn("SET LOCAL turboquant.decode_rescore_extra_candidates = 16", sql_batch)
-        self.assertNotIn("SET LOCAL turboquant.probes = 4", sql_batch)
-        self.assertNotIn("SET LOCAL turboquant.oversample_factor = 4", sql_batch)
-        self.assertNotIn("SET LOCAL turboquant.max_visited_codes = 4096", sql_batch)
+        self.assertNotIn("DO $$", sql_batch)
+        self.assertNotIn("tq_resolve_query_knobs(", sql_batch)
 
     def test_run_scenario_turboquant_uses_new_helper_once_per_repetition(self):
         corpus = BENCHMARK_SUITE.Corpus(

@@ -840,7 +840,7 @@ Datum
 tq_last_scan_stats_core(PG_FUNCTION_ARGS)
 {
 	TqScanStats stats;
-	char		json[2048];
+	char		json[4096];
 
 	memset(&stats, 0, sizeof(stats));
 	memset(json, 0, sizeof(json));

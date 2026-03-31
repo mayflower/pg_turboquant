@@ -28,6 +28,10 @@ typedef struct TqProdLut
 	uint32_t	level_count;
 	float	   *values;
 	float	   *qjl_values;
+	int16_t	   *qjl_quantized_values;
+	float		qjl_quantization_scale;
+	float		qjl_quantization_max_error;
+	bool		qjl_quantized_enabled;
 	float		feature_weight_norm;
 } TqProdLut;
 

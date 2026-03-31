@@ -1,0 +1,1023 @@
+#include <math.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#include "src/tq_codec_prod.h"
+#include "src/tq_page.h"
+#include "src/tq_router.h"
+#include "src/tq_scan.h"
+#include "src/tq_simd_avx2.h"
+
+typedef struct MicrobenchResult
+{
+	const char *benchmark;
+	const char *requested_kernel;
+	const char *kernel;
+	const char *qjl_lut_mode;
+	const char *scan_layout;
+	uint32_t dimension;
+	uint8_t bits;
+	uint32_t iterations;
+	uint32_t lane_count;
+	uint64_t visited_code_count;
+	uint64_t visited_page_count;
+	uint64_t candidate_heap_insert_count;
+	uint64_t candidate_heap_replace_count;
+	uint64_t candidate_heap_reject_count;
+	uint64_t local_candidate_heap_insert_count;
+	uint64_t local_candidate_heap_replace_count;
+	uint64_t local_candidate_heap_reject_count;
+	uint64_t local_candidate_merge_count;
+	uint64_t scratch_allocations;
+	uint64_t decoded_buffer_reuses;
+	uint64_t code_view_uses;
+	uint64_t code_copy_uses;
+	uint32_t list_count;
+	uint32_t probe_count;
+	uint64_t total_ns;
+	double ns_per_op;
+	double codes_per_second;
+	double pages_per_second;
+	bool requested_kernel_honored;
+	bool runtime_available;
+} MicrobenchResult;
+
+static void
+normalize(float *values, size_t len)
+{
+	float norm = 0.0f;
+	size_t i = 0;
+
+	for (i = 0; i < len; i++)
+		norm += values[i] * values[i];
+
+	norm = sqrtf(norm);
+	if (norm <= 0.0f)
+		norm = 1.0f;
+
+	for (i = 0; i < len; i++)
+		values[i] /= norm;
+}
+
+static void
+seeded_unit_vector(uint32_t seed, float *values, size_t len)
+{
+	size_t i = 0;
+
+	for (i = 0; i < len; i++)
+	{
+		uint32_t mixed = seed * 1664525u + 1013904223u + (uint32_t) i * 2654435761u;
+		values[i] = ((float) (mixed % 2001u) / 1000.0f) - 1.0f;
+	}
+
+	normalize(values, len);
+}
+
+static uint64_t
+monotonic_now_ns(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ((uint64_t) ts.tv_sec * UINT64_C(1000000000)) + (uint64_t) ts.tv_nsec;
+}
+
+static double
+throughput_per_second(uint64_t count, uint64_t total_ns)
+{
+	if (total_ns == 0)
+		return 0.0;
+
+	return ((double) count * 1000000000.0) / (double) total_ns;
+}
+
+static uint32_t
+iterations_for_dimension(uint32_t dimension)
+{
+	if (dimension <= 32u)
+		return 25000u;
+	if (dimension <= 128u)
+		return 10000u;
+	return 4000u;
+}
+
+static bool
+router_top_probe_prefix_matches(const TqRouterProbeScore *full_scores,
+								   const TqRouterProbeScore *partial_scores,
+								   uint32_t probe_count)
+{
+	uint32_t index = 0;
+
+	for (index = 0; index < probe_count; index++)
+	{
+		if (full_scores[index].list_id != partial_scores[index].list_id)
+			return false;
+		if (fabsf(full_scores[index].score - partial_scores[index].score) > 1e-6f)
+			return false;
+	}
+
+	return true;
+}
+
+static uint32_t
+test_unpack_bits(const uint8_t *packed, uint32_t bit_offset, uint32_t bit_count)
+{
+	uint32_t value = 0;
+	uint32_t bit = 0;
+
+	for (bit = 0; bit < bit_count; bit++)
+	{
+		uint32_t target_bit = bit_offset + bit;
+		uint32_t byte_index = target_bit / 8u;
+		uint32_t byte_shift = target_bit % 8u;
+
+		if ((packed[byte_index] >> byte_shift) & 1u)
+			value |= UINT32_C(1) << bit;
+	}
+
+	return value;
+}
+
+static float
+quantized_qjl_score(const TqProdCodecConfig *config,
+					  const TqProdLut *lut,
+					  const uint8_t *packed,
+					  size_t packed_len,
+					  char *errmsg,
+					  size_t errmsg_len)
+{
+	TqProdPackedLayout layout;
+	float base_sum = 0.0f;
+	float residual_sum = 0.0f;
+	float gamma = 0.0f;
+	uint32_t dim = 0;
+
+	memset(&layout, 0, sizeof(layout));
+
+	if (!lut->qjl_quantized_enabled || lut->qjl_quantized_values == NULL)
+	{
+		snprintf(errmsg, errmsg_len, "quantized qjl score requires quantized lut sidecar");
+		return 0.0f;
+	}
+
+	if (!tq_prod_packed_layout(config, &layout, errmsg, errmsg_len)
+		|| packed_len < layout.total_bytes
+		|| !tq_prod_read_gamma(config, packed, packed_len, &gamma, errmsg, errmsg_len))
+		return 0.0f;
+
+	for (dim = 0; dim < config->dimension; dim++)
+	{
+		uint32_t idx_code = test_unpack_bits(packed, dim * 3u, 3u);
+		size_t index = ((size_t) dim * (size_t) lut->level_count) + (size_t) idx_code;
+
+		base_sum += lut->values[index];
+	}
+
+	for (dim = 0; dim < lut->qjl_dimension; dim++)
+	{
+		float sign = test_unpack_bits(packed + layout.idx_bytes, dim, 1u) ? 1.0f : -1.0f;
+		float reconstructed = (float) lut->qjl_quantized_values[dim] * lut->qjl_quantization_scale;
+
+		residual_sum += sign * reconstructed;
+	}
+
+	return base_sum + (gamma * residual_sum);
+}
+
+static bool
+build_page_scan_fixture(uint32_t dimension,
+						  TqProdCodecConfig *config,
+						  TqProdPackedLayout *layout,
+						  TqProdLut *lut,
+						  TqBatchPageParams *params,
+						  uint8_t *page,
+						  size_t page_size,
+						  float *query,
+						  size_t query_capacity,
+						  char *errmsg,
+						  size_t errmsg_len)
+{
+	uint8_t packed[512];
+	uint16_t lane = 0;
+	uint32_t i = 0;
+
+	if (dimension > query_capacity)
+		return false;
+
+	memset(layout, 0, sizeof(*layout));
+	memset(lut, 0, sizeof(*lut));
+	memset(params, 0, sizeof(*params));
+	memset(page, 0, page_size);
+	memset(query, 0, sizeof(float) * query_capacity);
+	memset(packed, 0, sizeof(packed));
+
+	config->dimension = dimension;
+	config->bits = 4;
+
+	seeded_unit_vector(7u + dimension, query, dimension);
+	if (!tq_prod_packed_layout(config, layout, errmsg, errmsg_len)
+		|| !tq_prod_lut_build(config, query, lut, errmsg, errmsg_len))
+		return false;
+
+	params->lane_count = 32;
+	params->code_bytes = (uint32_t) layout->total_bytes;
+	params->list_id = 0;
+	params->next_block = TQ_INVALID_BLOCK_NUMBER;
+	if (!tq_batch_page_init(page, page_size, params, errmsg, errmsg_len))
+		return false;
+
+	for (i = 0; i < params->lane_count; i++)
+	{
+		float input[128];
+
+		memset(input, 0, sizeof(input));
+		seeded_unit_vector(100u + i + dimension, input, dimension);
+		if (!tq_prod_encode(config, input, packed, layout->total_bytes, errmsg, errmsg_len)
+			|| !tq_batch_page_append_lane(page,
+										  page_size,
+										  &(TqTid){.block_number = 1u, .offset_number = (uint16_t) (i + 1u)},
+										  &lane,
+										  errmsg,
+										  errmsg_len)
+			|| !tq_batch_page_set_code(page,
+									  page_size,
+									  lane,
+									  packed,
+									  layout->total_bytes,
+									  errmsg,
+									  errmsg_len))
+			return false;
+	}
+
+	return true;
+}
+
+static bool
+run_code_domain_bench(TqProdScoreKernel requested_kernel,
+					  uint32_t dimension,
+					  MicrobenchResult *result,
+					  char *errmsg,
+					  size_t errmsg_len)
+{
+	TqProdCodecConfig config = {.dimension = dimension, .bits = 4};
+	TqProdPackedLayout layout;
+	TqProdLut lut;
+	uint8_t *packed = NULL;
+	float *query = NULL;
+	float *input = NULL;
+	float score = 0.0f;
+	volatile float sink = 0.0f;
+	uint64_t started_ns = 0;
+	uint64_t ended_ns = 0;
+	uint32_t iterations = iterations_for_dimension(dimension);
+	uint32_t i = 0;
+	TqProdScoreKernel used_kernel = TQ_PROD_SCORE_AUTO;
+	bool ok = false;
+
+	memset(&layout, 0, sizeof(layout));
+	memset(&lut, 0, sizeof(lut));
+
+	query = (float *) calloc(dimension, sizeof(float));
+	input = (float *) calloc(dimension, sizeof(float));
+	if (query == NULL || input == NULL)
+		goto cleanup;
+
+	seeded_unit_vector(17u + dimension, query, dimension);
+	seeded_unit_vector(31u + dimension, input, dimension);
+
+	if (!tq_prod_packed_layout(&config, &layout, errmsg, errmsg_len))
+		goto cleanup;
+
+	packed = (uint8_t *) calloc(layout.total_bytes, sizeof(uint8_t));
+	if (packed == NULL)
+		goto cleanup;
+
+	if (!tq_prod_lut_build(&config, query, &lut, errmsg, errmsg_len))
+		goto cleanup;
+
+	if (!tq_prod_encode(&config, input, packed, layout.total_bytes, errmsg, errmsg_len))
+		goto cleanup;
+
+	started_ns = monotonic_now_ns();
+	for (i = 0; i < iterations; i++)
+	{
+		if (!tq_prod_score_code_from_lut_dispatch(&config,
+												  &lut,
+												  packed,
+												  layout.total_bytes,
+												  requested_kernel,
+												  &score,
+												  &used_kernel,
+												  errmsg,
+												  errmsg_len))
+			goto cleanup;
+		sink += score;
+	}
+	ended_ns = monotonic_now_ns();
+	if (sink == 0.1234567f)
+		fprintf(stderr, "ignore %f\n", sink);
+
+	result->benchmark = "score_code_from_lut";
+	result->requested_kernel = tq_prod_score_kernel_name(requested_kernel);
+	result->kernel = tq_prod_score_kernel_name(used_kernel);
+	result->qjl_lut_mode =
+		(lut.qjl_quantized_enabled && used_kernel != TQ_PROD_SCORE_SCALAR) ? "quantized" : "float";
+	result->scan_layout = "row_major";
+	result->dimension = dimension;
+	result->bits = config.bits;
+	result->iterations = iterations;
+	result->lane_count = 1u;
+	result->visited_code_count = iterations;
+	result->visited_page_count = 0u;
+	result->candidate_heap_insert_count = 0u;
+	result->candidate_heap_replace_count = 0u;
+	result->candidate_heap_reject_count = 0u;
+	result->local_candidate_heap_insert_count = 0u;
+	result->local_candidate_heap_replace_count = 0u;
+	result->local_candidate_heap_reject_count = 0u;
+	result->local_candidate_merge_count = 0u;
+	result->scratch_allocations = 0u;
+	result->decoded_buffer_reuses = 0u;
+	result->code_view_uses = 0u;
+	result->code_copy_uses = 0u;
+	result->list_count = 0u;
+	result->probe_count = 0u;
+	result->total_ns = ended_ns - started_ns;
+	result->ns_per_op = (double) result->total_ns / (double) iterations;
+	result->codes_per_second = throughput_per_second(result->visited_code_count,
+													 result->total_ns);
+	result->pages_per_second = 0.0;
+	result->requested_kernel_honored =
+		requested_kernel == TQ_PROD_SCORE_AUTO || used_kernel == requested_kernel;
+	switch (requested_kernel == TQ_PROD_SCORE_AUTO ? used_kernel : requested_kernel)
+	{
+		case TQ_PROD_SCORE_AVX2:
+			result->runtime_available = tq_simd_avx2_runtime_available();
+			break;
+		case TQ_PROD_SCORE_AVX512:
+			result->runtime_available = tq_simd_avx512_runtime_available();
+			break;
+		case TQ_PROD_SCORE_NEON:
+			result->runtime_available = tq_simd_neon_runtime_available();
+			break;
+		case TQ_PROD_SCORE_SCALAR:
+		default:
+			result->runtime_available = true;
+			break;
+	}
+	ok = true;
+
+cleanup:
+	tq_prod_lut_reset(&lut);
+	free(packed);
+	free(query);
+	free(input);
+	return ok;
+}
+
+static bool
+run_quantized_reference_bench(uint32_t dimension,
+								MicrobenchResult *result,
+								char *errmsg,
+								size_t errmsg_len)
+{
+	TqProdCodecConfig config = {.dimension = dimension, .bits = 4};
+	TqProdPackedLayout layout;
+	TqProdLut lut;
+	uint8_t *packed = NULL;
+	float *query = NULL;
+	float *input = NULL;
+	float score = 0.0f;
+	volatile float sink = 0.0f;
+	uint64_t started_ns = 0;
+	uint64_t ended_ns = 0;
+	uint32_t iterations = iterations_for_dimension(dimension);
+	uint32_t i = 0;
+	bool ok = false;
+
+	memset(&layout, 0, sizeof(layout));
+	memset(&lut, 0, sizeof(lut));
+
+	query = (float *) calloc(dimension, sizeof(float));
+	input = (float *) calloc(dimension, sizeof(float));
+	if (query == NULL || input == NULL)
+		goto cleanup;
+
+	seeded_unit_vector(17u + dimension, query, dimension);
+	seeded_unit_vector(31u + dimension, input, dimension);
+	if (!tq_prod_packed_layout(&config, &layout, errmsg, errmsg_len))
+		goto cleanup;
+
+	packed = (uint8_t *) calloc(layout.total_bytes, sizeof(uint8_t));
+	if (packed == NULL)
+		goto cleanup;
+
+	if (!tq_prod_lut_build(&config, query, &lut, errmsg, errmsg_len)
+		|| !lut.qjl_quantized_enabled
+		|| !tq_prod_encode(&config, input, packed, layout.total_bytes, errmsg, errmsg_len))
+		goto cleanup;
+
+	errmsg[0] = '\0';
+	started_ns = monotonic_now_ns();
+	for (i = 0; i < iterations; i++)
+	{
+		score = quantized_qjl_score(&config, &lut, packed, layout.total_bytes, errmsg, errmsg_len);
+		if (errmsg[0] != '\0')
+			goto cleanup;
+		sink += score;
+	}
+	ended_ns = monotonic_now_ns();
+	if (sink == 0.1234567f)
+		fprintf(stderr, "ignore %f\n", sink);
+
+	result->benchmark = "score_code_from_lut_quantized_reference";
+	result->requested_kernel = "scalar";
+	result->kernel = "scalar";
+	result->qjl_lut_mode = "quantized";
+	result->scan_layout = "row_major";
+	result->dimension = dimension;
+	result->bits = config.bits;
+	result->iterations = iterations;
+	result->lane_count = 1u;
+	result->visited_code_count = iterations;
+	result->visited_page_count = 0u;
+	result->candidate_heap_insert_count = 0u;
+	result->candidate_heap_replace_count = 0u;
+	result->candidate_heap_reject_count = 0u;
+	result->local_candidate_heap_insert_count = 0u;
+	result->local_candidate_heap_replace_count = 0u;
+	result->local_candidate_heap_reject_count = 0u;
+	result->local_candidate_merge_count = 0u;
+	result->scratch_allocations = 0u;
+	result->decoded_buffer_reuses = 0u;
+	result->code_view_uses = 0u;
+	result->code_copy_uses = 0u;
+	result->list_count = 0u;
+	result->probe_count = 0u;
+	result->total_ns = ended_ns - started_ns;
+	result->ns_per_op = (double) result->total_ns / (double) iterations;
+	result->codes_per_second = throughput_per_second(result->visited_code_count,
+													 result->total_ns);
+	result->pages_per_second = throughput_per_second(result->visited_page_count,
+													 result->total_ns);
+	result->requested_kernel_honored = true;
+	result->runtime_available = true;
+	ok = true;
+
+cleanup:
+	tq_prod_lut_reset(&lut);
+	free(packed);
+	free(query);
+	free(input);
+	return ok;
+}
+
+static bool
+run_page_scan_bench(uint32_t dimension,
+					MicrobenchResult *result,
+					char *errmsg,
+					size_t errmsg_len)
+{
+	TqProdCodecConfig config;
+	TqProdPackedLayout layout;
+	TqProdLut lut;
+	TqBatchPageParams params;
+	uint8_t page[TQ_DEFAULT_BLOCK_SIZE];
+	float query[128];
+	TqCandidateHeap heap;
+	TqScanScratch scratch;
+	volatile float sink = 0.0f;
+	uint32_t iterations = 0;
+	uint64_t started_ns = 0;
+	uint64_t ended_ns = 0;
+	TqScanStats stats;
+	bool ok = false;
+
+	memset(&config, 0, sizeof(config));
+	memset(&layout, 0, sizeof(layout));
+	memset(&lut, 0, sizeof(lut));
+	memset(&params, 0, sizeof(params));
+	memset(page, 0, sizeof(page));
+	memset(query, 0, sizeof(query));
+	memset(&heap, 0, sizeof(heap));
+	memset(&scratch, 0, sizeof(scratch));
+	memset(&stats, 0, sizeof(stats));
+
+	if (!build_page_scan_fixture(dimension,
+								  &config,
+								  &layout,
+								  &lut,
+								  &params,
+								  page,
+								  sizeof(page),
+								  query,
+								  sizeof(query) / sizeof(query[0]),
+								  errmsg,
+								  errmsg_len)
+		|| !tq_candidate_heap_init(&heap, 8))
+		goto cleanup;
+
+	iterations = iterations_for_dimension(dimension) / params.lane_count;
+	if (iterations == 0)
+		iterations = 1;
+
+	tq_scan_stats_begin(TQ_SCAN_MODE_FLAT, 1u);
+	started_ns = monotonic_now_ns();
+	for (uint32_t i = 0; i < iterations; i++)
+	{
+		if (!tq_batch_page_scan_prod_with_scratch(page,
+												  sizeof(page),
+												  &config,
+												  true,
+												  TQ_DISTANCE_COSINE,
+												  &lut,
+												  query,
+												  dimension,
+												  &heap,
+												  NULL,
+												  &scratch,
+												  errmsg,
+												  errmsg_len))
+			goto cleanup;
+		sink += (float) heap.count;
+		heap.count = 0;
+	}
+	ended_ns = monotonic_now_ns();
+	if (sink == 0.1234567f)
+		fprintf(stderr, "ignore %f\n", sink);
+	tq_scan_stats_snapshot(&stats);
+
+	result->benchmark = "page_scan";
+	result->requested_kernel = "auto";
+	result->kernel = tq_prod_score_kernel_name(stats.score_kernel);
+	result->qjl_lut_mode =
+		(lut.qjl_quantized_enabled && stats.score_kernel != TQ_PROD_SCORE_SCALAR) ? "quantized" : "float";
+	result->scan_layout = "row_major";
+	result->dimension = dimension;
+	result->bits = config.bits;
+	result->iterations = iterations;
+	result->lane_count = params.lane_count;
+	result->visited_code_count = stats.visited_code_count;
+	result->visited_page_count = stats.visited_page_count;
+	result->candidate_heap_insert_count = stats.candidate_heap_insert_count;
+	result->candidate_heap_replace_count = stats.candidate_heap_replace_count;
+	result->candidate_heap_reject_count = stats.candidate_heap_reject_count;
+	result->local_candidate_heap_insert_count = stats.local_candidate_heap_insert_count;
+	result->local_candidate_heap_replace_count = stats.local_candidate_heap_replace_count;
+	result->local_candidate_heap_reject_count = stats.local_candidate_heap_reject_count;
+	result->local_candidate_merge_count = stats.local_candidate_merge_count;
+	result->scratch_allocations = scratch.scratch_allocations;
+	result->decoded_buffer_reuses = scratch.decoded_buffer_reuses;
+	result->code_view_uses = scratch.code_view_uses;
+	result->code_copy_uses = scratch.code_copy_uses;
+	result->list_count = 0u;
+	result->probe_count = 0u;
+	result->total_ns = ended_ns - started_ns;
+	result->ns_per_op = (double) result->total_ns / (double) iterations;
+	result->codes_per_second = throughput_per_second(result->visited_code_count, result->total_ns);
+	result->pages_per_second = throughput_per_second(result->visited_page_count, result->total_ns);
+	result->requested_kernel_honored = true;
+	switch (stats.score_kernel)
+	{
+		case TQ_PROD_SCORE_AVX2:
+			result->runtime_available = tq_simd_avx2_runtime_available();
+			break;
+		case TQ_PROD_SCORE_AVX512:
+			result->runtime_available = tq_simd_avx512_runtime_available();
+			break;
+		case TQ_PROD_SCORE_NEON:
+			result->runtime_available = tq_simd_neon_runtime_available();
+			break;
+		case TQ_PROD_SCORE_SCALAR:
+		default:
+			result->runtime_available = true;
+			break;
+	}
+	ok = true;
+
+cleanup:
+	tq_scan_scratch_reset(&scratch);
+	tq_candidate_heap_reset(&heap);
+	tq_prod_lut_reset(&lut);
+	return ok;
+}
+
+static bool
+run_page_scan_global_heap_only_bench(uint32_t dimension,
+									   MicrobenchResult *result,
+									   char *errmsg,
+									   size_t errmsg_len)
+{
+	TqProdCodecConfig config;
+	TqProdPackedLayout layout;
+	TqProdLut lut;
+	TqBatchPageParams params;
+	uint8_t page[TQ_DEFAULT_BLOCK_SIZE];
+	float query[128];
+	TqCandidateHeap heap;
+	volatile float sink = 0.0f;
+	uint32_t iterations = 0;
+	uint64_t started_ns = 0;
+	uint64_t ended_ns = 0;
+	TqScanStats stats;
+	TqProdScoreKernel used_kernel = TQ_PROD_SCORE_SCALAR;
+	bool ok = false;
+
+	memset(&config, 0, sizeof(config));
+	memset(&layout, 0, sizeof(layout));
+	memset(&lut, 0, sizeof(lut));
+	memset(&params, 0, sizeof(params));
+	memset(page, 0, sizeof(page));
+	memset(query, 0, sizeof(query));
+	memset(&heap, 0, sizeof(heap));
+	memset(&stats, 0, sizeof(stats));
+
+	if (!build_page_scan_fixture(dimension,
+								  &config,
+								  &layout,
+								  &lut,
+								  &params,
+								  page,
+								  sizeof(page),
+								  query,
+								  sizeof(query) / sizeof(query[0]),
+								  errmsg,
+								  errmsg_len)
+		|| !tq_candidate_heap_init(&heap, 8))
+		goto cleanup;
+
+	iterations = iterations_for_dimension(dimension) / params.lane_count;
+	if (iterations == 0)
+		iterations = 1;
+
+	tq_scan_stats_begin(TQ_SCAN_MODE_FLAT, 1u);
+	tq_scan_stats_set_score_mode(TQ_SCAN_SCORE_MODE_CODE_DOMAIN);
+	started_ns = monotonic_now_ns();
+	for (uint32_t i = 0; i < iterations; i++)
+	{
+		uint16_t lane = 0;
+
+		tq_scan_stats_record_page_visit();
+		if (tq_batch_page_next_live_lane(page, sizeof(page), -1, &lane, errmsg, errmsg_len))
+		{
+			do
+			{
+				TqTid tid;
+				const uint8_t *code = NULL;
+				size_t code_len = 0;
+				float ip_score = 0.0f;
+				float distance_value = 0.0f;
+
+				memset(&tid, 0, sizeof(tid));
+				if (!tq_batch_page_get_tid(page, sizeof(page), lane, &tid, errmsg, errmsg_len)
+					|| !tq_batch_page_code_view(page, sizeof(page), lane, &code, &code_len, errmsg, errmsg_len)
+					|| !tq_prod_score_code_from_lut_dispatch(&config,
+															 &lut,
+															 code,
+															 code_len,
+															 tq_prod_code_domain_preferred_kernel(&config),
+															 &ip_score,
+															 &used_kernel,
+															 errmsg,
+															 errmsg_len)
+					|| !tq_metric_distance_from_ip_score(TQ_DISTANCE_COSINE,
+														  ip_score,
+														  &distance_value,
+														  errmsg,
+														  errmsg_len)
+					|| !tq_candidate_heap_push(&heap,
+											   distance_value,
+											   tid.block_number,
+											   tid.offset_number))
+					goto cleanup;
+
+				tq_scan_stats_set_score_kernel(used_kernel);
+				tq_scan_stats_record_code_view_uses(1);
+				tq_scan_stats_record_code_visit(false);
+			} while (tq_batch_page_next_live_lane(page, sizeof(page), (int) lane, &lane, errmsg, errmsg_len));
+		}
+
+		sink += (float) heap.count;
+		heap.count = 0;
+		heap.pop_index = 0;
+		heap.sorted = false;
+	}
+	ended_ns = monotonic_now_ns();
+	if (sink == 0.1234567f)
+		fprintf(stderr, "ignore %f\n", sink);
+	tq_scan_stats_snapshot(&stats);
+
+	result->benchmark = "page_scan_global_heap_only";
+	result->requested_kernel = "auto";
+	result->kernel = tq_prod_score_kernel_name(used_kernel);
+	result->qjl_lut_mode =
+		(lut.qjl_quantized_enabled && used_kernel != TQ_PROD_SCORE_SCALAR) ? "quantized" : "float";
+	result->scan_layout = "row_major";
+	result->dimension = dimension;
+	result->bits = config.bits;
+	result->iterations = iterations;
+	result->lane_count = params.lane_count;
+	result->visited_code_count = stats.visited_code_count;
+	result->visited_page_count = stats.visited_page_count;
+	result->candidate_heap_insert_count = stats.candidate_heap_insert_count;
+	result->candidate_heap_replace_count = stats.candidate_heap_replace_count;
+	result->candidate_heap_reject_count = stats.candidate_heap_reject_count;
+	result->local_candidate_heap_insert_count = stats.local_candidate_heap_insert_count;
+	result->local_candidate_heap_replace_count = stats.local_candidate_heap_replace_count;
+	result->local_candidate_heap_reject_count = stats.local_candidate_heap_reject_count;
+	result->local_candidate_merge_count = stats.local_candidate_merge_count;
+	result->scratch_allocations = 0u;
+	result->decoded_buffer_reuses = 0u;
+	result->code_view_uses = stats.code_view_uses;
+	result->code_copy_uses = 0u;
+	result->list_count = 0u;
+	result->probe_count = 0u;
+	result->total_ns = ended_ns - started_ns;
+	result->ns_per_op = (double) result->total_ns / (double) iterations;
+	result->codes_per_second = throughput_per_second(result->visited_code_count, result->total_ns);
+	result->pages_per_second = throughput_per_second(result->visited_page_count, result->total_ns);
+	result->requested_kernel_honored = true;
+	result->runtime_available = true;
+	ok = true;
+
+cleanup:
+	tq_candidate_heap_reset(&heap);
+	tq_prod_lut_reset(&lut);
+	return ok;
+}
+
+static bool
+run_router_top_probes_bench(bool partial_selection,
+							   MicrobenchResult *result,
+							   char *errmsg,
+							   size_t errmsg_len)
+{
+	const uint32_t dimension = 32u;
+	const uint32_t list_count = 256u;
+	const uint32_t probe_count = 8u;
+	const uint32_t iterations = 10000u;
+	float *centroids = NULL;
+	float *query = NULL;
+	TqRouterProbeScore *scores = NULL;
+	TqRouterProbeScore *full_scores = NULL;
+	TqRouterProbeScore *partial_scores = NULL;
+	TqRouterModel model;
+	volatile uint32_t sink = 0;
+	uint64_t started_ns = 0;
+	uint64_t ended_ns = 0;
+	uint32_t i = 0;
+	bool ok = false;
+
+	memset(&model, 0, sizeof(model));
+
+	centroids = (float *) calloc((size_t) list_count * (size_t) dimension, sizeof(float));
+	query = (float *) calloc(dimension, sizeof(float));
+	scores = (TqRouterProbeScore *) calloc(partial_selection ? probe_count : list_count,
+										   sizeof(TqRouterProbeScore));
+	full_scores = (TqRouterProbeScore *) calloc(list_count, sizeof(TqRouterProbeScore));
+	partial_scores = (TqRouterProbeScore *) calloc(probe_count, sizeof(TqRouterProbeScore));
+	if (centroids == NULL || query == NULL || scores == NULL || full_scores == NULL || partial_scores == NULL)
+		goto cleanup;
+
+	for (i = 0; i < list_count; i++)
+		seeded_unit_vector(100u + i, centroids + ((size_t) i * (size_t) dimension), dimension);
+	seeded_unit_vector(17u, query, dimension);
+
+	model.dimension = dimension;
+	model.list_count = list_count;
+	model.centroids = centroids;
+
+	if (!tq_router_rank_probes(&model, query, full_scores, list_count, errmsg, errmsg_len))
+		goto cleanup;
+	if (!tq_router_rank_probes(&model, query, partial_scores, probe_count, errmsg, errmsg_len))
+		goto cleanup;
+	if (!router_top_probe_prefix_matches(full_scores, partial_scores, probe_count))
+	{
+		snprintf(errmsg, errmsg_len,
+				 "router microbench expected partial top-probe prefix to match full sort");
+		goto cleanup;
+	}
+
+	started_ns = monotonic_now_ns();
+	for (i = 0; i < iterations; i++)
+	{
+		size_t capacity = partial_selection ? (size_t) probe_count : (size_t) list_count;
+
+		if (!tq_router_rank_probes(&model, query, scores, capacity, errmsg, errmsg_len))
+			goto cleanup;
+		sink += scores[0].list_id;
+	}
+	ended_ns = monotonic_now_ns();
+	if (sink == 0u)
+		fprintf(stderr, "ignore %u\n", sink);
+
+	result->benchmark = partial_selection
+		? "router_top_probes_partial"
+		: "router_top_probes_full_sort";
+	result->requested_kernel = "scalar";
+	result->kernel = "scalar";
+	result->qjl_lut_mode = "float";
+	result->scan_layout = "row_major";
+	result->dimension = dimension;
+	result->bits = 0u;
+	result->iterations = iterations;
+	result->lane_count = 0u;
+	result->visited_code_count = (uint64_t) iterations * (uint64_t) list_count;
+	result->visited_page_count = 0u;
+	result->candidate_heap_insert_count = 0u;
+	result->candidate_heap_replace_count = 0u;
+	result->candidate_heap_reject_count = 0u;
+	result->local_candidate_heap_insert_count = 0u;
+	result->local_candidate_heap_replace_count = 0u;
+	result->local_candidate_heap_reject_count = 0u;
+	result->local_candidate_merge_count = 0u;
+	result->scratch_allocations = 0u;
+	result->decoded_buffer_reuses = 0u;
+	result->code_view_uses = 0u;
+	result->code_copy_uses = 0u;
+	result->list_count = list_count;
+	result->probe_count = probe_count;
+	result->total_ns = ended_ns - started_ns;
+	result->ns_per_op = (double) result->total_ns / (double) iterations;
+	result->codes_per_second = throughput_per_second(result->visited_code_count,
+													 result->total_ns);
+	result->pages_per_second = 0.0;
+	result->requested_kernel_honored = true;
+	result->runtime_available = true;
+	ok = true;
+
+cleanup:
+	free(centroids);
+	free(query);
+	free(scores);
+	free(full_scores);
+	free(partial_scores);
+	return ok;
+}
+
+static void
+emit_results_json(const MicrobenchResult *results, size_t count)
+{
+	const char *arch = "unknown";
+	bool first = true;
+	size_t i = 0;
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+	arch = "arm64";
+#elif defined(__x86_64__) || defined(_M_X64)
+	arch = "x86_64";
+#endif
+
+	printf("{\"architecture\":\"%s\",\"simd\":{", arch);
+	printf("\"scalar\":{\"compiled\":true,\"runtime_available\":true},");
+	printf("\"avx2\":{\"compiled\":%s,\"runtime_available\":%s},",
+		   tq_simd_avx2_compile_available() ? "true" : "false",
+		   tq_simd_avx2_runtime_available() ? "true" : "false");
+	printf("\"avx512\":{\"compiled\":%s,\"runtime_available\":%s},",
+		   tq_simd_avx512_compile_available() ? "true" : "false",
+		   tq_simd_avx512_runtime_available() ? "true" : "false");
+	printf("\"neon\":{\"compiled\":%s,\"runtime_available\":%s}",
+		   tq_simd_neon_compile_available() ? "true" : "false",
+		   tq_simd_neon_runtime_available() ? "true" : "false");
+	printf("},\"results\":[");
+
+	for (i = 0; i < count; i++)
+	{
+		if (!first)
+			printf(",");
+		first = false;
+		printf(
+			"{\"benchmark\":\"%s\",\"requested_kernel\":\"%s\",\"kernel\":\"%s\","
+			"\"qjl_lut_mode\":\"%s\",\"scan_layout\":\"%s\","
+			"\"requested_kernel_honored\":%s,\"dimension\":%u,\"bits\":%u,"
+			"\"iterations\":%u,\"lane_count\":%u,\"visited_code_count\":%llu,"
+			"\"visited_page_count\":%llu,\"candidate_heap_insert_count\":%llu,"
+			"\"candidate_heap_replace_count\":%llu,\"candidate_heap_reject_count\":%llu,"
+			"\"local_candidate_heap_insert_count\":%llu,"
+			"\"local_candidate_heap_replace_count\":%llu,"
+			"\"local_candidate_heap_reject_count\":%llu,"
+			"\"local_candidate_merge_count\":%llu,"
+			"\"scratch_allocations\":%llu,\"decoded_buffer_reuses\":%llu,"
+			"\"code_view_uses\":%llu,\"code_copy_uses\":%llu,"
+			"\"list_count\":%u,\"probe_count\":%u,"
+			"\"total_ns\":%llu,\"ns_per_op\":%.3f,\"codes_per_second\":%.3f,"
+			"\"pages_per_second\":%.3f,"
+			"\"runtime_available\":%s}",
+			results[i].benchmark,
+			results[i].requested_kernel,
+			results[i].kernel,
+			results[i].qjl_lut_mode,
+			results[i].scan_layout,
+			results[i].requested_kernel_honored ? "true" : "false",
+			results[i].dimension,
+			(unsigned int) results[i].bits,
+			results[i].iterations,
+			results[i].lane_count,
+			(unsigned long long) results[i].visited_code_count,
+			(unsigned long long) results[i].visited_page_count,
+			(unsigned long long) results[i].candidate_heap_insert_count,
+			(unsigned long long) results[i].candidate_heap_replace_count,
+			(unsigned long long) results[i].candidate_heap_reject_count,
+			(unsigned long long) results[i].local_candidate_heap_insert_count,
+			(unsigned long long) results[i].local_candidate_heap_replace_count,
+			(unsigned long long) results[i].local_candidate_heap_reject_count,
+			(unsigned long long) results[i].local_candidate_merge_count,
+			(unsigned long long) results[i].scratch_allocations,
+			(unsigned long long) results[i].decoded_buffer_reuses,
+			(unsigned long long) results[i].code_view_uses,
+			(unsigned long long) results[i].code_copy_uses,
+			results[i].list_count,
+			results[i].probe_count,
+			(unsigned long long) results[i].total_ns,
+			results[i].ns_per_op,
+			results[i].codes_per_second,
+			results[i].pages_per_second,
+			results[i].runtime_available ? "true" : "false");
+	}
+
+	printf("]}\n");
+}
+
+int
+main(void)
+{
+	MicrobenchResult results[12];
+	size_t result_count = 0;
+	char errmsg[256];
+
+	memset(results, 0, sizeof(results));
+	memset(errmsg, 0, sizeof(errmsg));
+
+	if (!run_code_domain_bench(TQ_PROD_SCORE_SCALAR, 32u, &results[result_count], errmsg, sizeof(errmsg)))
+	{
+		fprintf(stderr, "scalar microbench failed: %s\n", errmsg);
+		return 1;
+	}
+	result_count++;
+
+	if (!run_code_domain_bench(TQ_PROD_SCORE_AUTO, 32u, &results[result_count], errmsg, sizeof(errmsg)))
+	{
+		fprintf(stderr, "auto microbench failed: %s\n", errmsg);
+		return 1;
+	}
+	result_count++;
+
+	if (!run_code_domain_bench(TQ_PROD_SCORE_AVX2, 32u, &results[result_count], errmsg, sizeof(errmsg)))
+	{
+		fprintf(stderr, "explicit avx2 microbench failed: %s\n", errmsg);
+		return 1;
+	}
+	result_count++;
+
+	if (!run_code_domain_bench(TQ_PROD_SCORE_NEON, 32u, &results[result_count], errmsg, sizeof(errmsg)))
+	{
+		fprintf(stderr, "explicit neon microbench failed: %s\n", errmsg);
+		return 1;
+	}
+	result_count++;
+
+	if (!run_quantized_reference_bench(32u, &results[result_count], errmsg, sizeof(errmsg)))
+	{
+		fprintf(stderr, "quantized reference microbench failed: %s\n", errmsg);
+		return 1;
+	}
+	result_count++;
+
+	if (!run_page_scan_bench(32u,
+							 &results[result_count],
+							 errmsg,
+							 sizeof(errmsg)))
+	{
+		fprintf(stderr, "page scan microbench failed: %s\n", errmsg);
+		return 1;
+	}
+	result_count++;
+
+	if (!run_page_scan_global_heap_only_bench(32u, &results[result_count], errmsg, sizeof(errmsg)))
+	{
+		fprintf(stderr, "global-heap page scan microbench failed: %s\n", errmsg);
+		return 1;
+	}
+	result_count++;
+
+	if (!run_router_top_probes_bench(false, &results[result_count], errmsg, sizeof(errmsg)))
+	{
+		fprintf(stderr, "router full-sort microbench failed: %s\n", errmsg);
+		return 1;
+	}
+	result_count++;
+
+	if (!run_router_top_probes_bench(true, &results[result_count], errmsg, sizeof(errmsg)))
+	{
+		fprintf(stderr, "router partial microbench failed: %s\n", errmsg);
+		return 1;
+	}
+	result_count++;
+
+	emit_results_json(results, result_count);
+	return 0;
+}

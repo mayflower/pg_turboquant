@@ -48,6 +48,25 @@ uv run python scripts/benchmark_suite.py \
 
 The suite records `turboquant.probes`, `turboquant.oversample_factor`, and the derived `candidate_slots_bound` so probe experiments are reproducible.
 
+## 4. Attach the Qprod/QJL microbench regression view
+
+```sh
+uv run python scripts/benchmark_suite.py \
+  --dry-run \
+  --profile tiny \
+  --corpus normalized_dense \
+  --methods turboquant_flat \
+  --microbench \
+  --report \
+  --output qprod-qjl-microbench.json
+```
+
+This adds three machine-readable sections under `microbenchmarks`:
+
+- `results`: raw per-row timings and counters
+- `comparisons`: stable pairwise comparisons for kernel, LUT, and heap-selection changes
+- `regression_gates`: directional statuses with explicit checks, plus `interpretation_notes`
+
 ## Output artifacts
 
 - main JSON output
@@ -85,6 +104,16 @@ flowchart LR
 - `simd.selected_kernel`
 
 The generated report is descriptive rather than normative. It states what was measured for the selected corpus/profile/knob matrix and keeps latency, scan work, and footprint separate instead of asserting unmeasured expectations such as "should be no slower".
+
+For the microbenchmark regression section, start with:
+
+- `microbenchmarks.comparisons[*].metrics.codes_per_second_ratio`
+- `microbenchmarks.comparisons[*].metrics.visited_code_count_delta`
+- `microbenchmarks.comparisons[*].metrics.visited_page_count_delta`
+- `microbenchmarks.comparisons[*].metrics.candidate_heap_insert_delta`
+- `microbenchmarks.regression_gates[*].status`
+
+Interpret the gate rows together with their `checks` map. A `warn` row is not automatically a failure: for example, a heap-selection change can still preserve equal work and reduce global heap churn even if a small host-local timing wobble moves in the wrong direction.
 
 ## RAG benchmarks
 

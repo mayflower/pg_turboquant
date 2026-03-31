@@ -2,7 +2,7 @@
 
 `pg_turboquant` is a PostgreSQL extension that adds a custom ANN index access method, `turboquant`, for compact nearest-neighbor search over `vector` and `halfvec`.
 
-It is designed around PostgreSQL's storage and executor constraints rather than treating ANN indexing as an external service. The project combines structured transforms, a faithful TurboQuant `v2` payload for normalized cosine and inner-product retrieval, lane-adaptive batch pages, ordered ANN scans, bitmap support for filtered workloads, SQL-side exact reranking helpers, and a reproducible benchmark harness.
+It is designed around PostgreSQL's storage and executor constraints rather than treating ANN indexing as an external service. The project combines structured transforms, a faithful TurboQuant `v2` payload for normalized cosine and inner-product retrieval, lane-adaptive row-major batch pages, ordered ANN scans, bitmap support for filtered workloads, SQL-side exact reranking helpers, and a reproducible benchmark harness with machine-readable microbench regression gates.
 
 ## Why it exists
 
@@ -31,6 +31,9 @@ It is designed around PostgreSQL's storage and executor constraints rather than 
 - Fast-path scope:
   - normalized cosine and inner product run on the faithful `v2` code-domain path
   - L2 and non-normalized scans use explicit compatibility fallback scoring
+- Page layout:
+  - row-major packed batch pages are the only supported on-disk scan layout
+  - an optional transposed scan-layout prototype was benchmarked and dropped after regressing equal-workload page scans on the current arm64/NEON baseline
 - SQL helpers:
   - `tq_rerank_candidates(...)`
   - `tq_approx_candidates(...)`
@@ -85,18 +88,18 @@ FROM tq_rerank_candidates(
 
 ## Benchmark highlights
 
-Representative checked-in retrieval results:
+Representative current retrieval results from the checked-in live comparative campaign at `benchmarks/rag/results/live-rag-e2e-20260331-current/`:
 
 | Workload | Method | Recall@10 | P95 Latency (ms) | Footprint (bytes) |
 |---|---|---:|---:|---:|
-| KILT NQ | `pg_turboquant_approx` | 0.946667 | 8.836190 | 1,277,952 |
-| KILT NQ | `pgvector_hnsw_approx` | 0.946667 | 28.845381 | 5,079,040 |
-| KILT NQ | `pgvector_ivfflat_approx` | 0.946667 | 49.492140 | 4,399,104 |
-| PopQA mini | `pg_turboquant_rerank` | 1.000000 | 4.796433 | 24,576 |
-| PopQA mini | `pgvector_hnsw_rerank` | 1.000000 | 5.408724 | 73,728 |
-| PopQA mini | `pgvector_ivfflat_rerank` | 1.000000 | 5.975884 | 81,920 |
-| HotpotQA fixed-q50 | `pg_turboquant_approx` | 1.000000 | 64.991898 | 5,873,664 |
-| HotpotQA fixed-q50 | `pgvector_ivfflat_approx` | 1.000000 | 8.329492 | 17,563,648 |
+| KILT NQ | `pg_turboquant_approx` | 0.950000 | 5.689029 | 1,277,952 |
+| KILT NQ | `pgvector_hnsw_approx` | 0.950000 | 3.228352 | 5,079,040 |
+| KILT NQ | `pgvector_ivfflat_approx` | 0.950000 | 2.596973 | 4,349,952 |
+| KILT HotpotQA | `pg_turboquant_approx` | 0.792500 | 5.906979 | 6,455,296 |
+| KILT HotpotQA | `pg_turboquant_rerank` | 1.000000 | 20.256061 | 6,455,296 |
+| KILT HotpotQA | `pgvector_ivfflat_approx` | 1.000000 | 3.069100 | 17,563,648 |
+| PopQA | `pg_turboquant_approx` | 1.000000 | 6.977801 | 2,514,944 |
+| PopQA | `pgvector_ivfflat_approx` | 1.000000 | 2.896392 | 8,159,232 |
 
 ### Comparative retrieval on KILT HotpotQA (amd64, PG 16, 10K passages, bge-small-en-v1.5)
 
@@ -111,14 +114,15 @@ Representative checked-in retrieval results:
 
 Those results are environment-specific. The benchmark harness keeps recall, latency, footprint, WAL, and concurrent-write measurements separate so tradeoffs remain visible instead of being collapsed into a single score.
 
-The checked-in benchmark corpus still includes pre-`v2` historical runs. Re-run the benchmark suite before using it as evidence for the faithful `v2` rewrite.
+The checked-in benchmark corpus still includes older historical runs. Re-run the benchmark suite before using any single checked-in artifact as evidence for the current tree.
 
 Recent live RAG evidence is also available under `benchmarks/rag/`:
 
-- the focused `kilt_nq` rerun at `benchmarks/rag/results/kilt-nq-rerun-q20-20260330/`
-- the generated aggregate HTML at `output.html`
+- the current three-dataset comparative rerun at `benchmarks/rag/results/live-rag-e2e-20260331-current/`
+- the campaign-local HTML report at `benchmarks/rag/results/live-rag-e2e-20260331-current/outcome.html`
+- the top-level aggregate HTML at `benchmarks/rag/results/outcome.html`
 
-That rerun used the current faithful TurboQuant code against the local PostgreSQL-backed RAG corpus with `query_limit = 20`. In that slice, all six method variants landed at `recall@10 = 0.95`; `pg_turboquant_approx` kept the smallest footprint at `1,277,952` bytes, but its retrieval p95 (`26.81 ms`) was slower than HNSW approx (`14.63 ms`) and slightly slower than IVFFlat approx (`24.92 ms`).
+That rerun used the current faithful TurboQuant code after the completed Qprod/QJL speed work against the local PostgreSQL-backed RAG corpus with `query_limit = 200`. On this machine, TurboQuant kept the footprint lead across all three datasets and materially improved its own retrieval latency versus the checked-in `2026-03-30` baseline, but it still did not become the raw latency leader against pgvector HNSW or IVFFlat on those slices.
 
 ## Documentation
 
@@ -165,6 +169,21 @@ make tapcheck
 ```
 
 The benchmark harness lives in `scripts/benchmark_suite.py`. The RAG evaluation harness lives under `benchmarks/rag/`.
+
+For the completed Qprod/QJL CPU speed work, the benchmark suite also supports a machine-readable microbench view:
+
+```sh
+uv run python scripts/benchmark_suite.py \
+  --dry-run \
+  --profile tiny \
+  --corpus normalized_dense \
+  --methods turboquant_flat \
+  --microbench \
+  --report \
+  --output qprod-qjl-microbench.json
+```
+
+That view records raw `results`, stable `comparisons`, and directional `regression_gates` for SIMD kernel selection, quantized QJL LUTs, and block-local page selection. The current baseline is row-major only; the optional transposed page-layout experiment was intentionally removed after the measured regression on the maintained arm64/NEON path.
 
 For scan observability, `tq_last_scan_stats()` exposes backend-local JSON for the most recent TurboQuant scan, and the benchmark/RAG harnesses persist scan-work counters such as visited lists, pages, codes, and score mode.
 

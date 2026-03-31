@@ -33,6 +33,10 @@ typedef struct TqProbeBudgetResult
 	bool		adaptive_enabled;
 } TqProbeBudgetResult;
 
+extern bool tq_should_use_near_exhaustive_scan(size_t selected_live_count,
+											   size_t total_live_count,
+											   size_t selected_page_count,
+											   size_t total_page_count);
 extern size_t tq_scan_candidate_capacity(size_t live_count,
 										 int probes,
 										 int oversample_factor);

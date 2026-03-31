@@ -120,6 +120,28 @@ test_flat_mode_disables_adaptive_budgeting(void)
 }
 
 static void
+test_near_exhaustive_scan_activates_on_live_fraction_threshold(void)
+{
+	assert(tq_should_use_near_exhaustive_scan(70, 100, 2, 10));
+	assert(!tq_should_use_near_exhaustive_scan(69, 100, 2, 10));
+}
+
+static void
+test_near_exhaustive_scan_activates_on_page_fraction_threshold(void)
+{
+	assert(tq_should_use_near_exhaustive_scan(6, 20, 7, 10));
+	assert(!tq_should_use_near_exhaustive_scan(6, 20, 6, 10));
+}
+
+static void
+test_near_exhaustive_scan_requires_nonzero_totals(void)
+{
+	assert(!tq_should_use_near_exhaustive_scan(0, 0, 0, 0));
+	assert(!tq_should_use_near_exhaustive_scan(8, 0, 0, 0));
+	assert(!tq_should_use_near_exhaustive_scan(0, 0, 8, 0));
+}
+
+static void
 test_cost_aware_selector_prefers_cheaper_combo_under_budget(void)
 {
 	double scores[] = {100.0, 99.6, 99.5, 99.4};
@@ -223,6 +245,9 @@ main(void)
 	test_selected_live_respects_budget_after_first_probe();
 	test_router_order_is_preserved();
 	test_flat_mode_disables_adaptive_budgeting();
+	test_near_exhaustive_scan_activates_on_live_fraction_threshold();
+	test_near_exhaustive_scan_activates_on_page_fraction_threshold();
+	test_near_exhaustive_scan_requires_nonzero_totals();
 	test_cost_aware_selector_prefers_cheaper_combo_under_budget();
 	test_cost_aware_selector_keeps_closest_centroids_without_budget();
 	test_cost_aware_selector_is_deterministic_for_equal_scores_and_costs();

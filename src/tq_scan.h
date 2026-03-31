@@ -51,15 +51,26 @@ typedef enum TqPageBoundMode
 	TQ_PAGE_BOUND_MODE_MIXED
 } TqPageBoundMode;
 
+typedef enum TqScanOrchestration
+{
+	TQ_SCAN_ORCHESTRATION_NONE = 0,
+	TQ_SCAN_ORCHESTRATION_FLAT_STREAMING,
+	TQ_SCAN_ORCHESTRATION_IVF_BOUNDED_PAGES,
+	TQ_SCAN_ORCHESTRATION_IVF_NEAR_EXHAUSTIVE,
+	TQ_SCAN_ORCHESTRATION_BITMAP_FILTER
+} TqScanOrchestration;
+
 typedef struct TqScanStats
 {
 	TqScanMode	mode;
 	TqScanScoreMode score_mode;
 	TqProdScoreKernel score_kernel;
 	TqPageBoundMode page_bound_mode;
+	TqScanOrchestration scan_orchestration;
 	bool		faithful_fast_path;
 	bool		compatibility_fallback;
 	bool		safe_pruning_enabled;
+	bool		near_exhaustive_crossover;
 	size_t		configured_probe_count;
 	size_t		nominal_probe_count;
 	size_t		effective_probe_count;
@@ -76,6 +87,10 @@ typedef struct TqScanStats
 	size_t		candidate_heap_insert_count;
 	size_t		candidate_heap_replace_count;
 	size_t		candidate_heap_reject_count;
+	size_t		local_candidate_heap_insert_count;
+	size_t		local_candidate_heap_replace_count;
+	size_t		local_candidate_heap_reject_count;
+	size_t		local_candidate_merge_count;
 	size_t		shadow_decoded_vector_count;
 	size_t		shadow_decode_candidate_count;
 	size_t		shadow_decode_overlap_count;
@@ -85,7 +100,21 @@ typedef struct TqScanStats
 	size_t		bound_data_page_reads;
 	size_t		page_prune_count;
 	size_t		early_stop_count;
+	size_t		scratch_allocations;
+	size_t		decoded_buffer_reuses;
+	size_t		code_view_uses;
+	size_t		code_copy_uses;
 } TqScanStats;
+
+typedef struct TqScanScratch
+{
+	float	   *decoded_values;
+	size_t		decoded_capacity;
+	size_t		scratch_allocations;
+	size_t		decoded_buffer_reuses;
+	size_t		code_view_uses;
+	size_t		code_copy_uses;
+} TqScanScratch;
 
 extern bool tq_candidate_heap_init(TqCandidateHeap *heap, size_t capacity);
 extern void tq_candidate_heap_reset(TqCandidateHeap *heap);
@@ -136,6 +165,8 @@ extern void tq_scan_stats_set_score_mode(TqScanScoreMode score_mode);
 extern void tq_scan_stats_set_score_kernel(TqProdScoreKernel score_kernel);
 extern void tq_scan_stats_set_path_flags(bool faithful_fast_path,
 										 bool compatibility_fallback);
+extern void tq_scan_stats_set_scan_orchestration(TqScanOrchestration scan_orchestration,
+												 bool near_exhaustive_crossover);
 extern void tq_scan_stats_record_page_bound_mode(TqPageBoundMode page_bound_mode,
 												 bool safe_pruning_enabled);
 extern void tq_scan_stats_reset_candidate_heap_metrics(void);
@@ -154,8 +185,16 @@ extern void tq_scan_stats_add_early_stops(size_t count);
 extern void tq_scan_stats_record_candidate_heap_insert(void);
 extern void tq_scan_stats_record_candidate_heap_replace(void);
 extern void tq_scan_stats_record_candidate_heap_reject(void);
+extern void tq_scan_stats_record_local_candidate_heap_insert(void);
+extern void tq_scan_stats_record_local_candidate_heap_replace(void);
+extern void tq_scan_stats_record_local_candidate_heap_reject(void);
+extern void tq_scan_stats_record_local_candidate_merge(void);
 extern void tq_scan_stats_record_decoded_vector_only(void);
 extern void tq_scan_stats_record_shadow_decoded_vector(void);
+extern void tq_scan_stats_record_scratch_allocations(size_t count);
+extern void tq_scan_stats_record_decoded_buffer_reuses(size_t count);
+extern void tq_scan_stats_record_code_view_uses(size_t count);
+extern void tq_scan_stats_record_code_copy_uses(size_t count);
 extern void tq_scan_stats_set_candidate_heap_metrics(size_t capacity, size_t count);
 extern void tq_scan_stats_set_shadow_decode_metrics(const TqCandidateHeap *primary,
 													const TqCandidateHeap *shadow);
@@ -171,6 +210,7 @@ extern bool tq_scan_stats_serialize_json(const TqScanStats *stats,
 										 char *buffer,
 										 size_t buffer_len);
 extern bool tq_scan_active_uses_prod_code_domain(bool normalized, TqDistanceKind distance);
+extern void tq_scan_scratch_reset(TqScanScratch *scratch);
 extern bool tq_batch_page_scan_prod(const void *page,
 									size_t page_size,
 									const TqProdCodecConfig *config,
@@ -183,6 +223,19 @@ extern bool tq_batch_page_scan_prod(const void *page,
 									TqCandidateHeap *shadow_decode_heap,
 									char *errmsg,
 									size_t errmsg_len);
+extern bool tq_batch_page_scan_prod_with_scratch(const void *page,
+												 size_t page_size,
+												 const TqProdCodecConfig *config,
+												 bool normalized,
+												 TqDistanceKind distance,
+												 const TqProdLut *lut,
+												 const float *query_values,
+												 size_t query_len,
+												 TqCandidateHeap *heap,
+												 TqCandidateHeap *shadow_decode_heap,
+												 TqScanScratch *scratch,
+												 char *errmsg,
+												 size_t errmsg_len);
 extern bool tq_batch_page_rescore_prod_candidates(const void *page,
 												  size_t page_size,
 												  const TqProdCodecConfig *config,
@@ -195,6 +248,19 @@ extern bool tq_batch_page_rescore_prod_candidates(const void *page,
 												  TqCandidateHeap *heap,
 												  char *errmsg,
 												  size_t errmsg_len);
+extern bool tq_batch_page_rescore_prod_candidates_with_scratch(const void *page,
+															   size_t page_size,
+															   const TqProdCodecConfig *config,
+															   bool normalized,
+															   TqDistanceKind distance,
+															   const float *query_values,
+															   size_t query_len,
+															   const TqTid *candidate_tids,
+															   size_t candidate_tid_count,
+															   TqCandidateHeap *heap,
+															   TqScanScratch *scratch,
+															   char *errmsg,
+															   size_t errmsg_len);
 extern bool tq_batch_page_scan_prod_cosine(const void *page,
 										   size_t page_size,
 										   const TqProdCodecConfig *config,

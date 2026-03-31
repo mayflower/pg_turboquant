@@ -109,6 +109,25 @@ tq_probe_selected_index_compare(const void *left, const void *right)
 	return 0;
 }
 
+static bool
+tq_fraction_meets_near_exhaustive_threshold(size_t selected_count, size_t total_count)
+{
+	if (selected_count == 0 || total_count == 0)
+		return false;
+
+	return selected_count >= ((total_count * (size_t) 7) + (size_t) 9) / (size_t) 10;
+}
+
+bool
+tq_should_use_near_exhaustive_scan(size_t selected_live_count,
+								   size_t total_live_count,
+								   size_t selected_page_count,
+								   size_t total_page_count)
+{
+	return tq_fraction_meets_near_exhaustive_threshold(selected_live_count, total_live_count)
+		|| tq_fraction_meets_near_exhaustive_threshold(selected_page_count, total_page_count);
+}
+
 size_t
 tq_streaming_candidate_capacity(int probes, int oversample_factor)
 {

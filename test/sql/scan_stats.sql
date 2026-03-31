@@ -52,6 +52,8 @@ WITH stats AS (
 SELECT
 	stats->>'mode' AS mode,
 	stats->>'score_mode' AS score_mode,
+	stats->>'scan_orchestration' AS scan_orchestration,
+	(stats->>'near_exhaustive_crossover')::boolean AS near_exhaustive_crossover,
 	(stats->>'visited_code_count')::int > 0 AS visited_codes_positive,
 	(stats->>'visited_page_count')::int > 0 AS visited_pages_positive,
 	(stats->>'bound_data_page_reads')::int = 0 AS bound_reads_avoided,
@@ -60,4 +62,25 @@ SELECT
 	(stats->>'selected_list_count')::int <= 2 AS selected_lists_within_probes,
 	(stats->>'selected_live_count')::int > 0 AS selected_live_positive,
 	(stats->>'candidate_heap_capacity')::int >= (stats->>'candidate_heap_count')::int AS heap_bounded
+FROM stats;
+
+SET turboquant.probes = 4;
+
+SELECT array_agg(id ORDER BY id) AS exhaustive_ids
+FROM (
+	SELECT id
+	FROM tq_scan_stats_docs
+	ORDER BY embedding <=> '[1.0,0.0]'
+	LIMIT 2
+) ranked;
+
+WITH stats AS (
+	SELECT tq_last_scan_stats() AS stats
+)
+SELECT
+	stats->>'scan_orchestration' AS scan_orchestration,
+	(stats->>'near_exhaustive_crossover')::boolean AS near_exhaustive_crossover,
+	(stats->>'selected_list_count')::int = 4 AS selected_all_lists,
+	(stats->>'visited_page_count')::int = (stats->>'selected_page_count')::int AS visited_all_selected_pages,
+	(stats->>'bound_data_page_reads')::int = 0 AS bound_reads_avoided
 FROM stats;
