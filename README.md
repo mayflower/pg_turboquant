@@ -101,16 +101,16 @@ Representative current retrieval results from the checked-in live comparative ca
 | PopQA | `pg_turboquant_approx` | 1.000000 | 6.977801 | 2,514,944 |
 | PopQA | `pgvector_ivfflat_approx` | 1.000000 | 2.896392 | 8,159,232 |
 
-### Comparative retrieval on KILT HotpotQA (amd64, PG 16, 10K passages, bge-small-en-v1.5)
+### Comparative retrieval on KILT HotpotQA (amd64, PG 16, 10K passages, bge-small-en-v1.5, v2 Qprod/QJL codec)
 
-| Method | P95 Latency (ms) | Footprint | vs HNSW approx |
+| Method | Recall@10 | P95 Latency (ms) | Footprint |
 |---|---:|---:|---:|
-| `pg_turboquant_approx` | 9.9 | 6.2 MB | 1.7x faster, 3.5x smaller |
-| `pg_turboquant_rerank` | 6.8 | 6.2 MB | 2.4x faster, 3.5x smaller |
-| `pgvector_hnsw_approx` | 16.4 | 21.6 MB | baseline |
-| `pgvector_hnsw_rerank` | 7.1 | 21.6 MB | 2.3x faster |
-| `pgvector_ivfflat_approx` | 17.8 | 17.6 MB | 1.1x slower |
-| `pgvector_ivfflat_rerank` | 7.5 | 17.6 MB | 2.2x faster |
+| `pg_turboquant_approx` | 0.363 | 4.7 | 6.2 MB |
+| `pg_turboquant_rerank` | 1.000 | 6.8 | 6.2 MB |
+| `pgvector_hnsw_approx` | 0.585 | 7.4 | 21.6 MB |
+| `pgvector_hnsw_rerank` | 1.000 | 7.3 | 21.6 MB |
+| `pgvector_ivfflat_approx` | 0.585 | 8.0 | 17.5 MB |
+| `pgvector_ivfflat_rerank` | 1.000 | 7.2 | 17.5 MB |
 
 Those results are environment-specific. The benchmark harness keeps recall, latency, footprint, WAL, and concurrent-write measurements separate so tradeoffs remain visible instead of being collapsed into a single score.
 
