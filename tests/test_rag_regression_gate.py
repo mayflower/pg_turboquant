@@ -42,11 +42,18 @@ class SequencedCursor:
 
 
 class SequencedConnection:
-    def __init__(self, rows):
-        self.rows = rows
+    def __init__(self, rows_per_call):
+        self.rows_per_call = list(rows_per_call)
 
     def cursor(self):
-        return SequencedCursor(self.rows)
+        rows = self.rows_per_call.pop(0)
+        return SequencedCursor(rows)
+
+    def rollback(self):
+        pass
+
+    def close(self):
+        pass
 
     def __enter__(self):
         return self
@@ -57,11 +64,10 @@ class SequencedConnection:
 
 class SequencedConnectionFactory:
     def __init__(self, rows_per_call):
-        self.rows_per_call = list(rows_per_call)
+        self._rows_per_call = list(rows_per_call)
 
     def __call__(self, dsn):
-        rows = self.rows_per_call.pop(0)
-        return SequencedConnection(rows)
+        return SequencedConnection(self._rows_per_call)
 
 
 class RagRegressionGateContractTest(unittest.TestCase):

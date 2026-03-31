@@ -16,6 +16,9 @@ class FakeCursor:
     def fetchall(self):
         return list(self.rows)
 
+    def fetchone(self):
+        return (None,)
+
     def __enter__(self):
         return self
 
@@ -32,6 +35,12 @@ class FakeConnection:
         cursor = FakeCursor(self.rows)
         self.cursors.append(cursor)
         return cursor
+
+    def rollback(self):
+        pass
+
+    def close(self):
+        pass
 
     def __enter__(self):
         return self
@@ -196,9 +205,11 @@ class PgTurboquantBackendContractTest(unittest.TestCase):
         self.assertEqual(len(rerank_results), 2)
         self.assertEqual(approx_results[0]["id"], "doc-1")
         self.assertEqual(rerank_results[0]["id"], "doc-1")
-        self.assertIn("ORDER BY p.embedding <=> query_vector.embedding ASC", approx_connection.cursors[0].executed[-1][0])
-        self.assertNotIn("tq_approx_candidates", approx_connection.cursors[0].executed[-1][0])
-        self.assertIn("tq_rerank_candidates", rerank_connection.cursors[0].executed[-1][0])
+        # The adapter appends a tq_last_scan_stats() query after the main
+        # retrieval query, so the main SQL is at executed[-2].
+        self.assertIn("ORDER BY p.embedding <=> query_vector.embedding ASC", approx_connection.cursors[0].executed[-2][0])
+        self.assertNotIn("tq_approx_candidates", approx_connection.cursors[0].executed[-2][0])
+        self.assertIn("tq_rerank_candidates", rerank_connection.cursors[0].executed[-2][0])
 
 
 if __name__ == "__main__":

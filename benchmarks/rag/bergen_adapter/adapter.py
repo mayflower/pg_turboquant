@@ -121,6 +121,17 @@ class PostgresRetrieverAdapter:
         self.table = table
         self.backend = backend
         self.connect_fn = connect_fn
+        self._connection: Any = None
+
+    def _get_connection(self) -> Any:
+        if self._connection is None:
+            self._connection = self.connect_fn(self.dsn)
+        return self._connection
+
+    def close(self) -> None:
+        if self._connection is not None:
+            self._connection.close()
+            self._connection = None
 
     def build_plan(self, request: RetrievalRequest) -> RetrievalPlan:
         return self.backend.build_plan(self.table, request)
@@ -155,7 +166,8 @@ class PostgresRetrieverAdapter:
         self, request: RetrievalRequest
     ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
         plan = self.build_plan(request)
-        with self.connect_fn(self.dsn) as connection:
+        connection = self._get_connection()
+        try:
             with connection.cursor() as cursor:
                 for sql, params in plan.session_statements:
                     cursor.execute(render_session_statement(sql, params))
@@ -171,6 +183,8 @@ class PostgresRetrieverAdapter:
                         except json.JSONDecodeError:
                             scan_stats = None
                 return rows, scan_stats
+        finally:
+            connection.rollback()
 
 
 def validate_metric(metric: str) -> str:

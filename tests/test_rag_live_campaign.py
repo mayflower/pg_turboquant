@@ -57,6 +57,12 @@ class FakeConnection:
         self.cursors.append(cursor)
         return cursor
 
+    def rollback(self):
+        pass
+
+    def close(self):
+        pass
+
     def __enter__(self):
         return self
 

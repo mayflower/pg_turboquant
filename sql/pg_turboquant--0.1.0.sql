@@ -309,21 +309,19 @@ BEGIN
 	EXECUTE format('SET LOCAL turboquant.max_visited_pages = %s', resolved_max_visited_pages);
 
 	helper_sql := format($fmt$
-		WITH approx AS MATERIALIZED (
-			SELECT
-				%1$I::text AS candidate_id,
-				row_number() OVER (ORDER BY %2$I %3$s $1, %1$I)::integer AS approximate_rank,
-				round((%2$I %3$s $1)::numeric, 6)::double precision AS approximate_distance
-			FROM %4$s
-			ORDER BY %2$I %3$s $1, %1$I
-			LIMIT $2
-		)
 		SELECT candidate_id, approximate_rank, approximate_distance
-		FROM approx
+		FROM (
+			SELECT %1$I::text AS candidate_id,
+				row_number() OVER (ORDER BY %2$I %3$s %5$L::vector, %1$I)::integer AS approximate_rank,
+				round((%2$I %3$s %5$L::vector)::numeric, 6)::double precision AS approximate_distance
+			FROM %4$s
+			ORDER BY %2$I %3$s %5$L::vector
+			LIMIT %6$s
+		) approx
 		ORDER BY approximate_rank
-	$fmt$, id_column, embedding_column, order_operator, indexed_table);
+	$fmt$, id_column, embedding_column, order_operator, indexed_table, query_vector::text, candidate_limit);
 
-	RETURN QUERY EXECUTE helper_sql USING query_vector, candidate_limit;
+	RETURN QUERY EXECUTE helper_sql;
 END;
 $$;
 
@@ -342,7 +340,6 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
 	order_operator text;
-	effective_candidate_limit integer;
 	resolved_probes integer;
 	resolved_oversample integer;
 	resolved_max_visited_codes integer;
@@ -361,21 +358,19 @@ BEGIN
 	EXECUTE format('SET LOCAL turboquant.max_visited_pages = %s', resolved_max_visited_pages);
 
 	helper_sql := format($fmt$
-		WITH approx AS MATERIALIZED (
-			SELECT
-				%1$I::text AS candidate_id,
-				row_number() OVER (ORDER BY %2$I %3$s $1, %1$I)::integer AS approximate_rank,
-				round((%2$I %3$s $1)::numeric, 6)::double precision AS approximate_distance
-			FROM %4$s
-			ORDER BY %2$I %3$s $1, %1$I
-			LIMIT $2
-		)
 		SELECT candidate_id, approximate_rank, approximate_distance
-		FROM approx
+		FROM (
+			SELECT %1$I::text AS candidate_id,
+				row_number() OVER (ORDER BY %2$I %3$s %5$L::halfvec, %1$I)::integer AS approximate_rank,
+				round((%2$I %3$s %5$L::halfvec)::numeric, 6)::double precision AS approximate_distance
+			FROM %4$s
+			ORDER BY %2$I %3$s %5$L::halfvec
+			LIMIT %6$s
+		) approx
 		ORDER BY approximate_rank
-	$fmt$, id_column, embedding_column, order_operator, indexed_table);
+	$fmt$, id_column, embedding_column, order_operator, indexed_table, query_vector::text, candidate_limit);
 
-	RETURN QUERY EXECUTE helper_sql USING query_vector, candidate_limit;
+	RETURN QUERY EXECUTE helper_sql;
 END;
 $$;
 
@@ -420,32 +415,28 @@ BEGIN
 	EXECUTE format('SET LOCAL turboquant.max_visited_pages = %s', resolved_max_visited_pages);
 
 	helper_sql := format($fmt$
-		WITH approx AS MATERIALIZED (
-			SELECT
-				%1$I::text AS candidate_id,
-				%1$I AS candidate_key,
-				%2$I AS candidate_embedding,
-				row_number() OVER (ORDER BY %2$I %3$s $1, %1$I)::integer AS approximate_rank,
-				round((%2$I %3$s $1)::numeric, 6)::double precision AS approximate_distance
-			FROM %4$s
-			ORDER BY %2$I %3$s $1, %1$I
-			LIMIT $2
-		), reranked AS (
-			SELECT
-				candidate_id,
-				approximate_rank,
-				approximate_distance,
-				row_number() OVER (ORDER BY candidate_embedding %3$s $1, candidate_key)::integer AS exact_rank,
-				round((candidate_embedding %3$s $1)::numeric, 6)::double precision AS exact_distance
-			FROM approx
-		)
 		SELECT candidate_id, approximate_rank, approximate_distance, exact_rank, exact_distance
-		FROM reranked
-		WHERE exact_rank <= $3
+		FROM (
+			SELECT candidate_id,
+				row_number() OVER (ORDER BY approx_distance, candidate_key)::integer AS approximate_rank,
+				round(approx_distance::numeric, 6)::double precision AS approximate_distance,
+				row_number() OVER (ORDER BY exact_distance, candidate_key)::integer AS exact_rank,
+				round(exact_distance::numeric, 6)::double precision AS exact_distance
+			FROM (
+				SELECT %1$I::text AS candidate_id,
+					%1$I AS candidate_key,
+					%2$I %3$s %5$L::vector AS approx_distance,
+					%2$I %3$s %5$L::vector AS exact_distance
+				FROM %4$s
+				ORDER BY %2$I %3$s %5$L::vector
+				LIMIT %6$s
+			) approx
+		) reranked
+		WHERE exact_rank <= %7$s
 		ORDER BY exact_rank
-	$fmt$, id_column, embedding_column, order_operator, indexed_table);
+	$fmt$, id_column, embedding_column, order_operator, indexed_table, query_vector::text, effective_candidate_limit, final_limit);
 
-	RETURN QUERY EXECUTE helper_sql USING query_vector, effective_candidate_limit, final_limit;
+	RETURN QUERY EXECUTE helper_sql;
 END;
 $$;
 
@@ -487,32 +478,28 @@ BEGIN
 	EXECUTE format('SET LOCAL turboquant.max_visited_pages = %s', resolved_max_visited_pages);
 
 	helper_sql := format($fmt$
-		WITH approx AS MATERIALIZED (
-			SELECT
-				%1$I::text AS candidate_id,
-				%1$I AS candidate_key,
-				%2$I AS candidate_embedding,
-				row_number() OVER (ORDER BY %2$I %3$s $1, %1$I)::integer AS approximate_rank,
-				round((%2$I %3$s $1)::numeric, 6)::double precision AS approximate_distance
-			FROM %4$s
-			ORDER BY %2$I %3$s $1, %1$I
-			LIMIT $2
-		), reranked AS (
-			SELECT
-				candidate_id,
-				approximate_rank,
-				approximate_distance,
-				row_number() OVER (ORDER BY candidate_embedding %3$s $1, candidate_key)::integer AS exact_rank,
-				round((candidate_embedding %3$s $1)::numeric, 6)::double precision AS exact_distance
-			FROM approx
-		)
 		SELECT candidate_id, approximate_rank, approximate_distance, exact_rank, exact_distance
-		FROM reranked
-		WHERE exact_rank <= $3
+		FROM (
+			SELECT candidate_id,
+				row_number() OVER (ORDER BY approx_distance, candidate_key)::integer AS approximate_rank,
+				round(approx_distance::numeric, 6)::double precision AS approximate_distance,
+				row_number() OVER (ORDER BY exact_distance, candidate_key)::integer AS exact_rank,
+				round(exact_distance::numeric, 6)::double precision AS exact_distance
+			FROM (
+				SELECT %1$I::text AS candidate_id,
+					%1$I AS candidate_key,
+					%2$I %3$s %5$L::halfvec AS approx_distance,
+					%2$I %3$s %5$L::halfvec AS exact_distance
+				FROM %4$s
+				ORDER BY %2$I %3$s %5$L::halfvec
+				LIMIT %6$s
+			) approx
+		) reranked
+		WHERE exact_rank <= %7$s
 		ORDER BY exact_rank
-	$fmt$, id_column, embedding_column, order_operator, indexed_table);
+	$fmt$, id_column, embedding_column, order_operator, indexed_table, query_vector::text, effective_candidate_limit, final_limit);
 
-	RETURN QUERY EXECUTE helper_sql USING query_vector, effective_candidate_limit, final_limit;
+	RETURN QUERY EXECUTE helper_sql;
 END;
 $$;
 

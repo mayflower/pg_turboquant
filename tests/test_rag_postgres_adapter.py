@@ -21,6 +21,9 @@ class FakeCursor:
     def fetchall(self):
         return list(self.rows)
 
+    def fetchone(self):
+        return (None,)
+
     def __enter__(self):
         return self
 
@@ -37,6 +40,12 @@ class FakeConnection:
         cursor = FakeCursor(self.rows)
         self.cursors.append(cursor)
         return cursor
+
+    def rollback(self):
+        pass
+
+    def close(self):
+        pass
 
     def __enter__(self):
         return self

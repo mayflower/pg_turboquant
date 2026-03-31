@@ -86,6 +86,17 @@ Representative checked-in retrieval results:
 | HotpotQA fixed-q50 | `pg_turboquant_approx` | 1.000000 | 64.991898 | 5,873,664 |
 | HotpotQA fixed-q50 | `pgvector_ivfflat_approx` | 1.000000 | 8.329492 | 17,563,648 |
 
+### Comparative retrieval on KILT HotpotQA (amd64, PG 16, 10K passages, bge-small-en-v1.5)
+
+| Method | P95 Latency (ms) | Footprint | vs HNSW approx |
+|---|---:|---:|---:|
+| `pg_turboquant_approx` | 9.9 | 6.2 MB | 1.7x faster, 3.5x smaller |
+| `pg_turboquant_rerank` | 6.8 | 6.2 MB | 2.4x faster, 3.5x smaller |
+| `pgvector_hnsw_approx` | 16.4 | 21.6 MB | baseline |
+| `pgvector_hnsw_rerank` | 7.1 | 21.6 MB | 2.3x faster |
+| `pgvector_ivfflat_approx` | 17.8 | 17.6 MB | 1.1x slower |
+| `pgvector_ivfflat_rerank` | 7.5 | 17.6 MB | 2.2x faster |
+
 Those results are environment-specific. The benchmark harness keeps recall, latency, footprint, WAL, and concurrent-write measurements separate so tradeoffs remain visible instead of being collapsed into a single score.
 
 ## Documentation
