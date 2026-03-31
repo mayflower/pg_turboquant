@@ -38,6 +38,17 @@ That is why the design lives under `USING turboquant` instead of trying to fit a
 - v1 mutation rules are append-only plus dead-bit cleanup
 - v1 uses generic WAL, localized behind helper code
 
+## Codec
+
+The v2 codec implements the paper-faithful TurboQuant `Qprod` construction:
+
+- structured rotation (Hadamard) maps the input vector into a transform space
+- `b - 1` stage-1 scalar codes quantize each subvector
+- a residual 1-bit QJL (Johnson-Lindenstrauss) sketch captures sign information lost by scalar quantization
+- a per-vector `gamma = ||r||_2` (float32 residual norm) is stored alongside the codes
+
+This payload enables an unbiased inner-product estimator that operates directly on the quantized codes without decoding.
+
 ## Scan model
 
 There are two principal query paths:
@@ -47,16 +58,19 @@ There are two principal query paths:
 - IVF mode:
   route to a subset of lists using `turboquant.probes`
 
-Within those paths there are also two scoring modes:
+Within those paths there are two scoring modes:
 
-- faithful fast path:
-  normalized cosine and inner product stay in code domain using paper-faithful `Qprod`: `b - 1` stage-1 codes, residual 1-bit QJL sketch bits, and stored residual norm `gamma`
-- compatibility fallback:
-  L2 and non-normalized scans decode vectors and score them explicitly
+- **code-domain fast path** (`score_mode = 'code_domain'`):
+  normalized cosine and inner-product queries score directly on the quantized Qprod payload without decoding vectors. This is the faithful fast path.
+- **decode-score fallback** (`score_mode = 'decode_score'`):
+  L2 and non-normalized scans decode vectors from the stored codes and compute exact distances. This path does not claim faithful TurboQuant semantics.
 
-Filtered workloads can also use the bitmap path, but ordered ANN scans remain the main retrieval surface.
+IVF scans additionally select a scan orchestration:
 
-Current page summaries are still a transitional heuristic. They are useful for ordering work, but faithful pruning must be rebuilt around same-space bounds before the project can claim mathematically safe pruning.
+- `ivf_bounded_pages`: page-visit budget limits work; page summaries enable safe pruning of pages whose bounds cannot beat the current candidate heap threshold
+- `ivf_near_exhaustive`: when the selected probe set covers more than ~70% of the index, the scan switches to a near-exhaustive strategy
+
+Filtered workloads can also use the bitmap path with `tq_bitmap_cosine_filter()`, but ordered ANN scans remain the main retrieval surface.
 
 ## Operational boundary
 

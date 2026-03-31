@@ -84,17 +84,25 @@ Returns the compiled and runtime-visible SIMD surface and selected score kernel.
 
 Returns backend-local JSON for the most recent TurboQuant scan in the current session.
 
-The current JSON includes probe-budget and scan-work fields such as:
+The current JSON includes:
 
-- `configured_probe_count`
-- `nominal_probe_count`
-- `effective_probe_count`
-- `max_visited_codes`
-- `max_visited_pages`
-- `selected_list_count`
-- `selected_live_count`
-- `visited_page_count`
-- `visited_code_count`
+Probe budget and scan work:
+
+- `configured_probe_count`, `nominal_probe_count`, `effective_probe_count`
+- `max_visited_codes`, `max_visited_pages`
+- `selected_list_count`, `selected_live_count`, `selected_page_count`
+- `visited_page_count`, `visited_code_count`
+- `candidate_heap_capacity`, `candidate_heap_count`, `candidate_heap_insert_count`, `candidate_heap_reject_count`, `candidate_heap_replace_count`
+
+Scoring and pruning:
+
+- `score_mode` — `code_domain` (faithful fast path) or `decode_score` (fallback)
+- `score_kernel` — `avx2`, `neon`, or `scalar`
+- `scan_orchestration` — `ivf_bounded_pages` or `ivf_near_exhaustive` (IVF only)
+- `page_bound_mode` — `safe_summary_pruning` or `none`
+- `page_prune_count`, `early_stop_count`
+- `near_exhaustive_crossover` — boolean, whether scan crossed the near-exhaustive threshold
+- `decoded_vector_count` — zero on the faithful fast path
 
 ## Supported plan shapes
 
