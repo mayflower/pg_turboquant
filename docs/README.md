@@ -13,7 +13,7 @@ flowchart TD
     R --> R3["Benchmark Output"]
     E["Explanation"] --> E1["Architecture"]
     E --> E2["Benchmark Results"]
-    E --> E3["PRD and ADRs"]
+    E --> E3["ADRs"]
 ```
 
 ## Tutorials
@@ -36,5 +36,4 @@ flowchart TD
 
 - [Architecture](explanation/architecture.md)
 - [Benchmark results](explanation/benchmark-results.md)
-- [PRD](PRD.md)
 - [ADRs](adrs)

@@ -151,7 +151,6 @@ The public docs follow Diataxis:
 - Explanation:
   - [docs/explanation/architecture.md](docs/explanation/architecture.md)
   - [docs/explanation/benchmark-results.md](docs/explanation/benchmark-results.md)
-  - [docs/PRD.md](docs/PRD.md)
   - [docs/adrs](docs/adrs)
 
 The docs hub lives at [docs/README.md](docs/README.md).
