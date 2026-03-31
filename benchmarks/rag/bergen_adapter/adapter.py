@@ -146,6 +146,8 @@ class PostgresRetrieverAdapter:
             else:
                 doc_id, score, text = row
 
+            if isinstance(doc_id, bytes):
+                doc_id = doc_id.decode("utf-8")
             if isinstance(text, bytes):
                 text = text.decode("utf-8")
 
