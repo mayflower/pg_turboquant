@@ -165,6 +165,11 @@ class PostgresRetrieverAdapter:
     def retrieve_with_metadata(
         self, request: RetrievalRequest
     ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+        rows = self._execute_retrieval(request)
+        scan_stats = self._fetch_scan_stats()
+        return rows, scan_stats
+
+    def _execute_retrieval(self, request: RetrievalRequest) -> list[dict[str, Any]]:
         plan = self.build_plan(request)
         connection = self._get_connection()
         try:
@@ -172,19 +177,26 @@ class PostgresRetrieverAdapter:
                 for sql, params in plan.session_statements:
                     cursor.execute(render_session_statement(sql, params))
                 cursor.execute(plan.sql, plan.params)
-                rows = self.normalize_rows(cursor.fetchall())
-                scan_stats = None
-                if getattr(self.backend, "name", None) == "pg_turboquant":
-                    cursor.execute("SELECT public.tq_last_scan_stats()::text")
-                    raw = cursor.fetchone()[0]
-                    if raw:
-                        try:
-                            scan_stats = json.loads(raw)
-                        except json.JSONDecodeError:
-                            scan_stats = None
-                return rows, scan_stats
+                return self.normalize_rows(cursor.fetchall())
         finally:
             connection.rollback()
+
+    def _fetch_scan_stats(self) -> dict[str, Any] | None:
+        if getattr(self.backend, "name", None) != "pg_turboquant":
+            return None
+        connection = self._get_connection()
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT public.tq_last_scan_stats()::text")
+                raw = cursor.fetchone()[0]
+                if raw:
+                    try:
+                        return json.loads(raw)
+                    except json.JSONDecodeError:
+                        pass
+        finally:
+            connection.rollback()
+        return None
 
 
 def validate_metric(metric: str) -> str:

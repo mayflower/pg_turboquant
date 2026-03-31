@@ -578,16 +578,16 @@ def _run_retrieval_scenario(
         query_vector = list(query_encoder([sample.question])[0])
 
         if approx_adapter is not None:
-            started_at = clock_fn()
-            approx_rows, approx_scan_stats = approx_adapter.retrieve_with_metadata(
-                RetrievalRequest(
-                    query_vector=query_vector,
-                    top_k=rerank_top_k,
-                    metric=metric,
-                    ann=ann,
-                )
+            approx_request = RetrievalRequest(
+                query_vector=query_vector,
+                top_k=rerank_top_k,
+                metric=metric,
+                ann=ann,
             )
+            started_at = clock_fn()
+            approx_rows = approx_adapter._execute_retrieval(approx_request)
             approx_latency_ms = (clock_fn() - started_at) * 1000.0
+            approx_scan_stats = approx_adapter._fetch_scan_stats()
             pre_rerank_evaluations.append(
                 QueryEvaluation(
                     query_id=sample.query_id,
@@ -602,16 +602,16 @@ def _run_retrieval_scenario(
             approx_latency_ms = None
             approx_scan_stats = None
 
-        started_at = clock_fn()
-        final_rows, final_scan_stats = adapter.retrieve_with_metadata(
-            RetrievalRequest(
-                query_vector=query_vector,
-                top_k=dataset_top_k,
-                metric=metric,
-                ann=ann,
-            )
+        final_request = RetrievalRequest(
+            query_vector=query_vector,
+            top_k=dataset_top_k,
+            metric=metric,
+            ann=ann,
         )
+        started_at = clock_fn()
+        final_rows = adapter._execute_retrieval(final_request)
         retrieval_latency_ms = (clock_fn() - started_at) * 1000.0
+        final_scan_stats = adapter._fetch_scan_stats()
         final_ids = _canonicalize_ids(dataset_config, [row["id"] for row in final_rows])
         final_eval = QueryEvaluation(
             query_id=sample.query_id,

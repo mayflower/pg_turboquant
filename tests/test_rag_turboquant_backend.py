@@ -120,7 +120,8 @@ class PgTurboquantBackendContractTest(unittest.TestCase):
             ),
         )
 
-        self.assertIn("tq_rerank_candidates", plan.sql)
+        self.assertIn("approx_candidates", plan.sql)
+        self.assertIn("ORDER BY", plan.sql)
         self.assertEqual(plan.params[-2:], (25, 5))
 
         metadata = backend.serialize_run_metadata(plan)
@@ -205,11 +206,9 @@ class PgTurboquantBackendContractTest(unittest.TestCase):
         self.assertEqual(len(rerank_results), 2)
         self.assertEqual(approx_results[0]["id"], "doc-1")
         self.assertEqual(rerank_results[0]["id"], "doc-1")
-        # The adapter appends a tq_last_scan_stats() query after the main
-        # retrieval query, so the main SQL is at executed[-2].
-        self.assertIn("ORDER BY p.embedding <=> query_vector.embedding ASC", approx_connection.cursors[0].executed[-2][0])
-        self.assertNotIn("tq_approx_candidates", approx_connection.cursors[0].executed[-2][0])
-        self.assertIn("tq_rerank_candidates", rerank_connection.cursors[0].executed[-2][0])
+        self.assertIn("ORDER BY p.embedding <=> query_vector.embedding ASC", approx_connection.cursors[0].executed[-1][0])
+        self.assertNotIn("tq_approx_candidates", approx_connection.cursors[0].executed[-1][0])
+        self.assertIn("approx_candidates", rerank_connection.cursors[0].executed[-1][0])
 
 
 if __name__ == "__main__":

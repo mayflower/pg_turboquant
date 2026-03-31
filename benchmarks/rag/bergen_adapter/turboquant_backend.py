@@ -61,8 +61,8 @@ class PgTurboquantBackend:
             session_statements.append((f"SET LOCAL {self.max_visited_pages_guc} = %s", (max_visited_pages,)))
 
         query_literal = vector_literal(request.query_vector)
+        operator = METRIC_OPERATORS[request_metric]
         if self.mode == MODE_APPROX:
-            operator = METRIC_OPERATORS[request_metric]
             sql = (
                 f"WITH query_vector AS (SELECT %s::{table.query_vector_cast} AS embedding) "
                 f"SELECT p.{table.id_column} AS id, "
@@ -76,20 +76,22 @@ class PgTurboquantBackend:
             params = (query_literal, request.top_k)
         else:
             sql = (
-                f"SELECT id, score, text "
-                f"FROM {self.helper_schema}.tq_rerank_candidates("
-                f"%s::regclass, %s, %s, %s::{table.query_vector_cast}, %s, %s, %s"
-                f") AS result(id, score, text)"
+                f"WITH query_vector AS (SELECT %s::{table.query_vector_cast} AS embedding), "
+                f"approx_candidates AS ("
+                f"SELECT p.{table.id_column} AS id, p.{table.text_column} AS text, "
+                f"p.{table.embedding_column} AS embedding "
+                f"FROM {table.table_name} AS p "
+                f"CROSS JOIN query_vector "
+                f"ORDER BY p.{table.embedding_column} {operator} query_vector.embedding ASC "
+                f"LIMIT %s"
+                f") "
+                f"SELECT id, approx_candidates.embedding {operator} query_vector.embedding AS score, text "
+                f"FROM approx_candidates "
+                f"CROSS JOIN query_vector "
+                f"ORDER BY score ASC "
+                f"LIMIT %s"
             )
-            params = (
-                table.table_name,
-                table.id_column,
-                table.embedding_column,
-                query_literal,
-                self.metric_name_for_helper(),
-                self.rerank_k,
-                request.top_k,
-            )
+            params = (query_literal, self.rerank_k, request.top_k)
 
         return RetrievalPlan(
             sql=sql,
