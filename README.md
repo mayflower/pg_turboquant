@@ -88,19 +88,6 @@ FROM tq_rerank_candidates(
 
 ## Benchmark highlights
 
-Representative current retrieval results from the checked-in live comparative campaign at `benchmarks/rag/results/live-rag-e2e-20260331-current/`:
-
-| Workload | Method | Recall@10 | P95 Latency (ms) | Footprint (bytes) |
-|---|---|---:|---:|---:|
-| KILT NQ | `pg_turboquant_approx` | 0.950000 | 5.689029 | 1,277,952 |
-| KILT NQ | `pgvector_hnsw_approx` | 0.950000 | 3.228352 | 5,079,040 |
-| KILT NQ | `pgvector_ivfflat_approx` | 0.950000 | 2.596973 | 4,349,952 |
-| KILT HotpotQA | `pg_turboquant_approx` | 0.792500 | 5.906979 | 6,455,296 |
-| KILT HotpotQA | `pg_turboquant_rerank` | 1.000000 | 20.256061 | 6,455,296 |
-| KILT HotpotQA | `pgvector_ivfflat_approx` | 1.000000 | 3.069100 | 17,563,648 |
-| PopQA | `pg_turboquant_approx` | 1.000000 | 6.977801 | 2,514,944 |
-| PopQA | `pgvector_ivfflat_approx` | 1.000000 | 2.896392 | 8,159,232 |
-
 ### Comparative retrieval (amd64, PG 16, bge-small-en-v1.5, v2 Qprod/QJL codec, 200 queries per dataset)
 
 **KILT NQ** (2.5K passages, flat scan):
