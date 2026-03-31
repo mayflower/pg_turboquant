@@ -418,15 +418,15 @@ BEGIN
 		SELECT candidate_id, approximate_rank, approximate_distance, exact_rank, exact_distance
 		FROM (
 			SELECT candidate_id,
-				row_number() OVER (ORDER BY approx_distance, candidate_key)::integer AS approximate_rank,
-				round(approx_distance::numeric, 6)::double precision AS approximate_distance,
-				row_number() OVER (ORDER BY exact_distance, candidate_key)::integer AS exact_rank,
-				round(exact_distance::numeric, 6)::double precision AS exact_distance
+				approximate_rank,
+				approximate_distance,
+				row_number() OVER (ORDER BY approximate_distance, candidate_key)::integer AS exact_rank,
+				approximate_distance AS exact_distance
 			FROM (
 				SELECT %1$I::text AS candidate_id,
 					%1$I AS candidate_key,
-					%2$I %3$s %5$L::vector AS approx_distance,
-					%2$I %3$s %5$L::vector AS exact_distance
+					row_number() OVER ()::integer AS approximate_rank,
+					round((%2$I %3$s %5$L::vector)::numeric, 6)::double precision AS approximate_distance
 				FROM %4$s
 				ORDER BY %2$I %3$s %5$L::vector
 				LIMIT %6$s
@@ -481,15 +481,15 @@ BEGIN
 		SELECT candidate_id, approximate_rank, approximate_distance, exact_rank, exact_distance
 		FROM (
 			SELECT candidate_id,
-				row_number() OVER (ORDER BY approx_distance, candidate_key)::integer AS approximate_rank,
-				round(approx_distance::numeric, 6)::double precision AS approximate_distance,
-				row_number() OVER (ORDER BY exact_distance, candidate_key)::integer AS exact_rank,
-				round(exact_distance::numeric, 6)::double precision AS exact_distance
+				approximate_rank,
+				approximate_distance,
+				row_number() OVER (ORDER BY approximate_distance, candidate_key)::integer AS exact_rank,
+				approximate_distance AS exact_distance
 			FROM (
 				SELECT %1$I::text AS candidate_id,
 					%1$I AS candidate_key,
-					%2$I %3$s %5$L::halfvec AS approx_distance,
-					%2$I %3$s %5$L::halfvec AS exact_distance
+					row_number() OVER ()::integer AS approximate_rank,
+					round((%2$I %3$s %5$L::halfvec)::numeric, 6)::double precision AS approximate_distance
 				FROM %4$s
 				ORDER BY %2$I %3$s %5$L::halfvec
 				LIMIT %6$s

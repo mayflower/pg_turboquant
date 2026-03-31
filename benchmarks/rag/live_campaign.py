@@ -639,6 +639,7 @@ def _run_retrieval_scenario(
                 "relevant_ids": sample.relevant_ids,
                 "evidence_ids": sample.evidence_ids,
                 "retrieved_rows": final_rows,
+                "retrieval_latency_ms": retrieval_latency_ms,
             }
         )
 
@@ -740,9 +741,7 @@ def _run_end_to_end_scenario(
                 "answer": str(generation["answer"]),
                 "reference_answer": sample.answers[0] if sample.answers else "",
                 "operational_metrics": QueryOperationalMetrics(
-                    retrieval_latency_ms=float(
-                        query_result["retrieved_rows"] and 0.0 or 0.0
-                    ),
+                    retrieval_latency_ms=float(query_result.get("retrieval_latency_ms", 0.0)),
                     generator_latency_ms=generator_latency_ms,
                 ).to_dict(),
             }
@@ -879,14 +878,14 @@ def _make_backend(
         return PgTurboquantBackend(
             index_name=turboquant_index_name,
             metric=metric,
-            normalized=metric != "inner_product",
+            normalized=metric in ("cosine", "inner_product"),
             mode=TURBOQUANT_MODE_APPROX,
         )
     if method_id == "pg_turboquant_rerank":
         return PgTurboquantBackend(
             index_name=turboquant_index_name,
             metric=metric,
-            normalized=metric != "inner_product",
+            normalized=metric in ("cosine", "inner_product"),
             mode=TURBOQUANT_MODE_APPROX_RERANK,
             rerank_k=rerank_top_k,
         )
@@ -1172,11 +1171,13 @@ def _fallback_answer_metrics(
         best_f1 = 0.0
         for answer in answers:
             answer_tokens = normalize(answer)
-            common = set(prediction_tokens) & set(answer_tokens)
-            if not common:
+            from collections import Counter
+            common = Counter(prediction_tokens) & Counter(answer_tokens)
+            num_common = sum(common.values())
+            if not num_common:
                 continue
-            precision = len(common) / len(prediction_tokens) if prediction_tokens else 0.0
-            recall = len(common) / len(answer_tokens) if answer_tokens else 0.0
+            precision = num_common / len(prediction_tokens) if prediction_tokens else 0.0
+            recall = num_common / len(answer_tokens) if answer_tokens else 0.0
             if precision + recall:
                 best_f1 = max(best_f1, (2 * precision * recall) / (precision + recall))
         f1_scores.append(best_f1)

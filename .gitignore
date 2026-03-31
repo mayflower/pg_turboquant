@@ -57,5 +57,10 @@ prompts/
 .env.*
 
 # Local test binaries
-tests/unit/test_smoke
-tests/unit/test_smoke.dSYM/
+tests/unit/test_*
+tests/unit/*.dSYM/
+tests/perf/test_*
+tests/perf/*.dSYM/
+
+# Generated reports
+output.html
