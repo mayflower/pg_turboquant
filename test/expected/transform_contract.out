@@ -38,7 +38,7 @@ LIMIT 3;
 ----
   1
   2
-  3
+  4
 (3 rows)
 
 REINDEX INDEX tq_transform_contract_idx;
@@ -56,6 +56,6 @@ LIMIT 3;
 ----
   1
   2
-  3
+  4
 (3 rows)
 

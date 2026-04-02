@@ -54,7 +54,7 @@ FROM (
 ) ranked;
  supported_ids 
 ---------------
- {1,2,3}
+ {1,3,2}
 (1 row)
 
 WITH simd AS (

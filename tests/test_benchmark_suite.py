@@ -414,6 +414,14 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
         self.assertIn("requested_kernel", first)
         self.assertIn("qjl_lut_mode", first)
         self.assertIn("scan_layout", first)
+        self.assertIn("lookup_style", first)
+        self.assertIn("block_width", first)
+        self.assertIn("qjl_path", first)
+        self.assertIn("gamma_path", first)
+        self.assertIsInstance(first["lookup_style"], str)
+        self.assertIsInstance(first["qjl_path"], str)
+        self.assertIsInstance(first["gamma_path"], str)
+        self.assertIsInstance(first["block_width"], int)
         self.assertIn("requested_kernel_honored", first)
         self.assertIn("dimension", first)
         self.assertIn("bits", first)
@@ -463,6 +471,10 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
         self.assertGreaterEqual(page_scan["scratch_allocations"], 0)
         self.assertGreaterEqual(page_scan["decoded_buffer_reuses"], 0)
         self.assertEqual(page_scan["scan_layout"], "row_major")
+        self.assertIn(page_scan["lookup_style"], ("scalar_loop", "float_gather"))
+        self.assertEqual(page_scan["block_width"], 1)
+        self.assertIn(page_scan["qjl_path"], ("float", "int16_quantized"))
+        self.assertEqual(page_scan["gamma_path"], "float32_scalar")
         self.assertGreater(page_scan["code_view_uses"], 0)
         self.assertEqual(page_scan["code_copy_uses"], 0)
         self.assertEqual(scalar_requested["qjl_lut_mode"], "float")
@@ -497,6 +509,22 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
                 )
         )
         self.assertNotIn("skipped", json.dumps(payload["microbenchmarks"]).lower())
+
+        # Gate validation
+        self.assertIn("gates", payload["microbenchmarks"])
+        gates = payload["microbenchmarks"]["gates"]
+        self.assertGreater(len(gates), 0)
+        for gate in gates:
+            self.assertIn("gate", gate)
+            self.assertIn("passed", gate)
+            self.assertIn("reason", gate)
+            self.assertIsInstance(gate["passed"], bool)
+            self.assertIsInstance(gate["reason"], str)
+            self.assertTrue(gate["passed"], f"gate '{gate['gate']}' failed: {gate['reason']}")
+
+        gate_names = {g["gate"] for g in gates}
+        self.assertIn("lut16_dispatch_kernel_selection", gate_names)
+        self.assertIn("page_scan_local_heap_reduces_global_inserts", gate_names)
 
     def test_microbenchmark_comparisons_and_regression_gates_are_reported(self):
         payload = self.run_suite(

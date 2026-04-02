@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "src/tq_scan.h"
+#include "src/tq_simd_avx2.h"
 
 static void
 test_stats_initialize_to_zero_and_empty(void)
@@ -314,6 +315,128 @@ test_serialization_exposes_stable_field_names(void)
 	assert(strstr(json, "\"early_stop_count\"") != NULL);
 }
 
+static void
+test_router_selection_method_is_serialized(void)
+{
+	TqScanStats stats;
+	char json[8192];
+
+	memset(&stats, 0, sizeof(stats));
+	memset(json, 0, sizeof(json));
+
+	tq_scan_stats_begin(TQ_SCAN_MODE_IVF, 4);
+	tq_scan_stats_set_router_selection_method(TQ_ROUTER_SELECTION_PARTIAL);
+	tq_scan_stats_snapshot(&stats);
+
+	assert(stats.router_selection_method == TQ_ROUTER_SELECTION_PARTIAL);
+	assert(tq_scan_stats_serialize_json(&stats, json, sizeof(json)));
+	assert(strstr(json, "\"router_selection_method\":\"partial\"") != NULL);
+
+	tq_scan_stats_begin(TQ_SCAN_MODE_IVF, 8);
+	tq_scan_stats_set_router_selection_method(TQ_ROUTER_SELECTION_FULL_SORT);
+	tq_scan_stats_snapshot(&stats);
+
+	assert(stats.router_selection_method == TQ_ROUTER_SELECTION_FULL_SORT);
+	assert(tq_scan_stats_serialize_json(&stats, json, sizeof(json)));
+	assert(strstr(json, "\"router_selection_method\":\"full_sort\"") != NULL);
+
+	tq_scan_stats_begin(TQ_SCAN_MODE_FLAT, 1);
+	tq_scan_stats_snapshot(&stats);
+
+	assert(stats.router_selection_method == TQ_ROUTER_SELECTION_NONE);
+	assert(tq_scan_stats_serialize_json(&stats, json, sizeof(json)));
+	assert(strstr(json, "\"router_selection_method\":\"none\"") != NULL);
+}
+
+static void
+test_block16_select_top_m_returns_best_candidates(void)
+{
+	/* Scores: higher = better. Select top-3 from 8 candidates */
+	float scores[8] = {0.1f, 0.9f, 0.3f, 0.7f, 0.5f, 0.2f, 0.8f, 0.4f};
+	uint32_t selected[8];
+	uint32_t count = 0;
+	uint32_t i = 0;
+	bool has_1 = false;
+	bool has_6 = false;
+	bool has_3 = false;
+
+	memset(selected, 0, sizeof(selected));
+
+	/* Top-3 should be indices 1 (0.9), 6 (0.8), 3 (0.7) */
+	count = tq_block16_select_top_m(scores, 8, 3, selected);
+	assert(count == 3);
+
+	for (i = 0; i < count; i++)
+	{
+		if (selected[i] == 1) has_1 = true;
+		if (selected[i] == 6) has_6 = true;
+		if (selected[i] == 3) has_3 = true;
+	}
+	assert(has_1 && has_6 && has_3);
+
+	/* Top-M >= candidate_count returns all */
+	count = tq_block16_select_top_m(scores, 8, 10, selected);
+	assert(count == 8);
+
+	/* Top-1 should be index 1 (score 0.9) */
+	count = tq_block16_select_top_m(scores, 8, 1, selected);
+	assert(count == 1);
+	assert(selected[0] == 1);
+}
+
+static void
+test_block_local_selection_stats_are_serialized(void)
+{
+	TqScanStats stats;
+	char json[8192];
+
+	memset(&stats, 0, sizeof(stats));
+	memset(json, 0, sizeof(json));
+
+	tq_scan_stats_begin(TQ_SCAN_MODE_FLAT, 1);
+	tq_scan_stats_record_block_local_selection(16, 8);
+	tq_scan_stats_record_block_local_selection(12, 5);
+	tq_scan_stats_snapshot(&stats);
+
+	assert(stats.block_local_scored_count == 28);
+	assert(stats.block_local_survivor_count == 13);
+	assert(stats.block_local_rejected_count == 15);
+
+	assert(tq_scan_stats_serialize_json(&stats, json, sizeof(json)));
+	assert(strstr(json, "\"block_local_scored_count\":28") != NULL);
+	assert(strstr(json, "\"block_local_survivor_count\":13") != NULL);
+	assert(strstr(json, "\"block_local_rejected_count\":15") != NULL);
+}
+
+static void
+test_speed_path_label_enums_return_stable_strings(void)
+{
+	assert(strcmp(tq_lookup_style_name(TQ_LOOKUP_STYLE_SCALAR_LOOP), "scalar_loop") == 0);
+	assert(strcmp(tq_lookup_style_name(TQ_LOOKUP_STYLE_FLOAT_GATHER), "float_gather") == 0);
+	assert(strcmp(tq_lookup_style_name(TQ_LOOKUP_STYLE_LUT16_SCALAR), "lut16_scalar") == 0);
+	assert(strcmp(tq_lookup_style_name(TQ_LOOKUP_STYLE_LUT16_AVX2), "lut16_avx2") == 0);
+	assert(strcmp(tq_lookup_style_name(TQ_LOOKUP_STYLE_LUT16_NEON), "lut16_neon") == 0);
+	assert(strcmp(tq_lookup_style_name(TQ_LOOKUP_STYLE_LUT16_AVX512), "lut16_avx512") == 0);
+
+	assert(strcmp(tq_gamma_path_name(TQ_GAMMA_PATH_FLOAT32_SCALAR), "float32_scalar") == 0);
+	assert(strcmp(tq_gamma_path_name(TQ_GAMMA_PATH_FLOAT32_VECTOR), "float32_vector") == 0);
+	assert(strcmp(tq_gamma_path_name(TQ_GAMMA_PATH_FP16_VECTOR), "fp16_vector") == 0);
+
+	assert(strcmp(tq_qjl_path_name(TQ_QJL_PATH_FLOAT), "float") == 0);
+	assert(strcmp(tq_qjl_path_name(TQ_QJL_PATH_INT16_QUANTIZED), "int16_quantized") == 0);
+	assert(strcmp(tq_qjl_path_name(TQ_QJL_PATH_LUT16_QUANTIZED), "lut16_quantized") == 0);
+
+	assert(tq_lookup_style_for_kernel(TQ_PROD_SCORE_SCALAR) == TQ_LOOKUP_STYLE_SCALAR_LOOP);
+	assert(tq_lookup_style_for_kernel(TQ_PROD_SCORE_AVX2) == TQ_LOOKUP_STYLE_FLOAT_GATHER);
+	assert(tq_lookup_style_for_kernel(TQ_PROD_SCORE_NEON) == TQ_LOOKUP_STYLE_FLOAT_GATHER);
+
+	assert(tq_qjl_path_for_kernel(TQ_PROD_SCORE_SCALAR, false) == TQ_QJL_PATH_FLOAT);
+	assert(tq_qjl_path_for_kernel(TQ_PROD_SCORE_SCALAR, true) == TQ_QJL_PATH_FLOAT);
+	assert(tq_qjl_path_for_kernel(TQ_PROD_SCORE_AVX2, true) == TQ_QJL_PATH_INT16_QUANTIZED);
+	assert(tq_qjl_path_for_kernel(TQ_PROD_SCORE_NEON, true) == TQ_QJL_PATH_INT16_QUANTIZED);
+	assert(tq_qjl_path_for_kernel(TQ_PROD_SCORE_AVX2, false) == TQ_QJL_PATH_FLOAT);
+}
+
 int
 main(void)
 {
@@ -325,5 +448,9 @@ main(void)
 	test_local_candidate_heap_metrics_are_serialized_separately();
 	test_shadow_decode_metrics_track_heap_overlap();
 	test_serialization_exposes_stable_field_names();
+	test_speed_path_label_enums_return_stable_strings();
+	test_router_selection_method_is_serialized();
+	test_block16_select_top_m_returns_best_candidates();
+	test_block_local_selection_stats_are_serialized();
 	return 0;
 }

@@ -16,6 +16,24 @@ typedef struct RankedDistance
 	float		distance;
 } RankedDistance;
 
+/*
+ * Transpose nibbles from candidate-major (nibbles[c * dim + d]) to
+ * dimension-major (out[d * 16 + c]) layout for block-16 scorers.
+ */
+static void
+transpose_nibbles_to_dim_major(const uint8_t *candidate_major,
+							   uint8_t *dim_major,
+							   uint32_t candidate_count,
+							   uint32_t dimension)
+{
+	uint32_t c, d;
+
+	memset(dim_major, 0, (size_t) dimension * 16u);
+	for (c = 0; c < candidate_count; c++)
+		for (d = 0; d < dimension; d++)
+			dim_major[(size_t) d * 16u + c] = candidate_major[(size_t) c * dimension + d];
+}
+
 static float
 dot_product(const float *left, const float *right, size_t len)
 {
@@ -1051,6 +1069,570 @@ test_page_local_selection_retains_overlap_fixture_across_pages(void)
 	tq_prod_lut_reset(&lut);
 }
 
+static void
+test_lut16_build_rejects_unsupported_shapes(void)
+{
+	TqProdCodecConfig config_bad_bits = {.dimension = 32, .bits = 3, .qjl_dimension = 32};
+	TqProdCodecConfig config_bad_dim = {.dimension = 31, .bits = 4, .qjl_dimension = 31};
+	TqProdCodecConfig config_bad_qjl = {.dimension = 32, .bits = 4, .qjl_dimension = 16};
+	TqProdLut16 lut16;
+	char errmsg[256];
+
+	memset(&lut16, 0, sizeof(lut16));
+	memset(errmsg, 0, sizeof(errmsg));
+
+	assert(!tq_prod_lut16_is_supported(&config_bad_bits, errmsg, sizeof(errmsg)));
+	assert(!tq_prod_lut16_is_supported(&config_bad_dim, errmsg, sizeof(errmsg)));
+	assert(!tq_prod_lut16_is_supported(&config_bad_qjl, errmsg, sizeof(errmsg)));
+
+	/* lut16_build should also reject, since it checks support internally */
+	assert(!tq_prod_lut16_build(&config_bad_bits, NULL, &lut16, errmsg, sizeof(errmsg)));
+}
+
+static void
+test_lut16_scalar_matches_code_domain_scorer(void)
+{
+	TqProdCodecConfig config = {.dimension = 32, .bits = 4, .qjl_seed = 997u, .qjl_dimension = 32};
+	TqProdPackedLayout layout;
+	TqProdLut lut;
+	TqProdLut16 lut16;
+	uint8_t packed[256];
+	uint8_t nibbles[32];
+	uint8_t dim_major_nibbles[32 * 16];
+	float query[32];
+	float input[32];
+	float gamma = 0.0f;
+	float reference_score = 0.0f;
+	float lut16_score = 0.0f;
+	uint32_t vec_idx = 0;
+	char errmsg[256];
+
+	memset(&layout, 0, sizeof(layout));
+	memset(&lut, 0, sizeof(lut));
+	memset(&lut16, 0, sizeof(lut16));
+	memset(packed, 0, sizeof(packed));
+	memset(nibbles, 0, sizeof(nibbles));
+
+	seeded_unit_vector(101u, query, 32);
+	assert(tq_prod_packed_layout(&config, &layout, errmsg, sizeof(errmsg)));
+	assert(tq_prod_lut_build(&config, query, &lut, errmsg, sizeof(errmsg)));
+	assert(tq_prod_lut16_build(&config, &lut, &lut16, errmsg, sizeof(errmsg)));
+
+	for (vec_idx = 0; vec_idx < 8; vec_idx++)
+	{
+		memset(packed, 0, sizeof(packed));
+		seeded_unit_vector(200u + vec_idx, input, 32);
+		assert(tq_prod_encode(&config, input, packed, layout.total_bytes, errmsg, sizeof(errmsg)));
+		assert(tq_prod_read_gamma(&config, packed, layout.total_bytes, &gamma, errmsg, sizeof(errmsg)));
+		assert(tq_prod_score_code_from_lut(&config, &lut, packed, layout.total_bytes,
+										   &reference_score, errmsg, sizeof(errmsg)));
+		assert(tq_prod_extract_nibbles(&config, packed, layout.total_bytes,
+									   nibbles, sizeof(nibbles), errmsg, sizeof(errmsg)));
+		transpose_nibbles_to_dim_major(nibbles, dim_major_nibbles, 1, 32);
+		assert(tq_prod_score_block16_scalar(&lut16, dim_major_nibbles, &gamma, 1, &lut16_score,
+											errmsg, sizeof(errmsg)));
+
+		assert(fabsf(lut16_score - reference_score) < 1e-5f);
+	}
+
+	tq_prod_lut16_reset(&lut16);
+	tq_prod_lut_reset(&lut);
+}
+
+static void
+test_lut16_block16_preserves_score_ordering(void)
+{
+	const uint32_t N = 16;
+	TqProdCodecConfig config = {.dimension = 32, .bits = 4, .qjl_seed = 443u, .qjl_dimension = 32};
+	TqProdPackedLayout layout;
+	TqProdLut lut;
+	TqProdLut16 lut16;
+	uint8_t packed[256];
+	uint8_t all_nibbles[16 * 32];
+	uint8_t dim_major_nibbles[32 * 16];
+	float gammas[16];
+	float reference_scores[16];
+	float block_scores[16];
+	float query[32];
+	float input[32];
+	uint32_t i = 0;
+	uint32_t j = 0;
+	char errmsg[256];
+
+	memset(&layout, 0, sizeof(layout));
+	memset(&lut, 0, sizeof(lut));
+	memset(&lut16, 0, sizeof(lut16));
+	memset(all_nibbles, 0, sizeof(all_nibbles));
+
+	seeded_unit_vector(501u, query, 32);
+	assert(tq_prod_packed_layout(&config, &layout, errmsg, sizeof(errmsg)));
+	assert(tq_prod_lut_build(&config, query, &lut, errmsg, sizeof(errmsg)));
+	assert(tq_prod_lut16_build(&config, &lut, &lut16, errmsg, sizeof(errmsg)));
+
+	/* Encode N vectors, extract nibbles and gammas, score with reference */
+	for (i = 0; i < N; i++)
+	{
+		memset(packed, 0, sizeof(packed));
+		seeded_unit_vector(600u + i, input, 32);
+		assert(tq_prod_encode(&config, input, packed, layout.total_bytes, errmsg, sizeof(errmsg)));
+		assert(tq_prod_read_gamma(&config, packed, layout.total_bytes, &gammas[i], errmsg, sizeof(errmsg)));
+		assert(tq_prod_score_code_from_lut(&config, &lut, packed, layout.total_bytes,
+										   &reference_scores[i], errmsg, sizeof(errmsg)));
+		assert(tq_prod_extract_nibbles(&config, packed, layout.total_bytes,
+									   all_nibbles + (size_t) i * 32u, 32, errmsg, sizeof(errmsg)));
+	}
+
+	transpose_nibbles_to_dim_major(all_nibbles, dim_major_nibbles, N, 32);
+
+	/* Score all 16 at once via block scorer */
+	assert(tq_prod_score_block16_scalar(&lut16, dim_major_nibbles, gammas, N, block_scores,
+										errmsg, sizeof(errmsg)));
+
+	/* Verify exact score match */
+	for (i = 0; i < N; i++)
+		assert(fabsf(block_scores[i] - reference_scores[i]) < 1e-5f);
+
+	/* Verify ordering is preserved: same relative order */
+	for (i = 0; i < N; i++)
+		for (j = i + 1; j < N; j++)
+		{
+			if (reference_scores[i] > reference_scores[j])
+				assert(block_scores[i] > block_scores[j] - 1e-6f);
+			else if (reference_scores[i] < reference_scores[j])
+				assert(block_scores[i] < block_scores[j] + 1e-6f);
+		}
+
+	tq_prod_lut16_reset(&lut16);
+	tq_prod_lut_reset(&lut);
+}
+
+static void
+test_scratch_transpose_preserves_lane_order_and_tid(void)
+{
+	TqProdCodecConfig config = {.dimension = 32, .bits = 4, .qjl_seed = 811u, .qjl_dimension = 32};
+	TqProdPackedLayout layout;
+	TqBatchPageParams params;
+	uint8_t page[TQ_DEFAULT_BLOCK_SIZE];
+	uint8_t packed[256];
+	TqScratchBlock16Set set;
+	TqTid expected_tids[32];
+	uint32_t lane_count = 0;
+	uint32_t i = 0;
+	char errmsg[256];
+
+	memset(&layout, 0, sizeof(layout));
+	memset(&params, 0, sizeof(params));
+	memset(page, 0, sizeof(page));
+	memset(packed, 0, sizeof(packed));
+	memset(&set, 0, sizeof(set));
+	memset(expected_tids, 0, sizeof(expected_tids));
+
+	assert(tq_prod_packed_layout(&config, &layout, errmsg, sizeof(errmsg)));
+	params.lane_count = 20;
+	params.code_bytes = (uint32_t) layout.total_bytes;
+	params.list_id = 0;
+	params.next_block = TQ_INVALID_BLOCK_NUMBER;
+	assert(tq_batch_page_init(page, sizeof(page), &params, errmsg, sizeof(errmsg)));
+
+	for (i = 0; i < params.lane_count; i++)
+	{
+		float input[32];
+		uint16_t lane_idx = 0;
+
+		seeded_unit_vector(900u + i, input, 32);
+		memset(packed, 0, sizeof(packed));
+		assert(tq_prod_encode(&config, input, packed, layout.total_bytes, errmsg, sizeof(errmsg)));
+		assert(tq_batch_page_append_lane(page, sizeof(page),
+			&(TqTid){.block_number = 10u, .offset_number = (uint16_t)(i + 1u)},
+			&lane_idx, errmsg, sizeof(errmsg)));
+		assert(tq_batch_page_set_code(page, sizeof(page), lane_idx, packed,
+									  layout.total_bytes, errmsg, sizeof(errmsg)));
+		expected_tids[i].block_number = 10u;
+		expected_tids[i].offset_number = (uint16_t)(i + 1u);
+		lane_count++;
+	}
+
+	assert(tq_scratch_block16_set_init(&set, config.dimension, lane_count, errmsg, sizeof(errmsg)));
+	assert(tq_batch_page_transpose_block16(page, sizeof(page), &config, &set, errmsg, sizeof(errmsg)));
+
+	/* Verify total candidates match live lanes */
+	assert(set.total_candidates == lane_count);
+	assert(set.block_count == 2);  /* 20 candidates → 2 blocks of 16+4 */
+	assert(set.blocks[0].count == 16);
+	assert(set.blocks[1].count == 4);
+
+	/* Verify TID order matches insertion order */
+	for (i = 0; i < set.total_candidates; i++)
+	{
+		assert(set.tid_storage[i].block_number == expected_tids[i].block_number);
+		assert(set.tid_storage[i].offset_number == expected_tids[i].offset_number);
+	}
+
+	tq_scratch_block16_set_reset(&set);
+}
+
+static void
+test_scratch_transpose_block16_scores_match_per_lane(void)
+{
+	TqProdCodecConfig config = {.dimension = 32, .bits = 4, .qjl_seed = 557u, .qjl_dimension = 32};
+	TqProdPackedLayout layout;
+	TqProdLut lut;
+	TqProdLut16 lut16;
+	TqBatchPageParams params;
+	uint8_t page[TQ_DEFAULT_BLOCK_SIZE];
+	uint8_t packed[256];
+	float query[32];
+	float reference_scores[32];
+	TqScratchBlock16Set set;
+	uint32_t i = 0;
+	uint32_t b = 0;
+	uint32_t c = 0;
+	uint32_t score_idx = 0;
+	char errmsg[256];
+
+	memset(&layout, 0, sizeof(layout));
+	memset(&lut, 0, sizeof(lut));
+	memset(&lut16, 0, sizeof(lut16));
+	memset(&params, 0, sizeof(params));
+	memset(page, 0, sizeof(page));
+	memset(&set, 0, sizeof(set));
+
+	seeded_unit_vector(701u, query, 32);
+	assert(tq_prod_packed_layout(&config, &layout, errmsg, sizeof(errmsg)));
+	assert(tq_prod_lut_build(&config, query, &lut, errmsg, sizeof(errmsg)));
+	assert(tq_prod_lut16_build(&config, &lut, &lut16, errmsg, sizeof(errmsg)));
+
+	params.lane_count = 24;
+	params.code_bytes = (uint32_t) layout.total_bytes;
+	params.list_id = 0;
+	params.next_block = TQ_INVALID_BLOCK_NUMBER;
+	assert(tq_batch_page_init(page, sizeof(page), &params, errmsg, sizeof(errmsg)));
+
+	for (i = 0; i < params.lane_count; i++)
+	{
+		float input[32];
+		uint16_t lane_idx = 0;
+
+		seeded_unit_vector(800u + i, input, 32);
+		memset(packed, 0, sizeof(packed));
+		assert(tq_prod_encode(&config, input, packed, layout.total_bytes, errmsg, sizeof(errmsg)));
+		assert(tq_batch_page_append_lane(page, sizeof(page),
+			&(TqTid){.block_number = 5u, .offset_number = (uint16_t)(i + 1u)},
+			&lane_idx, errmsg, sizeof(errmsg)));
+		assert(tq_batch_page_set_code(page, sizeof(page), lane_idx, packed,
+									  layout.total_bytes, errmsg, sizeof(errmsg)));
+
+		/* Score each lane individually for reference */
+		assert(tq_prod_score_code_from_lut(&config, &lut, packed, layout.total_bytes,
+										   &reference_scores[i], errmsg, sizeof(errmsg)));
+	}
+
+	/* Transpose and score via block16 */
+	assert(tq_scratch_block16_set_init(&set, config.dimension, params.lane_count, errmsg, sizeof(errmsg)));
+	assert(tq_batch_page_transpose_block16(page, sizeof(page), &config, &set, errmsg, sizeof(errmsg)));
+
+	score_idx = 0;
+	for (b = 0; b < set.block_count; b++)
+	{
+		float block_scores[TQ_BLOCK16_MAX_CANDIDATES];
+
+		memset(block_scores, 0, sizeof(block_scores));
+		assert(tq_prod_score_block16_scalar(&lut16,
+											set.blocks[b].nibbles,
+											set.blocks[b].gammas,
+											set.blocks[b].count,
+											block_scores,
+											errmsg, sizeof(errmsg)));
+
+		for (c = 0; c < set.blocks[b].count; c++)
+		{
+			assert(fabsf(block_scores[c] - reference_scores[score_idx]) < 1e-4f);
+			score_idx++;
+		}
+	}
+
+	assert(score_idx == params.lane_count);
+
+	tq_scratch_block16_set_reset(&set);
+	tq_prod_lut16_reset(&lut16);
+	tq_prod_lut_reset(&lut);
+}
+
+static void
+test_scratch_transpose_partial_block_pads_safely(void)
+{
+	TqProdCodecConfig config = {.dimension = 16, .bits = 4, .qjl_seed = 331u, .qjl_dimension = 16};
+	TqProdPackedLayout layout;
+	TqBatchPageParams params;
+	uint8_t page[TQ_DEFAULT_BLOCK_SIZE];
+	uint8_t packed[128];
+	TqScratchBlock16Set set;
+	uint32_t i = 0;
+	char errmsg[256];
+
+	memset(&layout, 0, sizeof(layout));
+	memset(&params, 0, sizeof(params));
+	memset(page, 0, sizeof(page));
+	memset(&set, 0, sizeof(set));
+
+	assert(tq_prod_packed_layout(&config, &layout, errmsg, sizeof(errmsg)));
+	params.lane_count = 5;
+	params.code_bytes = (uint32_t) layout.total_bytes;
+	params.list_id = 0;
+	params.next_block = TQ_INVALID_BLOCK_NUMBER;
+	assert(tq_batch_page_init(page, sizeof(page), &params, errmsg, sizeof(errmsg)));
+
+	for (i = 0; i < params.lane_count; i++)
+	{
+		float input[16];
+		uint16_t lane_idx = 0;
+
+		seeded_unit_vector(400u + i, input, 16);
+		memset(packed, 0, sizeof(packed));
+		assert(tq_prod_encode(&config, input, packed, layout.total_bytes, errmsg, sizeof(errmsg)));
+		assert(tq_batch_page_append_lane(page, sizeof(page),
+			&(TqTid){.block_number = 2u, .offset_number = (uint16_t)(i + 1u)},
+			&lane_idx, errmsg, sizeof(errmsg)));
+		assert(tq_batch_page_set_code(page, sizeof(page), lane_idx, packed,
+									  layout.total_bytes, errmsg, sizeof(errmsg)));
+	}
+
+	assert(tq_scratch_block16_set_init(&set, config.dimension, params.lane_count, errmsg, sizeof(errmsg)));
+	assert(tq_batch_page_transpose_block16(page, sizeof(page), &config, &set, errmsg, sizeof(errmsg)));
+
+	/* 5 candidates → 1 block with count=5 */
+	assert(set.block_count == 1);
+	assert(set.blocks[0].count == 5);
+	assert(set.total_candidates == 5);
+
+	/* Verify each nibble is valid (0..15) */
+	for (i = 0; i < set.blocks[0].count * config.dimension; i++)
+		assert(set.blocks[0].nibbles[i] < 16u);
+
+	tq_scratch_block16_set_reset(&set);
+}
+
+static void
+test_quantized_lut16_reconstruction_error_is_small(void)
+{
+	TqProdCodecConfig config = {.dimension = 64, .bits = 4, .qjl_seed = 131u, .qjl_dimension = 64};
+	TqProdPackedLayout layout;
+	TqProdLut lut;
+	TqProdLut16 lut16;
+	float query[64];
+	uint32_t dim = 0;
+	uint32_t nib = 0;
+	float max_rel_error = 0.0f;
+	char errmsg[256];
+
+	memset(&layout, 0, sizeof(layout));
+	memset(&lut, 0, sizeof(lut));
+	memset(&lut16, 0, sizeof(lut16));
+
+	seeded_unit_vector(421u, query, 64);
+	assert(tq_prod_packed_layout(&config, &layout, errmsg, sizeof(errmsg)));
+	assert(tq_prod_lut_build(&config, query, &lut, errmsg, sizeof(errmsg)));
+	assert(tq_prod_lut16_build(&config, &lut, &lut16, errmsg, sizeof(errmsg)));
+	assert(tq_prod_lut16_quantize(&lut16, errmsg, sizeof(errmsg)));
+
+	{
+		float global_max = lut16.base_global_scale * 127.0f;
+
+		for (dim = 0; dim < config.dimension; dim++)
+		{
+			for (nib = 0; nib < 16u; nib++)
+			{
+				size_t idx = (size_t) dim * 16u + nib;
+				float original = lut16.base_values[idx];
+				float reconstructed = (float) lut16.base_quantized[idx] * lut16.base_global_scale;
+				float abs_error = fabsf(original - reconstructed);
+				/* Normalize error against global range (avoids division by near-zero) */
+				float rel_error = (global_max > 1e-8f) ? abs_error / global_max : abs_error;
+
+				if (rel_error > max_rel_error)
+					max_rel_error = rel_error;
+			}
+		}
+	}
+
+	/* int8 quantization with 127 levels: max error per entry is ~1/127 ≈ 0.8% of range */
+	assert(max_rel_error < 0.02f);
+
+	tq_prod_lut16_reset(&lut16);
+	tq_prod_lut_reset(&lut);
+}
+
+static void
+test_quantized_block16_fused_score_stays_close_to_float(void)
+{
+	const uint32_t dim = 32;
+	const uint32_t N = 16;
+	TqProdCodecConfig config = {.dimension = dim, .bits = 4, .qjl_seed = 557u, .qjl_dimension = dim};
+	TqProdPackedLayout layout;
+	TqProdLut lut;
+	TqProdLut16 lut16;
+	uint8_t packed[256];
+	uint8_t all_nibbles[16 * 32];
+	uint8_t dim_major_nibbles[32 * 16];
+	float gammas[16];
+	float float_scores[16];
+	float quantized_scores[16];
+	float query[32];
+	float input[32];
+	float max_abs_diff = 0.0f;
+	uint32_t i = 0;
+	char errmsg[256];
+
+	memset(&layout, 0, sizeof(layout));
+	memset(&lut, 0, sizeof(lut));
+	memset(&lut16, 0, sizeof(lut16));
+	memset(all_nibbles, 0, sizeof(all_nibbles));
+
+	seeded_unit_vector(771u, query, dim);
+	assert(tq_prod_packed_layout(&config, &layout, errmsg, sizeof(errmsg)));
+	assert(tq_prod_lut_build(&config, query, &lut, errmsg, sizeof(errmsg)));
+	assert(tq_prod_lut16_build(&config, &lut, &lut16, errmsg, sizeof(errmsg)));
+	assert(tq_prod_lut16_quantize(&lut16, errmsg, sizeof(errmsg)));
+
+	for (i = 0; i < N; i++)
+	{
+		memset(packed, 0, sizeof(packed));
+		seeded_unit_vector(800u + i, input, dim);
+		assert(tq_prod_encode(&config, input, packed, layout.total_bytes, errmsg, sizeof(errmsg)));
+		assert(tq_prod_read_gamma(&config, packed, layout.total_bytes, &gammas[i], errmsg, sizeof(errmsg)));
+		assert(tq_prod_extract_nibbles(&config, packed, layout.total_bytes,
+									   all_nibbles + (size_t) i * dim, dim, errmsg, sizeof(errmsg)));
+	}
+
+	transpose_nibbles_to_dim_major(all_nibbles, dim_major_nibbles, N, dim);
+
+	/* Float reference */
+	assert(tq_prod_score_block16_scalar(&lut16, dim_major_nibbles, gammas, N, float_scores,
+										errmsg, sizeof(errmsg)));
+
+	/* Quantized fused scorer */
+	assert(tq_prod_score_block16_quantized_scalar(&lut16, dim_major_nibbles, gammas, N, quantized_scores,
+												  errmsg, sizeof(errmsg)));
+
+	for (i = 0; i < N; i++)
+	{
+		float diff = fabsf(quantized_scores[i] - float_scores[i]);
+
+		if (diff > max_abs_diff)
+			max_abs_diff = diff;
+	}
+
+	/* Quantized fused score should be close to float (< 5% of max score magnitude) */
+	{
+		float max_mag = 0.0f;
+
+		for (i = 0; i < N; i++)
+		{
+			float mag = fabsf(float_scores[i]);
+			if (mag > max_mag)
+				max_mag = mag;
+		}
+		assert(max_abs_diff < 0.05f * max_mag);
+	}
+
+	tq_prod_lut16_reset(&lut16);
+	tq_prod_lut_reset(&lut);
+}
+
+static void
+test_quantized_block16_preserves_ranking_at_top_k(void)
+{
+	const uint32_t dim = 64;
+	const uint32_t N = 16;
+	const uint32_t top_k = 5;
+	TqProdCodecConfig config = {.dimension = dim, .bits = 4, .qjl_seed = 887u, .qjl_dimension = dim};
+	TqProdPackedLayout layout;
+	TqProdLut lut;
+	TqProdLut16 lut16;
+	uint8_t packed[512];
+	uint8_t *all_nibbles = NULL;
+	uint8_t *dim_major_nibbles = NULL;
+	float gammas[16];
+	float float_scores[16];
+	float quantized_scores[16];
+	RankedDistance float_ranked[16];
+	RankedDistance quant_ranked[16];
+	float *query = NULL;
+	float *input = NULL;
+	uint32_t i = 0;
+	uint32_t overlap = 0;
+	char errmsg[256];
+
+	memset(&layout, 0, sizeof(layout));
+	memset(&lut, 0, sizeof(lut));
+	memset(&lut16, 0, sizeof(lut16));
+
+	query = (float *) calloc(dim, sizeof(float));
+	input = (float *) calloc(dim, sizeof(float));
+	all_nibbles = (uint8_t *) calloc((size_t) N * dim, sizeof(uint8_t));
+	dim_major_nibbles = (uint8_t *) calloc((size_t) dim * 16u, sizeof(uint8_t));
+	assert(query != NULL && input != NULL && all_nibbles != NULL && dim_major_nibbles != NULL);
+
+	seeded_unit_vector(991u, query, dim);
+	assert(tq_prod_packed_layout(&config, &layout, errmsg, sizeof(errmsg)));
+	assert(tq_prod_lut_build(&config, query, &lut, errmsg, sizeof(errmsg)));
+	assert(tq_prod_lut16_build(&config, &lut, &lut16, errmsg, sizeof(errmsg)));
+	assert(tq_prod_lut16_quantize(&lut16, errmsg, sizeof(errmsg)));
+
+	for (i = 0; i < N; i++)
+	{
+		memset(packed, 0, sizeof(packed));
+		seeded_unit_vector(1000u + i, input, dim);
+		assert(tq_prod_encode(&config, input, packed, layout.total_bytes, errmsg, sizeof(errmsg)));
+		assert(tq_prod_read_gamma(&config, packed, layout.total_bytes, &gammas[i], errmsg, sizeof(errmsg)));
+		assert(tq_prod_extract_nibbles(&config, packed, layout.total_bytes,
+									   all_nibbles + (size_t) i * dim, dim, errmsg, sizeof(errmsg)));
+	}
+
+	transpose_nibbles_to_dim_major(all_nibbles, dim_major_nibbles, N, dim);
+
+	assert(tq_prod_score_block16_scalar(&lut16, dim_major_nibbles, gammas, N, float_scores,
+										errmsg, sizeof(errmsg)));
+	assert(tq_prod_score_block16_quantized_scalar(&lut16, dim_major_nibbles, gammas, N, quantized_scores,
+												  errmsg, sizeof(errmsg)));
+
+	/* Sort both by distance (1 - score for cosine-like) and compare top-k overlap */
+	for (i = 0; i < N; i++)
+	{
+		float_ranked[i].offset = (uint16_t) i;
+		float_ranked[i].distance = 1.0f - float_scores[i];
+		quant_ranked[i].offset = (uint16_t) i;
+		quant_ranked[i].distance = 1.0f - quantized_scores[i];
+	}
+
+	qsort(float_ranked, N, sizeof(RankedDistance), compare_ranked_distance);
+	qsort(quant_ranked, N, sizeof(RankedDistance), compare_ranked_distance);
+
+	for (i = 0; i < top_k; i++)
+	{
+		uint32_t j = 0;
+
+		for (j = 0; j < top_k; j++)
+		{
+			if (float_ranked[i].offset == quant_ranked[j].offset)
+			{
+				overlap++;
+				break;
+			}
+		}
+	}
+
+	/* At least 80% of top-k should overlap between float and quantized ranking */
+	assert(overlap >= (top_k * 4u) / 5u);
+
+	tq_prod_lut16_reset(&lut16);
+	tq_prod_lut_reset(&lut);
+	free(dim_major_nibbles);
+	free(all_nibbles);
+	free(input);
+	free(query);
+}
+
 int
 main(void)
 {
@@ -1069,5 +1651,14 @@ main(void)
 	test_scan_scratch_reuse_across_repeated_page_scans();
 	test_page_local_selection_preserves_single_page_top_k();
 	test_page_local_selection_retains_overlap_fixture_across_pages();
+	test_lut16_build_rejects_unsupported_shapes();
+	test_lut16_scalar_matches_code_domain_scorer();
+	test_lut16_block16_preserves_score_ordering();
+	test_scratch_transpose_preserves_lane_order_and_tid();
+	test_scratch_transpose_block16_scores_match_per_lane();
+	test_scratch_transpose_partial_block_pads_safely();
+	test_quantized_lut16_reconstruction_error_is_small();
+	test_quantized_block16_fused_score_stays_close_to_float();
+	test_quantized_block16_preserves_ranking_at_top_k();
 	return 0;
 }

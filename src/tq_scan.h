@@ -55,10 +55,18 @@ typedef enum TqScanOrchestration
 {
 	TQ_SCAN_ORCHESTRATION_NONE = 0,
 	TQ_SCAN_ORCHESTRATION_FLAT_STREAMING,
+	TQ_SCAN_ORCHESTRATION_FLAT_BOUNDED_PAGES,
 	TQ_SCAN_ORCHESTRATION_IVF_BOUNDED_PAGES,
 	TQ_SCAN_ORCHESTRATION_IVF_NEAR_EXHAUSTIVE,
 	TQ_SCAN_ORCHESTRATION_BITMAP_FILTER
 } TqScanOrchestration;
+
+typedef enum TqRouterSelectionMethod
+{
+	TQ_ROUTER_SELECTION_NONE = 0,
+	TQ_ROUTER_SELECTION_PARTIAL,
+	TQ_ROUTER_SELECTION_FULL_SORT
+} TqRouterSelectionMethod;
 
 typedef struct TqScanStats
 {
@@ -67,6 +75,7 @@ typedef struct TqScanStats
 	TqProdScoreKernel score_kernel;
 	TqPageBoundMode page_bound_mode;
 	TqScanOrchestration scan_orchestration;
+	TqRouterSelectionMethod router_selection_method;
 	bool		faithful_fast_path;
 	bool		compatibility_fallback;
 	bool		safe_pruning_enabled;
@@ -104,7 +113,41 @@ typedef struct TqScanStats
 	size_t		decoded_buffer_reuses;
 	size_t		code_view_uses;
 	size_t		code_copy_uses;
+	size_t		block_local_scored_count;
+	size_t		block_local_survivor_count;
+	size_t		block_local_rejected_count;
 } TqScanStats;
+
+/*
+ * Scratch block-16 microblock for transposed scoring.
+ * nibbles: dimension-major layout, nibbles[d * 16 + c]
+ *          (16 candidates per dimension, contiguous for SIMD loads)
+ * gammas:  one float per candidate
+ * tids:    one TqTid per candidate
+ * count:   number of valid candidates (1..16)
+ */
+#define TQ_BLOCK16_MAX_CANDIDATES 16
+
+typedef struct TqScratchBlock16
+{
+	uint8_t    *nibbles;
+	float	   *gammas;
+	TqTid	   *tids;
+	uint32_t	count;
+	uint32_t	dimension;
+} TqScratchBlock16;
+
+typedef struct TqScratchBlock16Set
+{
+	TqScratchBlock16 *blocks;
+	uint32_t	block_count;
+	uint32_t	block_capacity;
+	uint8_t    *nibble_storage;
+	float	   *gamma_storage;
+	TqTid	   *tid_storage;
+	uint32_t	dimension;
+	uint32_t	total_candidates;
+} TqScratchBlock16Set;
 
 typedef struct TqScanScratch
 {
@@ -114,6 +157,9 @@ typedef struct TqScanScratch
 	size_t		decoded_buffer_reuses;
 	size_t		code_view_uses;
 	size_t		code_copy_uses;
+	TqScratchBlock16Set block16_set;
+	bool		block16_set_initialized;
+	const TqProdLut16 *lut16;	/* optional: enables block-16 fast path */
 } TqScanScratch;
 
 extern bool tq_candidate_heap_init(TqCandidateHeap *heap, size_t capacity);
@@ -169,6 +215,7 @@ extern void tq_scan_stats_set_scan_orchestration(TqScanOrchestration scan_orches
 												 bool near_exhaustive_crossover);
 extern void tq_scan_stats_record_page_bound_mode(TqPageBoundMode page_bound_mode,
 												 bool safe_pruning_enabled);
+extern void tq_scan_stats_set_router_selection_method(TqRouterSelectionMethod method);
 extern void tq_scan_stats_reset_candidate_heap_metrics(void);
 extern void tq_scan_stats_set_probe_budget(size_t nominal_probe_count,
 										   size_t effective_probe_count,
@@ -195,6 +242,7 @@ extern void tq_scan_stats_record_scratch_allocations(size_t count);
 extern void tq_scan_stats_record_decoded_buffer_reuses(size_t count);
 extern void tq_scan_stats_record_code_view_uses(size_t count);
 extern void tq_scan_stats_record_code_copy_uses(size_t count);
+extern void tq_scan_stats_record_block_local_selection(size_t scored, size_t survivors);
 extern void tq_scan_stats_set_candidate_heap_metrics(size_t capacity, size_t count);
 extern void tq_scan_stats_set_shadow_decode_metrics(const TqCandidateHeap *primary,
 													const TqCandidateHeap *shadow);
@@ -211,6 +259,23 @@ extern bool tq_scan_stats_serialize_json(const TqScanStats *stats,
 										 size_t buffer_len);
 extern bool tq_scan_active_uses_prod_code_domain(bool normalized, TqDistanceKind distance);
 extern void tq_scan_scratch_reset(TqScanScratch *scratch);
+
+extern uint32_t tq_block16_select_top_m(const float *scores,
+										uint32_t candidate_count,
+										uint32_t top_m,
+										uint32_t *selected_indices);
+extern bool tq_scratch_block16_set_init(TqScratchBlock16Set *set,
+										uint32_t dimension,
+										uint32_t max_candidates,
+										char *errmsg,
+										size_t errmsg_len);
+extern void tq_scratch_block16_set_reset(TqScratchBlock16Set *set);
+extern bool tq_batch_page_transpose_block16(const void *page,
+											size_t page_size,
+											const TqProdCodecConfig *config,
+											TqScratchBlock16Set *set,
+											char *errmsg,
+											size_t errmsg_len);
 extern bool tq_batch_page_scan_prod(const void *page,
 									size_t page_size,
 									const TqProdCodecConfig *config,

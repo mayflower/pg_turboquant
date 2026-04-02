@@ -102,6 +102,7 @@ typedef struct TqBatchPageParams
 	uint32_t	code_bytes;
 	uint32_t	list_id;
 	uint32_t	next_block;
+	uint32_t	dimension;		/* >0 selects SoA nibble layout; 0 uses legacy AoS */
 } TqBatchPageParams;
 
 typedef struct TqBatchPageHeaderView
@@ -114,6 +115,7 @@ typedef struct TqBatchPageHeaderView
 	uint32_t	list_id;
 	uint32_t	next_block;
 	float		residual_radius;
+	uint16_t	flags;
 } TqBatchPageHeaderView;
 
 typedef struct TqBatchPageSummary
@@ -342,5 +344,26 @@ extern bool tq_batch_page_next_live_lane(const void *page,
 										 uint16_t *lane_index,
 										 char *errmsg,
 										 size_t errmsg_len);
+
+extern bool tq_batch_page_is_soa(const void *page, size_t page_size);
+extern bool tq_batch_page_get_nibble_ptr(const void *page, size_t page_size,
+										 const uint8_t **nibbles, uint32_t *dimension,
+										 uint16_t *lane_count, char *errmsg, size_t errmsg_len);
+extern bool tq_batch_page_get_gamma_ptr(const void *page, size_t page_size,
+										const float **gammas, char *errmsg, size_t errmsg_len);
+extern bool tq_batch_page_set_nibble_and_gamma(void *page, size_t page_size,
+											   uint16_t lane_index, const uint8_t *nibbles,
+											   uint32_t dimension, float gamma,
+											   char *errmsg, size_t errmsg_len);
+extern size_t tq_batch_page_soa_required_bytes(uint16_t lane_count, uint32_t dimension,
+											   uint32_t representative_code_bytes);
+extern bool tq_batch_page_can_fit_soa(size_t page_size, uint16_t lane_count,
+									  uint32_t dimension, uint32_t representative_code_bytes);
+extern bool tq_batch_page_set_representative_code(void *page, size_t page_size,
+												  const uint8_t *code, size_t code_len,
+												  char *errmsg, size_t errmsg_len);
+extern bool tq_batch_page_get_representative_code_view(const void *page, size_t page_size,
+													   const uint8_t **code, size_t *code_len,
+													   char *errmsg, size_t errmsg_len);
 
 #endif

@@ -108,6 +108,8 @@ tq_scan_orchestration_name(TqScanOrchestration scan_orchestration)
 	{
 		case TQ_SCAN_ORCHESTRATION_FLAT_STREAMING:
 			return "flat_streaming";
+		case TQ_SCAN_ORCHESTRATION_FLAT_BOUNDED_PAGES:
+			return "flat_bounded_pages";
 		case TQ_SCAN_ORCHESTRATION_IVF_BOUNDED_PAGES:
 			return "ivf_bounded_pages";
 		case TQ_SCAN_ORCHESTRATION_IVF_NEAR_EXHAUSTIVE:
@@ -137,6 +139,22 @@ tq_page_bound_mode_name(TqPageBoundMode mode)
 			return "data_page_fallback";
 		case TQ_PAGE_BOUND_MODE_MIXED:
 			return "mixed";
+	}
+
+	return "unknown";
+}
+
+static const char *
+tq_router_selection_method_name(TqRouterSelectionMethod method)
+{
+	switch (method)
+	{
+		case TQ_ROUTER_SELECTION_NONE:
+			return "none";
+		case TQ_ROUTER_SELECTION_PARTIAL:
+			return "partial";
+		case TQ_ROUTER_SELECTION_FULL_SORT:
+			return "full_sort";
 	}
 
 	return "unknown";
@@ -574,6 +592,12 @@ tq_scan_stats_record_page_bound_mode(TqPageBoundMode page_bound_mode,
 }
 
 void
+tq_scan_stats_set_router_selection_method(TqRouterSelectionMethod method)
+{
+	tq_last_scan_stats.router_selection_method = method;
+}
+
+void
 tq_scan_stats_reset_candidate_heap_metrics(void)
 {
 	tq_last_scan_stats.retained_candidate_count = 0;
@@ -770,6 +794,82 @@ tq_scan_stats_record_code_copy_uses(size_t count)
 }
 
 void
+tq_scan_stats_record_block_local_selection(size_t scored, size_t survivors)
+{
+	if (survivors > scored)
+		survivors = scored;
+
+	tq_last_scan_stats.block_local_scored_count += scored;
+	tq_last_scan_stats.block_local_survivor_count += survivors;
+	tq_last_scan_stats.block_local_rejected_count += (scored - survivors);
+}
+
+uint32_t
+tq_block16_select_top_m(const float *scores,
+						uint32_t candidate_count,
+						uint32_t top_m,
+						uint32_t *selected_indices)
+{
+	/*
+	 * Select the top_m candidates with the highest scores (lowest distance)
+	 * from a block of up to 16 candidates. Since candidate_count <= 16,
+	 * a simple insertion into a sorted buffer is efficient.
+	 *
+	 * Distance is 1-score for cosine, so higher score = better = lower distance.
+	 * We select the top_m highest scores.
+	 */
+	uint32_t	selected = 0;
+	float		threshold = -1e30f;
+	uint32_t	c = 0;
+
+	if (scores == NULL || selected_indices == NULL
+		|| candidate_count == 0 || top_m == 0)
+		return 0;
+
+	if (top_m >= candidate_count)
+	{
+		for (c = 0; c < candidate_count; c++)
+			selected_indices[c] = c;
+		return candidate_count;
+	}
+
+	/* Simple selection: maintain sorted buffer of top_m best scores */
+	for (c = 0; c < candidate_count; c++)
+	{
+		if (selected < top_m)
+		{
+			/* Insert into sorted buffer */
+			uint32_t pos = selected;
+
+			while (pos > 0 && scores[c] > scores[selected_indices[pos - 1]])
+			{
+				selected_indices[pos] = selected_indices[pos - 1];
+				pos--;
+			}
+			selected_indices[pos] = c;
+			selected++;
+			if (selected == top_m)
+				threshold = scores[selected_indices[selected - 1]];
+		}
+		else if (scores[c] > threshold)
+		{
+			/* Replace worst in buffer */
+			uint32_t pos = selected - 1;
+
+			while (pos > 0 && scores[c] > scores[selected_indices[pos - 1]])
+			{
+				selected_indices[pos] = selected_indices[pos - 1];
+				pos--;
+			}
+			selected_indices[pos] = c;
+			threshold = scores[selected_indices[selected - 1]];
+		}
+	}
+
+	return selected;
+}
+
+void
 tq_scan_stats_record_decoded_vector_only(void)
 {
 	tq_last_scan_stats.decoded_vector_count += 1;
@@ -901,7 +1001,339 @@ tq_scan_scratch_reset(TqScanScratch *scratch)
 		return;
 
 	free(scratch->decoded_values);
+	if (scratch->block16_set_initialized)
+		tq_scratch_block16_set_reset(&scratch->block16_set);
 	memset(scratch, 0, sizeof(*scratch));
+}
+
+bool
+tq_scratch_block16_set_init(TqScratchBlock16Set *set,
+							uint32_t dimension,
+							uint32_t max_candidates,
+							char *errmsg,
+							size_t errmsg_len)
+{
+	uint32_t	max_blocks = 0;
+
+	if (set == NULL || dimension == 0 || max_candidates == 0)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid block16 set init: set, dimension, and max_candidates must be non-null/non-zero");
+		return false;
+	}
+
+	memset(set, 0, sizeof(*set));
+	max_blocks = (max_candidates + TQ_BLOCK16_MAX_CANDIDATES - 1u) / TQ_BLOCK16_MAX_CANDIDATES;
+
+	set->blocks = (TqScratchBlock16 *) calloc(max_blocks, sizeof(TqScratchBlock16));
+	set->nibble_storage = (uint8_t *) calloc((size_t) max_blocks * TQ_BLOCK16_MAX_CANDIDATES * (size_t) dimension, sizeof(uint8_t));
+	set->gamma_storage = (float *) calloc((size_t) max_blocks * TQ_BLOCK16_MAX_CANDIDATES, sizeof(float));
+	set->tid_storage = (TqTid *) calloc((size_t) max_blocks * TQ_BLOCK16_MAX_CANDIDATES, sizeof(TqTid));
+
+	if (set->blocks == NULL || set->nibble_storage == NULL
+		|| set->gamma_storage == NULL || set->tid_storage == NULL)
+	{
+		tq_scratch_block16_set_reset(set);
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid block16 set init: out of memory");
+		return false;
+	}
+
+	set->block_capacity = max_blocks;
+	set->dimension = dimension;
+	return true;
+}
+
+void
+tq_scratch_block16_set_reset(TqScratchBlock16Set *set)
+{
+	if (set == NULL)
+		return;
+
+	free(set->blocks);
+	free(set->nibble_storage);
+	free(set->gamma_storage);
+	free(set->tid_storage);
+	memset(set, 0, sizeof(*set));
+}
+
+bool
+tq_batch_page_transpose_block16(const void *page,
+								size_t page_size,
+								const TqProdCodecConfig *config,
+								TqScratchBlock16Set *set,
+								char *errmsg,
+								size_t errmsg_len)
+{
+	TqBatchPageHeaderView header;
+	uint16_t	lane = 0;
+	uint32_t	candidate_index = 0;
+	uint32_t	block_index = 0;
+
+	if (page == NULL || config == NULL || set == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid transpose: page, config, and set must be non-null");
+		return false;
+	}
+
+	if (!tq_prod_lut16_is_supported(config, errmsg, errmsg_len))
+		return false;
+
+	memset(&header, 0, sizeof(header));
+	if (!tq_batch_page_read_header(page, page_size, &header, errmsg, errmsg_len))
+		return false;
+
+	set->block_count = 0;
+	set->total_candidates = 0;
+	candidate_index = 0;
+
+	if (!tq_batch_page_next_live_lane(page, page_size, -1, &lane, errmsg, errmsg_len))
+		return true;
+
+	/*
+	 * SoA fast path: when the page stores nibbles in dimension-major
+	 * layout and all lanes are live with lane_count == 16, we can copy
+	 * directly from the page nibble block without per-lane extraction.
+	 */
+	if (tq_batch_page_is_soa(page, page_size)
+		&& header.live_count == header.occupied_count
+		&& header.occupied_count == TQ_BLOCK16_MAX_CANDIDATES)
+	{
+		const uint8_t *page_nibbles = NULL;
+		const float *page_gammas = NULL;
+		uint32_t	soa_dim = 0;
+		uint16_t	soa_lane_count = 0;
+
+		if (!tq_batch_page_get_nibble_ptr(page, page_size, &page_nibbles,
+										  &soa_dim, &soa_lane_count,
+										  errmsg, errmsg_len))
+			return false;
+
+		if (!tq_batch_page_get_gamma_ptr(page, page_size, &page_gammas,
+										 errmsg, errmsg_len))
+			return false;
+
+		if (soa_lane_count == TQ_BLOCK16_MAX_CANDIDATES
+			&& soa_dim == config->dimension)
+		{
+			size_t		pair_cols = ((size_t) soa_lane_count + 1u) / 2u;
+			uint32_t	d;
+
+			if (set->block_capacity < 1)
+			{
+				tq_set_error(errmsg, errmsg_len,
+							 "invalid transpose: block set capacity too small for SoA direct copy");
+				return false;
+			}
+
+			/*
+			 * Unpack 4-bit packed nibbles from the page into full-byte
+			 * dimension-major layout for the SIMD kernel.  Each page byte
+			 * holds two candidates: low nibble = even, high = odd.
+			 * For 16 lanes (pair_cols=8), load 8 packed bytes and split
+			 * into 16 full bytes using mask+shift.
+			 */
+			if (pair_cols == 8u)
+			{
+				/*
+				 * Fast path for 16 lanes: load 8 bytes, produce 16
+				 * nibble bytes via interleaved low/high extraction.
+				 */
+				for (d = 0; d < soa_dim; d++)
+				{
+					const uint8_t *src = page_nibbles + (size_t) d * 8u;
+					uint8_t		  *dst = set->nibble_storage + (size_t) d * 16u;
+					size_t		   p;
+
+					for (p = 0; p < 8u; p++)
+					{
+						dst[p * 2]     = src[p] & 0x0Fu;
+						dst[p * 2 + 1] = (src[p] >> 4u) & 0x0Fu;
+					}
+				}
+			}
+			else
+			{
+				for (d = 0; d < soa_dim; d++)
+				{
+					const uint8_t *src = page_nibbles + (size_t) d * pair_cols;
+					uint8_t		  *dst = set->nibble_storage + (size_t) d * TQ_BLOCK16_MAX_CANDIDATES;
+					size_t		   p;
+
+					for (p = 0; p < pair_cols; p++)
+					{
+						dst[p * 2]     = src[p] & 0x0Fu;
+						dst[p * 2 + 1] = (src[p] >> 4u) & 0x0Fu;
+					}
+				}
+			}
+			memcpy(set->gamma_storage, page_gammas,
+				   sizeof(float) * TQ_BLOCK16_MAX_CANDIDATES);
+
+			/* Collect TIDs */
+			for (candidate_index = 0; candidate_index < TQ_BLOCK16_MAX_CANDIDATES; candidate_index++)
+			{
+				TqTid	tid;
+
+				memset(&tid, 0, sizeof(tid));
+				if (!tq_batch_page_get_tid(page, page_size, (uint16_t) candidate_index,
+										   &tid, errmsg, errmsg_len))
+					return false;
+				set->tid_storage[candidate_index] = tid;
+			}
+
+			set->total_candidates = TQ_BLOCK16_MAX_CANDIDATES;
+			set->block_count = 1;
+			set->blocks[0].nibbles = set->nibble_storage;
+			set->blocks[0].gammas = set->gamma_storage;
+			set->blocks[0].tids = set->tid_storage;
+			set->blocks[0].count = TQ_BLOCK16_MAX_CANDIDATES;
+			set->blocks[0].dimension = config->dimension;
+			return true;
+		}
+	}
+
+	do
+	{
+		const uint8_t *code = NULL;
+		size_t		code_len = 0;
+		TqTid		tid;
+		float		gamma = 0.0f;
+
+		memset(&tid, 0, sizeof(tid));
+
+		block_index = candidate_index / TQ_BLOCK16_MAX_CANDIDATES;
+
+		if (block_index >= set->block_capacity)
+		{
+			tq_set_error(errmsg, errmsg_len,
+						 "invalid transpose: too many candidates for block set capacity");
+			return false;
+		}
+
+		if (!tq_batch_page_get_tid(page, page_size, lane, &tid, errmsg, errmsg_len))
+			return false;
+
+		if (tq_batch_page_is_soa(page, page_size))
+		{
+			/*
+			 * SoA page with partial occupancy or dead lanes: extract
+			 * this lane's nibbles from the dimension-major block and
+			 * scatter into the scratch block's candidate-major layout.
+			 */
+			const uint8_t *page_nibbles = NULL;
+			const float *page_gammas = NULL;
+			uint32_t	soa_dim = 0;
+			uint16_t	soa_lane_count = 0;
+			uint32_t	slot = candidate_index % TQ_BLOCK16_MAX_CANDIDATES;
+			size_t		block_base = (size_t) block_index * (size_t) TQ_BLOCK16_MAX_CANDIDATES
+										* (size_t) config->dimension;
+			uint32_t	d;
+
+			if (!tq_batch_page_get_nibble_ptr(page, page_size, &page_nibbles,
+											  &soa_dim, &soa_lane_count,
+											  errmsg, errmsg_len))
+				return false;
+			if (!tq_batch_page_get_gamma_ptr(page, page_size, &page_gammas,
+											 errmsg, errmsg_len))
+				return false;
+
+			for (d = 0; d < config->dimension; d++)
+			{
+				set->nibble_storage[block_base + (size_t) d * TQ_BLOCK16_MAX_CANDIDATES + slot]
+					= page_nibbles[(size_t) d * soa_lane_count + lane];
+			}
+			gamma = page_gammas[lane];
+		}
+		else
+		{
+			if (!tq_batch_page_code_view(page, page_size, lane, &code, &code_len, errmsg, errmsg_len))
+				return false;
+
+			if (!tq_prod_read_gamma(config, code, code_len, &gamma, errmsg, errmsg_len))
+				return false;
+
+			/*
+			 * Fast extract + scatter: extract 8 nibbles at a time from the
+			 * packed code and write directly to dimension-major positions.
+			 * Avoids the per-bit tq_unpack_bits and the intermediate buffer.
+			 *
+			 * For bits=4: each group of 8 dimensions uses 3 bytes of idx
+			 * (24 bits = 8 x 3-bit codes) and 1 byte of signs (8 x 1-bit).
+			 * Since LUT16 requires dim % 8 == 0, groups are byte-aligned.
+			 */
+			{
+				uint32_t	slot = candidate_index % TQ_BLOCK16_MAX_CANDIDATES;
+				size_t		block_base = (size_t) block_index * (size_t) TQ_BLOCK16_MAX_CANDIDATES
+											* (size_t) config->dimension;
+				const uint8_t *idx_base = code;
+				const uint8_t *sign_base = code + (size_t) config->dimension * 3u / 8u;
+				uint32_t	d;
+
+				for (d = 0; d < config->dimension; d += 8u)
+				{
+					uint32_t	chunk = (uint32_t) idx_base[0]
+									| ((uint32_t) idx_base[1] << 8u)
+									| ((uint32_t) idx_base[2] << 16u);
+					uint8_t		signs = sign_base[0];
+					uint8_t    *dst = set->nibble_storage + block_base
+									+ (size_t) d * TQ_BLOCK16_MAX_CANDIDATES + slot;
+
+					dst[0 * TQ_BLOCK16_MAX_CANDIDATES] = (uint8_t) (((signs & 0x01u) << 3u) | ((chunk >> 0u) & 7u));
+					dst[1 * TQ_BLOCK16_MAX_CANDIDATES] = (uint8_t) (((signs & 0x02u) << 2u) | ((chunk >> 3u) & 7u));
+					dst[2 * TQ_BLOCK16_MAX_CANDIDATES] = (uint8_t) (((signs & 0x04u) << 1u) | ((chunk >> 6u) & 7u));
+					dst[3 * TQ_BLOCK16_MAX_CANDIDATES] = (uint8_t) (((signs & 0x08u)      ) | ((chunk >> 9u) & 7u));
+					dst[4 * TQ_BLOCK16_MAX_CANDIDATES] = (uint8_t) (((signs & 0x10u) >> 1u) | ((chunk >> 12u) & 7u));
+					dst[5 * TQ_BLOCK16_MAX_CANDIDATES] = (uint8_t) (((signs & 0x20u) >> 2u) | ((chunk >> 15u) & 7u));
+					dst[6 * TQ_BLOCK16_MAX_CANDIDATES] = (uint8_t) (((signs & 0x40u) >> 3u) | ((chunk >> 18u) & 7u));
+					dst[7 * TQ_BLOCK16_MAX_CANDIDATES] = (uint8_t) (((signs & 0x80u) >> 4u) | ((chunk >> 21u) & 7u));
+
+					idx_base += 3;
+					sign_base += 1;
+				}
+			}
+		}
+
+		set->gamma_storage[candidate_index] = gamma;
+		set->tid_storage[candidate_index] = tid;
+		candidate_index++;
+	} while (tq_batch_page_next_live_lane(page, page_size, (int) lane, &lane, errmsg, errmsg_len));
+
+	/* Wire up blocks */
+	set->total_candidates = candidate_index;
+	set->block_count = (candidate_index + TQ_BLOCK16_MAX_CANDIDATES - 1u) / TQ_BLOCK16_MAX_CANDIDATES;
+
+	for (block_index = 0; block_index < set->block_count; block_index++)
+	{
+		uint32_t	start = block_index * TQ_BLOCK16_MAX_CANDIDATES;
+		uint32_t	count = candidate_index - start;
+		size_t		block_base = (size_t) block_index * (size_t) TQ_BLOCK16_MAX_CANDIDATES
+									* (size_t) config->dimension;
+
+		if (count > TQ_BLOCK16_MAX_CANDIDATES)
+			count = TQ_BLOCK16_MAX_CANDIDATES;
+
+		/* Zero-pad unused candidate slots in partial blocks */
+		if (count < TQ_BLOCK16_MAX_CANDIDATES)
+		{
+			uint32_t	d;
+			for (d = 0; d < config->dimension; d++)
+			{
+				uint32_t	c;
+				for (c = count; c < TQ_BLOCK16_MAX_CANDIDATES; c++)
+					set->nibble_storage[block_base + (size_t) d * TQ_BLOCK16_MAX_CANDIDATES + c] = 0;
+			}
+		}
+
+		set->blocks[block_index].nibbles = set->nibble_storage + block_base;
+		set->blocks[block_index].gammas = set->gamma_storage + start;
+		set->blocks[block_index].tids = set->tid_storage + start;
+		set->blocks[block_index].count = count;
+		set->blocks[block_index].dimension = config->dimension;
+	}
+
+	return true;
 }
 
 bool
@@ -916,7 +1348,8 @@ tq_scan_stats_serialize_json(const TqScanStats *stats, char *buffer, size_t buff
 		buffer,
 		buffer_len,
 		"{\"mode\":\"%s\",\"score_mode\":\"%s\",\"score_kernel\":\"%s\",\"page_bound_mode\":\"%s\","
-		"\"scan_orchestration\":\"%s\",\"faithful_fast_path\":%s,\"compatibility_fallback\":%s,"
+		"\"scan_orchestration\":\"%s\",\"router_selection_method\":\"%s\","
+		"\"faithful_fast_path\":%s,\"compatibility_fallback\":%s,"
 		"\"safe_pruning_enabled\":%s,\"near_exhaustive_crossover\":%s,"
 		"\"configured_probe_count\":%zu,"
 		"\"nominal_probe_count\":%zu,\"effective_probe_count\":%zu,"
@@ -937,12 +1370,15 @@ tq_scan_stats_serialize_json(const TqScanStats *stats, char *buffer, size_t buff
 		"\"bound_data_page_reads\":%zu,"
 		"\"page_prune_count\":%zu,\"early_stop_count\":%zu,"
 		"\"scratch_allocations\":%zu,\"decoded_buffer_reuses\":%zu,"
-		"\"code_view_uses\":%zu,\"code_copy_uses\":%zu}",
+		"\"code_view_uses\":%zu,\"code_copy_uses\":%zu,"
+		"\"block_local_scored_count\":%zu,\"block_local_survivor_count\":%zu,"
+		"\"block_local_rejected_count\":%zu}",
 		tq_scan_mode_name(stats->mode),
 		tq_scan_score_mode_name(stats->score_mode),
 		tq_scan_score_kernel_name(stats),
 		tq_page_bound_mode_name(stats->page_bound_mode),
 		tq_scan_orchestration_name(stats->scan_orchestration),
+		tq_router_selection_method_name(stats->router_selection_method),
 		stats->faithful_fast_path ? "true" : "false",
 		stats->compatibility_fallback ? "true" : "false",
 		stats->safe_pruning_enabled ? "true" : "false",
@@ -979,7 +1415,10 @@ tq_scan_stats_serialize_json(const TqScanStats *stats, char *buffer, size_t buff
 		stats->scratch_allocations,
 		stats->decoded_buffer_reuses,
 		stats->code_view_uses,
-		stats->code_copy_uses
+		stats->code_copy_uses,
+		stats->block_local_scored_count,
+		stats->block_local_survivor_count,
+		stats->block_local_rejected_count
 	);
 
 	return written >= 0 && (size_t) written < buffer_len;
@@ -1281,14 +1720,24 @@ tq_scan_page_optimistic_distance_bound(const TqProdCodecConfig *config,
 		return true;
 	}
 
-	if (!tq_batch_page_code_view(page,
-								 page_size,
-								 summary.representative_lane,
-								 &code,
-								 &code_len,
-								 errmsg,
-								 errmsg_len))
-		return false;
+	if (tq_batch_page_is_soa(page, page_size))
+	{
+		if (!tq_batch_page_get_representative_code_view(page, page_size,
+														&code, &code_len,
+														errmsg, errmsg_len))
+			return false;
+	}
+	else
+	{
+		if (!tq_batch_page_code_view(page,
+									 page_size,
+									 summary.representative_lane,
+									 &code,
+									 &code_len,
+									 errmsg,
+									 errmsg_len))
+			return false;
+	}
 	tq_scan_stats_record_code_view_uses(1);
 
 	ok = tq_scan_summary_optimistic_distance_bound(config,
@@ -1363,6 +1812,7 @@ tq_batch_page_scan_prod_with_scratch(const void *page,
 	float *decoded = NULL;
 	bool		use_code_domain = false;
 	bool		use_shadow_decode = false;
+	bool		use_block16 = false;
 	float		query_norm_squared = 0.0f;
 	uint16_t	lane = 0;
 	bool		ok = false;
@@ -1409,6 +1859,11 @@ tq_batch_page_scan_prod_with_scratch(const void *page,
 		&& shadow_decode_heap != NULL
 		&& shadow_decode_heap->entries != NULL
 		&& shadow_decode_heap->capacity > 0;
+	use_block16 = use_code_domain
+		&& !use_shadow_decode
+		&& scratch->lut16 != NULL
+		&& scratch->lut16->quantized_ready
+		&& tq_prod_lut16_is_supported(config, NULL, 0);
 	tq_scan_stats_set_score_mode(use_code_domain ? TQ_SCAN_SCORE_MODE_CODE_DOMAIN
 												 : TQ_SCAN_SCORE_MODE_DECODE);
 	tq_scan_stats_set_score_kernel(use_code_domain
@@ -1429,8 +1884,207 @@ tq_batch_page_scan_prod_with_scratch(const void *page,
 		query_norm_squared = tq_norm_squared_scalar(query_values, query_len);
 	}
 
-	if (tq_batch_page_next_live_lane(page, page_size, -1, &lane, errmsg, errmsg_len))
+	/*
+	 * SoA zero-copy fast path: when the page stores 4-bit packed nibbles
+	 * in dimension-major layout and all lanes are live with count == 16,
+	 * score directly from the page buffer with no transpose or copy.
+	 * The kernel unpacks 4-bit pairs inline via mask+shift.
+	 */
+	if (use_block16 && header.live_count > 0
+		&& tq_batch_page_is_soa(page, page_size)
+		&& header.live_count == header.occupied_count
+		&& header.occupied_count == TQ_BLOCK16_MAX_CANDIDATES)
 	{
+		const uint8_t *page_nibbles = NULL;
+		const float   *page_gammas = NULL;
+		uint32_t	soa_dim = 0;
+		uint16_t	soa_lc = 0;
+
+		if (!tq_batch_page_get_nibble_ptr(page, page_size, &page_nibbles,
+										  &soa_dim, &soa_lc, errmsg, errmsg_len)
+			|| !tq_batch_page_get_gamma_ptr(page, page_size, &page_gammas,
+											errmsg, errmsg_len))
+			return false;
+
+		if (soa_lc == TQ_BLOCK16_MAX_CANDIDATES && soa_dim == config->dimension)
+		{
+			const TqProdLut16 *lut16 = scratch->lut16;
+			uint32_t	dim = soa_dim;
+			size_t		pair_cols = (size_t) soa_lc / 2u;
+			float		block_scores[TQ_BLOCK16_MAX_CANDIDATES];
+			int32_t		base_sums[TQ_BLOCK16_MAX_CANDIDATES];
+			int32_t		qjl_sums[TQ_BLOCK16_MAX_CANDIDATES];
+			uint32_t	d;
+			uint32_t	i;
+
+			memset(base_sums, 0, sizeof(base_sums));
+			memset(qjl_sums, 0, sizeof(qjl_sums));
+
+			for (d = 0; d < dim; d++)
+			{
+				const uint8_t *packed_row = page_nibbles + (size_t) d * pair_cols;
+				const int8_t  *base_row = lut16->base_quantized + (size_t) d * 16u;
+				const int8_t  *qjl_row = lut16->qjl_quantized + (size_t) d * 16u;
+				size_t		p;
+
+				for (p = 0; p < pair_cols; p++)
+				{
+					uint8_t	lo_nib = packed_row[p] & 0x0Fu;
+					uint8_t	hi_nib = (packed_row[p] >> 4u) & 0x0Fu;
+
+					base_sums[p * 2]     += (int32_t) base_row[lo_nib];
+					base_sums[p * 2 + 1] += (int32_t) base_row[hi_nib];
+					qjl_sums[p * 2]      += (int32_t) qjl_row[lo_nib];
+					qjl_sums[p * 2 + 1]  += (int32_t) qjl_row[hi_nib];
+				}
+			}
+
+			for (i = 0; i < TQ_BLOCK16_MAX_CANDIDATES; i++)
+				block_scores[i] = (float) base_sums[i] * lut16->base_global_scale
+							   + page_gammas[i] * (float) qjl_sums[i] * lut16->qjl_global_scale;
+
+			tq_scan_stats_set_score_kernel(TQ_PROD_SCORE_SCALAR);
+
+			for (i = 0; i < TQ_BLOCK16_MAX_CANDIDATES; i++)
+			{
+				float	distance_value = 0.0f;
+				TqTid	tid;
+
+				tq_scan_stats_record_code_visit(false);
+
+				if (!tq_metric_distance_from_ip_score(distance,
+													  block_scores[i],
+													  &distance_value,
+													  errmsg, errmsg_len))
+					return false;
+
+				memset(&tid, 0, sizeof(tid));
+				if (!tq_batch_page_get_tid(page, page_size, (uint16_t) i,
+										   &tid, errmsg, errmsg_len))
+					return false;
+
+				if (!tq_candidate_heap_push_internal(&local_heap,
+													 distance_value,
+													 tid.block_number,
+													 tid.offset_number,
+													 TQ_CANDIDATE_HEAP_METRICS_LOCAL))
+					return false;
+			}
+
+			tq_scan_stats_record_block_local_selection(TQ_BLOCK16_MAX_CANDIDATES,
+													   TQ_BLOCK16_MAX_CANDIDATES);
+			goto merge_and_return;
+		}
+	}
+
+	if (use_block16 && header.live_count > 0)
+	{
+		/*
+		 * Block-16 transpose path: for AoS pages or partial SoA pages,
+		 * extract + transpose nibbles, then score via SIMD dispatch.
+		 */
+		float		block_scores[TQ_BLOCK16_MAX_CANDIDATES];
+		uint32_t	b;
+
+		if (!scratch->block16_set_initialized
+			|| scratch->block16_set.dimension != config->dimension
+			|| scratch->block16_set.block_capacity * TQ_BLOCK16_MAX_CANDIDATES < header.live_count)
+		{
+			if (scratch->block16_set_initialized)
+				tq_scratch_block16_set_reset(&scratch->block16_set);
+
+			if (!tq_scratch_block16_set_init(&scratch->block16_set,
+											 config->dimension,
+											 header.live_count,
+											 errmsg, errmsg_len))
+				return false;
+			scratch->block16_set_initialized = true;
+		}
+
+		if (!tq_batch_page_transpose_block16(page, page_size, config,
+											 &scratch->block16_set,
+											 errmsg, errmsg_len))
+			return false;
+
+		for (b = 0; b < scratch->block16_set.block_count; b++)
+		{
+			TqScratchBlock16 *blk = &scratch->block16_set.blocks[b];
+			TqProdScoreKernel used_kernel = TQ_PROD_SCORE_SCALAR;
+			uint32_t	i;
+
+			if (!tq_prod_score_block16_dispatch(scratch->lut16,
+												blk->nibbles,
+												blk->gammas,
+												blk->count,
+												TQ_PROD_SCORE_AUTO,
+												block_scores,
+												&used_kernel,
+												errmsg, errmsg_len))
+				return false;
+
+			tq_scan_stats_set_score_kernel(used_kernel);
+
+			for (i = 0; i < blk->count; i++)
+			{
+				float	distance_value = 0.0f;
+
+				tq_scan_stats_record_code_visit(false);
+
+				if (!tq_metric_distance_from_ip_score(distance,
+													  block_scores[i],
+													  &distance_value,
+													  errmsg, errmsg_len))
+					return false;
+
+				if (!tq_candidate_heap_push_internal(&local_heap,
+													 distance_value,
+													 blk->tids[i].block_number,
+													 blk->tids[i].offset_number,
+													 TQ_CANDIDATE_HEAP_METRICS_LOCAL))
+					return false;
+			}
+
+			tq_scan_stats_record_block_local_selection(blk->count, blk->count);
+		}
+	}
+	else if (tq_batch_page_next_live_lane(page, page_size, -1, &lane, errmsg, errmsg_len))
+	{
+		/*
+		 * For SoA pages in the per-lane fallback, we reconstruct packed
+		 * codes from nibbles + gamma so existing scoring functions work.
+		 */
+		bool		page_is_soa = tq_batch_page_is_soa(page, page_size);
+		const uint8_t *soa_nibbles_ptr = NULL;
+		const float *soa_gammas_ptr = NULL;
+		uint32_t	soa_dim = 0;
+		uint16_t	soa_lane_count = 0;
+		uint8_t	   *reconstructed_code = NULL;
+
+		if (page_is_soa)
+		{
+			TqProdPackedLayout layout;
+
+			memset(&layout, 0, sizeof(layout));
+			if (!tq_prod_packed_layout(config, &layout, errmsg, errmsg_len))
+				return false;
+
+			if (!tq_batch_page_get_nibble_ptr(page, page_size, &soa_nibbles_ptr,
+											  &soa_dim, &soa_lane_count,
+											  errmsg, errmsg_len))
+				return false;
+			if (!tq_batch_page_get_gamma_ptr(page, page_size, &soa_gammas_ptr,
+											 errmsg, errmsg_len))
+				return false;
+
+			reconstructed_code = (uint8_t *) malloc(layout.total_bytes);
+			if (reconstructed_code == NULL)
+			{
+				tq_set_error(errmsg, errmsg_len,
+							 "invalid turboquant scan: out of memory for SoA code reconstruction");
+				return false;
+			}
+		}
+
 		do
 		{
 			TqTid		tid;
@@ -1439,10 +2093,55 @@ tq_batch_page_scan_prod_with_scratch(const void *page,
 
 			memset(&tid, 0, sizeof(tid));
 			if (!tq_batch_page_get_tid(page, page_size, lane, &tid, errmsg, errmsg_len))
+			{
+				free(reconstructed_code);
 				return false;
+			}
 
-			if (!tq_batch_page_code_view(page, page_size, lane, &code, &code_len, errmsg, errmsg_len))
-				return false;
+			if (page_is_soa)
+			{
+				TqProdPackedLayout layout;
+				uint8_t	   *lane_nibbles;
+				uint32_t	d;
+
+				memset(&layout, 0, sizeof(layout));
+				if (!tq_prod_packed_layout(config, &layout, errmsg, errmsg_len))
+				{
+					free(reconstructed_code);
+					return false;
+				}
+
+				lane_nibbles = (uint8_t *) malloc(soa_dim);
+				if (lane_nibbles == NULL)
+				{
+					free(reconstructed_code);
+					tq_set_error(errmsg, errmsg_len,
+								 "invalid turboquant scan: out of memory for SoA nibble extraction");
+					return false;
+				}
+				for (d = 0; d < soa_dim; d++)
+					lane_nibbles[d] = soa_nibbles_ptr[(size_t) d * soa_lane_count + lane];
+
+				if (!tq_prod_nibbles_gamma_to_packed(config, lane_nibbles, soa_dim,
+													 soa_gammas_ptr[lane],
+													 reconstructed_code, layout.total_bytes,
+													 errmsg, errmsg_len))
+				{
+					free(lane_nibbles);
+					free(reconstructed_code);
+					return false;
+				}
+				free(lane_nibbles);
+
+				code = reconstructed_code;
+				code_len = layout.total_bytes;
+			}
+			else
+			{
+				if (!tq_batch_page_code_view(page, page_size, lane, &code, &code_len, errmsg, errmsg_len))
+					return false;
+			}
+
 			scratch->code_view_uses += 1;
 			tq_scan_stats_record_code_view_uses(1);
 
@@ -1454,7 +2153,10 @@ tq_batch_page_scan_prod_with_scratch(const void *page,
 				if (!tq_prod_score_code_from_lut_dispatch(config, lut, code, code_len,
 														  tq_prod_code_domain_preferred_kernel(config),
 														  &ip_score, &used_kernel, errmsg, errmsg_len))
+				{
+					free(reconstructed_code);
 					return false;
+				}
 
 				tq_scan_stats_set_score_kernel(used_kernel);
 				tq_scan_stats_record_code_visit(false);
@@ -1464,13 +2166,19 @@ tq_batch_page_scan_prod_with_scratch(const void *page,
 													  &distance_value,
 													  errmsg,
 													  errmsg_len))
+				{
+					free(reconstructed_code);
 					return false;
+				}
 
 				if (use_shadow_decode)
 				{
 					if (!tq_prod_decode(config, code, code_len, decoded, query_len,
 										 errmsg, errmsg_len))
+					{
+						free(reconstructed_code);
 						return false;
+					}
 
 					tq_scan_stats_record_shadow_decoded_vector();
 
@@ -1488,12 +2196,18 @@ tq_batch_page_scan_prod_with_scratch(const void *page,
 															 tid.block_number,
 															 tid.offset_number,
 															 TQ_CANDIDATE_HEAP_METRICS_NONE))
+					{
+						free(reconstructed_code);
 						return false;
+					}
 				}
 			}
 			else if (!tq_prod_decode(config, code, code_len, decoded, query_len,
 									 errmsg, errmsg_len))
+			{
+				free(reconstructed_code);
 				return false;
+			}
 			else
 			{
 				tq_scan_stats_record_code_visit(true);
@@ -1507,7 +2221,10 @@ tq_batch_page_scan_prod_with_scratch(const void *page,
 															&distance_value,
 															errmsg,
 															errmsg_len))
+				{
+					free(reconstructed_code);
 					return false;
+				}
 			}
 
 			if (!tq_candidate_heap_push_internal(&local_heap,
@@ -1515,10 +2232,16 @@ tq_batch_page_scan_prod_with_scratch(const void *page,
 												 tid.block_number,
 												 tid.offset_number,
 												 TQ_CANDIDATE_HEAP_METRICS_LOCAL))
+			{
+				free(reconstructed_code);
 				return false;
+			}
 		} while (tq_batch_page_next_live_lane(page, page_size, (int) lane, &lane, errmsg, errmsg_len));
+
+		free(reconstructed_code);
 	}
 
+merge_and_return:
 	if (!tq_candidate_heap_merge_into_global(heap, &local_heap))
 	{
 		tq_set_error(errmsg, errmsg_len,
@@ -1641,6 +2364,38 @@ tq_batch_page_rescore_prod_candidates_with_scratch(const void *page,
 
 	if (tq_batch_page_next_live_lane(page, page_size, -1, &lane, errmsg, errmsg_len))
 	{
+		bool		page_is_soa = tq_batch_page_is_soa(page, page_size);
+		const uint8_t *soa_nibbles_ptr = NULL;
+		const float *soa_gammas_ptr = NULL;
+		uint32_t	soa_dim = 0;
+		uint16_t	soa_lane_count = 0;
+		uint8_t	   *reconstructed_code = NULL;
+
+		if (page_is_soa)
+		{
+			TqProdPackedLayout layout;
+
+			memset(&layout, 0, sizeof(layout));
+			if (!tq_prod_packed_layout(config, &layout, errmsg, errmsg_len))
+				return false;
+
+			if (!tq_batch_page_get_nibble_ptr(page, page_size, &soa_nibbles_ptr,
+											  &soa_dim, &soa_lane_count,
+											  errmsg, errmsg_len))
+				return false;
+			if (!tq_batch_page_get_gamma_ptr(page, page_size, &soa_gammas_ptr,
+											 errmsg, errmsg_len))
+				return false;
+
+			reconstructed_code = (uint8_t *) malloc(layout.total_bytes);
+			if (reconstructed_code == NULL)
+			{
+				tq_set_error(errmsg, errmsg_len,
+							 "invalid turboquant scan: out of memory for SoA rescore code reconstruction");
+				return false;
+			}
+		}
+
 		do
 		{
 			TqTid tid;
@@ -1648,18 +2403,66 @@ tq_batch_page_rescore_prod_candidates_with_scratch(const void *page,
 
 			memset(&tid, 0, sizeof(tid));
 			if (!tq_batch_page_get_tid(page, page_size, lane, &tid, errmsg, errmsg_len))
+			{
+				free(reconstructed_code);
 				return false;
+			}
 
 			if (!tq_candidate_tid_is_selected(candidate_tids, candidate_tid_count, &tid))
 				continue;
 
-			if (!tq_batch_page_code_view(page, page_size, lane, &code, &code_len, errmsg, errmsg_len))
-				return false;
+			if (page_is_soa)
+			{
+				TqProdPackedLayout layout;
+				uint8_t	   *lane_nibbles;
+				uint32_t	d;
+
+				memset(&layout, 0, sizeof(layout));
+				if (!tq_prod_packed_layout(config, &layout, errmsg, errmsg_len))
+				{
+					free(reconstructed_code);
+					return false;
+				}
+
+				lane_nibbles = (uint8_t *) malloc(soa_dim);
+				if (lane_nibbles == NULL)
+				{
+					free(reconstructed_code);
+					tq_set_error(errmsg, errmsg_len,
+								 "invalid turboquant scan: out of memory for SoA rescore nibble extraction");
+					return false;
+				}
+				for (d = 0; d < soa_dim; d++)
+					lane_nibbles[d] = soa_nibbles_ptr[(size_t) d * soa_lane_count + lane];
+
+				if (!tq_prod_nibbles_gamma_to_packed(config, lane_nibbles, soa_dim,
+													 soa_gammas_ptr[lane],
+													 reconstructed_code, layout.total_bytes,
+													 errmsg, errmsg_len))
+				{
+					free(lane_nibbles);
+					free(reconstructed_code);
+					return false;
+				}
+				free(lane_nibbles);
+
+				code = reconstructed_code;
+				code_len = layout.total_bytes;
+			}
+			else
+			{
+				if (!tq_batch_page_code_view(page, page_size, lane, &code, &code_len, errmsg, errmsg_len))
+					return false;
+			}
+
 			scratch->code_view_uses += 1;
 			tq_scan_stats_record_code_view_uses(1);
 
 			if (!tq_prod_decode(config, code, code_len, decoded, query_len, errmsg, errmsg_len))
+			{
+				free(reconstructed_code);
 				return false;
+			}
 
 			tq_scan_stats_record_decoded_vector_only();
 
@@ -1676,8 +2479,13 @@ tq_batch_page_rescore_prod_candidates_with_scratch(const void *page,
 											 distance_value,
 											 tid.block_number,
 											 tid.offset_number))
+			{
+				free(reconstructed_code);
 				return false;
+			}
 		} while (tq_batch_page_next_live_lane(page, page_size, (int) lane, &lane, errmsg, errmsg_len));
+
+		free(reconstructed_code);
 	}
 
 	return true;

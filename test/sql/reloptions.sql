@@ -1,5 +1,7 @@
+SET client_min_messages = warning;
 DROP EXTENSION IF EXISTS pg_turboquant CASCADE;
 DROP EXTENSION IF EXISTS vector CASCADE;
+RESET client_min_messages;
 CREATE EXTENSION vector;
 CREATE EXTENSION pg_turboquant;
 

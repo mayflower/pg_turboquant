@@ -87,6 +87,21 @@ typedef struct TqWalBatchAppendArgs
 	uint16_t   *lane_index;
 } TqWalBatchAppendArgs;
 
+typedef struct TqWalBatchSoaAppendArgs
+{
+	const TqTid *tid;
+	const uint8_t *nibbles;
+	uint32_t	dimension;
+	float		gamma;
+	uint16_t   *lane_index;
+} TqWalBatchSoaAppendArgs;
+
+typedef struct TqWalBatchRepCodeArgs
+{
+	const uint8_t *code;
+	size_t		code_len;
+} TqWalBatchRepCodeArgs;
+
 typedef struct TqWalBatchDeadArgs
 {
 	uint16_t	lane_index;
@@ -361,6 +376,38 @@ tq_wal_mutate_batch_append(Page page, void *arg, char *errmsg, size_t errmsg_len
 }
 
 static bool
+tq_wal_mutate_batch_soa_append(Page page, void *arg, char *errmsg, size_t errmsg_len)
+{
+	const TqWalBatchSoaAppendArgs *args = (const TqWalBatchSoaAppendArgs *) arg;
+	uint16_t	lane_index = 0;
+
+	if (!tq_batch_page_append_lane(tq_wal_payload(page), tq_wal_payload_size(page),
+								   args->tid, &lane_index, errmsg, errmsg_len)
+		|| !tq_batch_page_set_nibble_and_gamma(tq_wal_payload(page), tq_wal_payload_size(page),
+											   lane_index, args->nibbles, args->dimension,
+											   args->gamma, errmsg, errmsg_len))
+		return false;
+
+	if (args->lane_index != NULL)
+		*args->lane_index = lane_index;
+
+	return tq_wal_sync_page_bounds(page, errmsg, errmsg_len);
+}
+
+static bool
+tq_wal_mutate_batch_representative_code(Page page, void *arg, char *errmsg, size_t errmsg_len)
+{
+	const TqWalBatchRepCodeArgs *args = (const TqWalBatchRepCodeArgs *) arg;
+
+	if (!tq_batch_page_set_representative_code(tq_wal_payload(page), tq_wal_payload_size(page),
+											   args->code, args->code_len,
+											   errmsg, errmsg_len))
+		return false;
+
+	return tq_wal_sync_page_bounds(page, errmsg, errmsg_len);
+}
+
+static bool
 tq_wal_mutate_batch_summary(Page page, void *arg, char *errmsg, size_t errmsg_len)
 {
 	const TqWalBatchSummaryArgs *args = (const TqWalBatchSummaryArgs *) arg;
@@ -594,6 +641,46 @@ tq_wal_append_batch_code(Relation relation,
 	args.lane_index = lane_index;
 	return tq_wal_apply(relation, buffer, 0,
 						tq_wal_mutate_batch_append, &args, errmsg, errmsg_len);
+}
+
+bool
+tq_wal_append_batch_soa(Relation relation,
+						 Buffer buffer,
+						 const TqTid *tid,
+						 const uint8_t *nibbles,
+						 uint32_t dimension,
+						 float gamma,
+						 uint16_t *lane_index,
+						 char *errmsg,
+						 size_t errmsg_len)
+{
+	TqWalBatchSoaAppendArgs args;
+
+	memset(&args, 0, sizeof(args));
+	args.tid = tid;
+	args.nibbles = nibbles;
+	args.dimension = dimension;
+	args.gamma = gamma;
+	args.lane_index = lane_index;
+	return tq_wal_apply(relation, buffer, 0,
+						tq_wal_mutate_batch_soa_append, &args, errmsg, errmsg_len);
+}
+
+bool
+tq_wal_set_batch_representative_code(Relation relation,
+									  Buffer buffer,
+									  const uint8_t *code,
+									  size_t code_len,
+									  char *errmsg,
+									  size_t errmsg_len)
+{
+	TqWalBatchRepCodeArgs args;
+
+	memset(&args, 0, sizeof(args));
+	args.code = code;
+	args.code_len = code_len;
+	return tq_wal_apply(relation, buffer, 0,
+						tq_wal_mutate_batch_representative_code, &args, errmsg, errmsg_len);
 }
 
 bool

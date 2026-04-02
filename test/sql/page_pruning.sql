@@ -6,7 +6,7 @@ CREATE EXTENSION pg_turboquant;
 
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET turboquant.probes = 3;
+SET turboquant.probes = 1;
 SET turboquant.oversample_factor = 1;
 
 CREATE FUNCTION tq_vec64(a float8, b float8)

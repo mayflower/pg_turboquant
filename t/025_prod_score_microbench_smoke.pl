@@ -24,6 +24,14 @@ ok(exists $payload->{simd}, 'microbenchmark payload reports simd metadata');
 ok(exists $payload->{results}, 'microbenchmark payload reports result rows');
 cmp_ok(scalar @{$payload->{results}}, '>=', 2, 'microbenchmark payload contains multiple result rows');
 
+for my $row (@{$payload->{results}})
+{
+	ok(exists $row->{lookup_style}, "result row '$row->{benchmark}' reports lookup_style");
+	ok(exists $row->{block_width}, "result row '$row->{benchmark}' reports block_width");
+	ok(exists $row->{qjl_path}, "result row '$row->{benchmark}' reports qjl_path");
+	ok(exists $row->{gamma_path}, "result row '$row->{benchmark}' reports gamma_path");
+}
+
 my %kernels = map { $_->{kernel} => 1 } @{$payload->{results}};
 ok($kernels{scalar}, 'microbenchmark payload includes scalar kernel timing');
 ok($kernels{avx2} || $kernels{neon} || $kernels{scalar}, 'microbenchmark payload reports an available execution kernel');
@@ -31,6 +39,48 @@ ok($kernels{avx2} || $kernels{neon} || $kernels{scalar}, 'microbenchmark payload
 my ($page_scan) = grep { $_->{benchmark} eq 'page_scan' } @{$payload->{results}};
 my ($router_full_sort) = grep { $_->{benchmark} eq 'router_top_probes_full_sort' } @{$payload->{results}};
 my ($router_partial) = grep { $_->{benchmark} eq 'router_top_probes_partial' } @{$payload->{results}};
+my ($lut16_reference) = grep { $_->{benchmark} eq 'score_lut16_reference' } @{$payload->{results}};
+ok(defined $lut16_reference, 'microbenchmark payload includes lut16 reference timing');
+is($lut16_reference->{lookup_style}, 'lut16_scalar',
+   'lut16 reference row reports lut16_scalar lookup style');
+is($lut16_reference->{block_width}, 1, 'lut16 reference row reports block_width of 1');
+is($lut16_reference->{gamma_path}, 'float32_scalar',
+   'lut16 reference row reports float32_scalar gamma path');
+
+my ($lut16_dispatch) = grep { $_->{benchmark} eq 'score_lut16_dispatch' } @{$payload->{results}};
+ok(defined $lut16_dispatch, 'microbenchmark payload includes lut16 dispatch timing');
+ok($lut16_dispatch->{lookup_style} =~ /^lut16_/,
+   'lut16 dispatch row reports a lut16 lookup style');
+ok($lut16_dispatch->{kernel} eq 'scalar' || $lut16_dispatch->{kernel} eq 'avx2' || $lut16_dispatch->{kernel} eq 'neon',
+   'lut16 dispatch row reports a valid kernel');
+
+my ($lut16_quantized_fused) = grep { $_->{benchmark} eq 'score_lut16_quantized_fused' } @{$payload->{results}};
+ok(defined $lut16_quantized_fused, 'microbenchmark payload includes lut16 quantized fused timing');
+is($lut16_quantized_fused->{qjl_path}, 'lut16_quantized',
+   'quantized fused row reports lut16_quantized qjl path');
+is($lut16_quantized_fused->{qjl_lut_mode}, 'quantized',
+   'quantized fused row reports quantized qjl lut mode');
+
+my ($transpose_only) = grep { $_->{benchmark} eq 'page_transpose_only' } @{$payload->{results}};
+my ($transpose_block16) = grep { $_->{benchmark} eq 'page_transpose_block16_scalar' } @{$payload->{results}};
+ok(defined $transpose_only, 'microbenchmark payload includes page-transpose-only timing');
+ok(defined $transpose_block16, 'microbenchmark payload includes page-transpose+block16 timing');
+is($transpose_only->{scan_layout}, 'scratch_transposed_block16',
+   'transpose-only row reports scratch_transposed_block16 layout');
+is($transpose_block16->{scan_layout}, 'scratch_transposed_block16',
+   'transpose+block16 row reports scratch_transposed_block16 layout');
+is($transpose_block16->{lookup_style}, 'lut16_scalar',
+   'transpose+block16 row reports lut16_scalar lookup style');
+cmp_ok($transpose_block16->{block_width}, '>', 0,
+       'transpose+block16 row reports positive block width');
+
+my ($block16_topm) = grep { $_->{benchmark} eq 'page_transpose_block16_topm' } @{$payload->{results}};
+ok(defined $block16_topm, 'microbenchmark payload includes block16+topM timing');
+cmp_ok($block16_topm->{candidate_heap_reject_count}, '>', 0,
+       'block16+topM row shows rejected candidates from block-local selection');
+cmp_ok($block16_topm->{candidate_heap_insert_count}, '<', $block16_topm->{visited_code_count},
+       'block16+topM row reduces heap inserts below visited code count');
+
 my ($avx2_requested) = grep {
 	$_->{benchmark} eq 'score_code_from_lut'
 	&& exists $_->{requested_kernel}
@@ -57,6 +107,10 @@ ok(exists $page_scan->{local_candidate_heap_reject_count}, 'page-scan row report
 ok(exists $page_scan->{local_candidate_merge_count}, 'page-scan row reports local candidate merge count');
 ok(exists $page_scan->{qjl_lut_mode}, 'page-scan row reports qjl lut mode');
 ok(exists $page_scan->{scan_layout}, 'page-scan row reports scan layout');
+ok(exists $page_scan->{lookup_style}, 'page-scan row reports lookup style');
+ok(exists $page_scan->{block_width}, 'page-scan row reports block width');
+ok(exists $page_scan->{qjl_path}, 'page-scan row reports qjl path');
+ok(exists $page_scan->{gamma_path}, 'page-scan row reports gamma path');
 ok(exists $page_scan->{codes_per_second}, 'page-scan row reports code throughput');
 ok(exists $page_scan->{pages_per_second}, 'page-scan row reports page throughput');
 ok(exists $page_scan->{scratch_allocations}, 'page-scan row reports scratch allocations');
@@ -103,6 +157,13 @@ ok($page_scan->{qjl_lut_mode} eq 'float' || $page_scan->{qjl_lut_mode} eq 'quant
    'page-scan row reports float or quantized qjl lut mode');
 is($page_scan->{scan_layout}, 'row_major',
    'page-scan row reports the row-major baseline layout');
+ok($page_scan->{lookup_style} eq 'scalar_loop' || $page_scan->{lookup_style} eq 'float_gather',
+   'page-scan row reports scalar_loop or float_gather lookup style');
+is($page_scan->{block_width}, 1, 'page-scan row reports block_width of 1');
+ok($page_scan->{qjl_path} eq 'float' || $page_scan->{qjl_path} eq 'int16_quantized',
+   'page-scan row reports float or int16_quantized qjl path');
+is($page_scan->{gamma_path}, 'float32_scalar',
+   'page-scan row reports float32_scalar gamma path');
 is($avx2_requested->{requested_kernel}, 'avx2', 'explicit avx2 row records avx2 as the requested kernel');
 ok($avx2_requested->{kernel} eq 'scalar' || $avx2_requested->{kernel} eq 'avx2',
    'explicit avx2 row reports scalar fallback or avx2 execution');
@@ -119,5 +180,35 @@ ok($neon_requested->{qjl_lut_mode} eq 'float' || $neon_requested->{qjl_lut_mode}
 is($neon_requested->{requested_kernel_honored} ? JSON::PP::true : JSON::PP::false,
    $neon_requested->{kernel} eq 'neon' ? JSON::PP::true : JSON::PP::false,
    'explicit neon row truthfully reports whether neon actually ran');
+
+# Gate validation
+ok(exists $payload->{gates}, 'microbenchmark payload includes gates section');
+cmp_ok(scalar @{$payload->{gates}}, '>=', 1, 'microbenchmark payload contains at least one gate');
+
+for my $gate (@{$payload->{gates}})
+{
+	ok(exists $gate->{gate}, "gate entry has a gate name");
+	ok(exists $gate->{passed}, "gate '$gate->{gate}' has a passed field");
+	ok(exists $gate->{reason}, "gate '$gate->{gate}' has a reason field");
+
+	# All gates must pass — fail the TAP test if any gate reports failure
+	ok($gate->{passed}, "gate '$gate->{gate}' passed: $gate->{reason}");
+}
+
+# Architecture-aware: on supported hosts, lut16_dispatch must not silently fall back
+my ($dispatch_gate) = grep { $_->{gate} eq 'lut16_dispatch_kernel_selection' } @{$payload->{gates}};
+if (defined $dispatch_gate)
+{
+	if ($dispatch_gate->{simd_available})
+	{
+		isnt($dispatch_gate->{selected_kernel}, 'scalar',
+			 'supported host does not silently fall back to scalar for lut16 dispatch');
+	}
+	else
+	{
+		is($dispatch_gate->{selected_kernel}, 'scalar',
+		   'unsupported host correctly uses scalar fallback for lut16 dispatch');
+	}
+}
 
 done_testing();

@@ -142,6 +142,35 @@ test_near_exhaustive_scan_requires_nonzero_totals(void)
 }
 
 static void
+test_near_exhaustive_crossover_boundary_at_seventy_percent(void)
+{
+	/* Exact 70% boundary: (7*100 + 9) / 10 = 70 → selected >= 70 triggers */
+	assert(tq_should_use_near_exhaustive_scan(70, 100, 0, 100));
+	assert(!tq_should_use_near_exhaustive_scan(69, 100, 0, 100));
+
+	/* Either dimension can trigger independently */
+	assert(tq_should_use_near_exhaustive_scan(1, 100, 70, 100));
+	assert(!tq_should_use_near_exhaustive_scan(1, 100, 69, 100));
+
+	/* Both below threshold → no crossover */
+	assert(!tq_should_use_near_exhaustive_scan(69, 100, 69, 100));
+
+	/* Both above threshold → crossover */
+	assert(tq_should_use_near_exhaustive_scan(80, 100, 80, 100));
+
+	/* 100% selected always triggers */
+	assert(tq_should_use_near_exhaustive_scan(100, 100, 100, 100));
+	assert(tq_should_use_near_exhaustive_scan(10, 10, 5, 10));
+
+	/* Small totals: exact boundary check */
+	assert(tq_should_use_near_exhaustive_scan(7, 10, 0, 10));
+	assert(!tq_should_use_near_exhaustive_scan(6, 10, 0, 10));
+
+	/* Single item total */
+	assert(tq_should_use_near_exhaustive_scan(1, 1, 0, 1));
+}
+
+static void
 test_cost_aware_selector_prefers_cheaper_combo_under_budget(void)
 {
 	double scores[] = {100.0, 99.6, 99.5, 99.4};
@@ -251,5 +280,6 @@ main(void)
 	test_cost_aware_selector_prefers_cheaper_combo_under_budget();
 	test_cost_aware_selector_keeps_closest_centroids_without_budget();
 	test_cost_aware_selector_is_deterministic_for_equal_scores_and_costs();
+	test_near_exhaustive_crossover_boundary_at_seventy_percent();
 	return 0;
 }

@@ -1290,3 +1290,467 @@ tq_prod_decode_counter_get(void)
 {
 	return tq_prod_decode_counter;
 }
+
+bool
+tq_prod_lut16_is_supported(const TqProdCodecConfig *config,
+							char *errmsg,
+							size_t errmsg_len)
+{
+	if (config == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid tq_prod lut16: config must be non-null");
+		return false;
+	}
+
+	if (config->bits != 4)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "tq_prod lut16 requires bits=4");
+		return false;
+	}
+
+	if (config->dimension == 0 || config->dimension % 8 != 0)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "tq_prod lut16 requires dimension divisible by 8");
+		return false;
+	}
+
+	if (tq_prod_qjl_dimension(config) != config->dimension)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "tq_prod lut16 requires qjl_dimension == dimension");
+		return false;
+	}
+
+	return true;
+}
+
+bool
+tq_prod_lut16_build(const TqProdCodecConfig *config,
+					const TqProdLut *lut,
+					TqProdLut16 *lut16,
+					char *errmsg,
+					size_t errmsg_len)
+{
+	uint32_t	dim = 0;
+	uint32_t	nibble = 0;
+	size_t		table_size = 0;
+
+	if (lut == NULL || lut16 == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid tq_prod lut16: lut and lut16 must be non-null");
+		return false;
+	}
+
+	if (!tq_prod_lut16_is_supported(config, errmsg, errmsg_len))
+		return false;
+
+	if (lut->dimension != config->dimension
+		|| lut->level_count != tq_prod_idx_levels(config)
+		|| lut->values == NULL
+		|| lut->qjl_values == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid tq_prod lut16: lut shape does not match codec config");
+		return false;
+	}
+
+	tq_prod_lut16_reset(lut16);
+
+	table_size = (size_t) config->dimension * 16u;
+	lut16->base_values = (float *) malloc(sizeof(float) * table_size);
+	lut16->qjl_values = (float *) malloc(sizeof(float) * table_size);
+	if (lut16->base_values == NULL || lut16->qjl_values == NULL)
+	{
+		tq_prod_lut16_reset(lut16);
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid tq_prod lut16: out of memory");
+		return false;
+	}
+
+	lut16->dimension = config->dimension;
+
+	for (dim = 0; dim < config->dimension; dim++)
+	{
+		for (nibble = 0; nibble < 16u; nibble++)
+		{
+			uint32_t	idx_code = nibble & 0x7u;
+			uint32_t	sign_bit = (nibble >> 3u) & 0x1u;
+			size_t		src_index = ((size_t) dim * (size_t) lut->level_count) + (size_t) idx_code;
+			size_t		dst_index = (size_t) dim * 16u + (size_t) nibble;
+			float		sign = sign_bit ? 1.0f : -1.0f;
+
+			lut16->base_values[dst_index] = lut->values[src_index];
+			lut16->qjl_values[dst_index] = sign * lut->qjl_values[dim];
+		}
+	}
+
+	return true;
+}
+
+void
+tq_prod_lut16_reset(TqProdLut16 *lut16)
+{
+	if (lut16 == NULL)
+		return;
+
+	free(lut16->base_values);
+	free(lut16->qjl_values);
+	free(lut16->base_quantized);
+	free(lut16->qjl_quantized);
+	memset(lut16, 0, sizeof(*lut16));
+}
+
+/*
+ * Quantize a float table to int8 using a single global scale.
+ * The scale maps the global max absolute value to 127.
+ */
+static void
+tq_quantize_float_table_to_int8_global(const float *src, int8_t *dst,
+									   float *global_scale, size_t count)
+{
+	float		max_abs = 0.0f;
+	float		s = 1.0f;
+	size_t		i = 0;
+
+	for (i = 0; i < count; i++)
+	{
+		float magnitude = fabsf(src[i]);
+
+		if (magnitude > max_abs)
+			max_abs = magnitude;
+	}
+
+	if (max_abs > 0.0f)
+		s = max_abs / 127.0f;
+
+	for (i = 0; i < count; i++)
+	{
+		long quantized = lroundf(src[i] / s);
+
+		if (quantized > 127)
+			quantized = 127;
+		if (quantized < -127)
+			quantized = -127;
+		dst[i] = (int8_t) quantized;
+	}
+
+	*global_scale = s;
+}
+
+bool
+tq_prod_lut16_quantize(TqProdLut16 *lut16,
+						char *errmsg,
+						size_t errmsg_len)
+{
+	size_t		table_size = 0;
+
+	if (lut16 == NULL || lut16->dimension == 0
+		|| lut16->base_values == NULL || lut16->qjl_values == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid tq_prod lut16 quantize: lut16 not initialized");
+		return false;
+	}
+
+	free(lut16->base_quantized);
+	free(lut16->qjl_quantized);
+	lut16->base_quantized = NULL;
+	lut16->qjl_quantized = NULL;
+	lut16->base_global_scale = 0.0f;
+	lut16->qjl_global_scale = 0.0f;
+	lut16->quantized_ready = false;
+
+	table_size = (size_t) lut16->dimension * 16u;
+	lut16->base_quantized = (int8_t *) malloc(sizeof(int8_t) * table_size);
+	lut16->qjl_quantized = (int8_t *) malloc(sizeof(int8_t) * table_size);
+
+	if (lut16->base_quantized == NULL || lut16->qjl_quantized == NULL)
+	{
+		free(lut16->base_quantized);
+		free(lut16->qjl_quantized);
+		lut16->base_quantized = NULL;
+		lut16->qjl_quantized = NULL;
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid tq_prod lut16 quantize: out of memory");
+		return false;
+	}
+
+	tq_quantize_float_table_to_int8_global(lut16->base_values,
+										   lut16->base_quantized,
+										   &lut16->base_global_scale,
+										   table_size);
+	tq_quantize_float_table_to_int8_global(lut16->qjl_values,
+										   lut16->qjl_quantized,
+										   &lut16->qjl_global_scale,
+										   table_size);
+
+	lut16->quantized_ready = true;
+	return true;
+}
+
+static bool
+tq_prod_validate_nibbles(const uint8_t *nibbles,
+						 uint32_t candidate_count,
+						 uint32_t dimension,
+						 char *errmsg,
+						 size_t errmsg_len)
+{
+	uint32_t	d = 0;
+	uint32_t	c = 0;
+
+	for (d = 0; d < dimension; d++)
+	{
+		for (c = 0; c < candidate_count; c++)
+		{
+			if (nibbles[(size_t) d * 16u + (size_t) c] >= 16u)
+			{
+				tq_set_error(errmsg, errmsg_len,
+							 "invalid tq_prod block16 scorer: nibble value out of range");
+				return false;
+			}
+		}
+	}
+
+	return true;
+}
+
+bool
+tq_prod_score_block16_quantized_scalar(const TqProdLut16 *lut16,
+									   const uint8_t *nibbles,
+									   const float *gammas,
+									   uint32_t candidate_count,
+									   float *scores,
+									   char *errmsg,
+									   size_t errmsg_len)
+{
+	uint32_t	c = 0;
+	uint32_t	dim = 0;
+
+	if (lut16 == NULL || nibbles == NULL || gammas == NULL || scores == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid tq_prod quantized block16 scorer: all inputs must be non-null");
+		return false;
+	}
+
+	if (!lut16->quantized_ready || lut16->base_quantized == NULL || lut16->qjl_quantized == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid tq_prod quantized block16 scorer: quantized lut16 not ready");
+		return false;
+	}
+
+	if (candidate_count == 0 || candidate_count > 16u)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid tq_prod quantized block16 scorer: candidate_count must be 1..16");
+		return false;
+	}
+
+	if (!tq_prod_validate_nibbles(nibbles, candidate_count, lut16->dimension, errmsg, errmsg_len))
+		return false;
+
+	{
+		int32_t	base_sums[16];
+		int32_t	qjl_sums[16];
+
+		for (c = 0; c < candidate_count; c++)
+		{
+			base_sums[c] = 0;
+			qjl_sums[c] = 0;
+		}
+
+		for (dim = 0; dim < lut16->dimension; dim++)
+		{
+			const int8_t *base_row = lut16->base_quantized + (size_t) dim * 16u;
+			const int8_t *qjl_row = lut16->qjl_quantized + (size_t) dim * 16u;
+
+			for (c = 0; c < candidate_count; c++)
+			{
+				uint8_t		nib = nibbles[(size_t) dim * 16u + (size_t) c];
+
+				base_sums[c] += (int32_t) base_row[nib];
+				qjl_sums[c] += (int32_t) qjl_row[nib];
+			}
+		}
+
+		for (c = 0; c < candidate_count; c++)
+			scores[c] = (float) base_sums[c] * lut16->base_global_scale
+					   + gammas[c] * (float) qjl_sums[c] * lut16->qjl_global_scale;
+	}
+
+	return true;
+}
+
+bool
+tq_prod_extract_nibbles(const TqProdCodecConfig *config,
+						const uint8_t *packed,
+						size_t packed_len,
+						uint8_t *nibbles,
+						size_t nibbles_len,
+						char *errmsg,
+						size_t errmsg_len)
+{
+	TqProdPackedLayout layout;
+	uint32_t	dim = 0;
+	uint32_t	idx_bits = 0;
+	uint32_t	qjl_dimension = 0;
+
+	if (!tq_prod_lut16_is_supported(config, errmsg, errmsg_len))
+		return false;
+
+	memset(&layout, 0, sizeof(layout));
+	if (!tq_prod_packed_layout(config, &layout, errmsg, errmsg_len))
+		return false;
+
+	if (!tq_prod_validate_packed_inputs(&layout, packed, packed_len, errmsg, errmsg_len))
+		return false;
+
+	qjl_dimension = tq_prod_qjl_dimension(config);
+	if (nibbles_len < (size_t) config->dimension)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid tq_prod nibble extraction: buffer too small");
+		return false;
+	}
+
+	idx_bits = tq_prod_idx_bits(config);
+
+	for (dim = 0; dim < config->dimension; dim++)
+	{
+		uint32_t	idx_code = tq_unpack_bits(packed, dim * idx_bits, idx_bits);
+		uint32_t	sign_bit = 0;
+
+		if (dim < qjl_dimension)
+			sign_bit = tq_unpack_bits(packed + layout.idx_bytes, dim, 1u);
+
+		nibbles[dim] = (uint8_t) ((sign_bit << 3u) | idx_code);
+	}
+
+	return true;
+}
+
+bool
+tq_prod_score_block16_scalar(const TqProdLut16 *lut16,
+							 const uint8_t *nibbles,
+							 const float *gammas,
+							 uint32_t candidate_count,
+							 float *scores,
+							 char *errmsg,
+							 size_t errmsg_len)
+{
+	uint32_t	c = 0;
+	uint32_t	dim = 0;
+
+	if (lut16 == NULL || nibbles == NULL || gammas == NULL || scores == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid tq_prod block16 scorer: all inputs must be non-null");
+		return false;
+	}
+
+	if (candidate_count == 0 || candidate_count > 16u)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid tq_prod block16 scorer: candidate_count must be 1..16");
+		return false;
+	}
+
+	if (lut16->dimension == 0 || lut16->base_values == NULL || lut16->qjl_values == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid tq_prod block16 scorer: lut16 not initialized");
+		return false;
+	}
+
+	if (!tq_prod_validate_nibbles(nibbles, candidate_count, lut16->dimension, errmsg, errmsg_len))
+		return false;
+
+	{
+		float	qjl_sums[16];
+
+		for (c = 0; c < candidate_count; c++)
+		{
+			scores[c] = 0.0f;
+			qjl_sums[c] = 0.0f;
+		}
+
+		for (dim = 0; dim < lut16->dimension; dim++)
+		{
+			const float *base_row = lut16->base_values + (size_t) dim * 16u;
+			const float *qjl_row = lut16->qjl_values + (size_t) dim * 16u;
+
+			for (c = 0; c < candidate_count; c++)
+			{
+				uint8_t		nib = nibbles[(size_t) dim * 16u + (size_t) c];
+
+				scores[c] += base_row[nib];
+				qjl_sums[c] += qjl_row[nib];
+			}
+		}
+
+		for (c = 0; c < candidate_count; c++)
+			scores[c] += gammas[c] * qjl_sums[c];
+	}
+
+	return true;
+}
+
+bool
+tq_prod_nibbles_gamma_to_packed(const TqProdCodecConfig *config,
+								const uint8_t *nibbles,
+								uint32_t dimension,
+								float gamma,
+								uint8_t *packed,
+								size_t packed_len,
+								char *errmsg,
+								size_t errmsg_len)
+{
+	TqProdPackedLayout layout;
+	uint32_t	idx_bits = 0;
+	uint32_t	qjl_dimension = 0;
+	uint32_t	dim = 0;
+
+	if (!tq_prod_lut16_is_supported(config, errmsg, errmsg_len))
+		return false;
+
+	memset(&layout, 0, sizeof(layout));
+	if (!tq_prod_packed_layout(config, &layout, errmsg, errmsg_len))
+		return false;
+
+	if (packed_len < layout.total_bytes)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid tq_prod nibble reconstruction: packed buffer too small");
+		return false;
+	}
+
+	if (dimension != config->dimension)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid tq_prod nibble reconstruction: dimension mismatch");
+		return false;
+	}
+
+	memset(packed, 0, packed_len);
+	idx_bits = tq_prod_idx_bits(config);
+	qjl_dimension = tq_prod_qjl_dimension(config);
+
+	for (dim = 0; dim < config->dimension; dim++)
+	{
+		uint32_t	idx_code = (uint32_t) (nibbles[dim] & 0x07u);
+		uint32_t	sign_bit = (uint32_t) ((nibbles[dim] >> 3u) & 0x01u);
+
+		tq_pack_bits(packed, dim * idx_bits, idx_bits, idx_code);
+
+		if (dim < qjl_dimension)
+			tq_pack_bits(packed + layout.idx_bytes, dim, 1u, sign_bit);
+	}
+
+	tq_prod_write_float32(packed + layout.idx_bytes + layout.qjl_bytes, gamma);
+	return true;
+}

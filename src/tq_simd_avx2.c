@@ -407,6 +407,153 @@ tq_prod_score_code_from_lut_avx2_impl(const TqProdCodecConfig *config,
 	}
 	return true;
 }
+
+/*
+ * AVX2 VPSHUFB-based LUT16 block scorer with global-scale int16 accumulation.
+ *
+ * Same algorithm as the NEON kernel: PSHUFB lookup, int16 accumulation
+ * with periodic drain to int32, single float conversion at the end.
+ */
+#ifndef TQ_LUT16_INT16_DRAIN_INTERVAL
+#define TQ_LUT16_INT16_DRAIN_INTERVAL 256u
+#endif
+
+__attribute__((target("avx2")))
+static bool
+tq_prod_score_block16_avx2_impl(const TqProdLut16 *lut16,
+								const uint8_t *nibbles,
+								const float *gammas,
+								uint32_t candidate_count,
+								float *scores,
+								char *errmsg,
+								size_t errmsg_len)
+{
+	uint32_t	dim;
+	uint32_t	c;
+	uint32_t	dimension;
+	uint32_t	dims_since_drain = 0;
+	const int8_t *base_quantized;
+	const int8_t *qjl_quantized;
+
+	/* int32 drain accumulators: __m256i holds 8 int32 values */
+	__m256i		base_acc32_lo;
+	__m256i		base_acc32_hi;
+	__m256i		qjl_acc32_lo;
+	__m256i		qjl_acc32_hi;
+
+	/* int16 running accumulators: __m128i holds 8 int16 values */
+	__m128i		base_acc16_lo;
+	__m128i		base_acc16_hi;
+	__m128i		qjl_acc16_lo;
+	__m128i		qjl_acc16_hi;
+
+	float		base_out[8];
+	float		qjl_out[8];
+
+	if (lut16 == NULL || !lut16->quantized_ready)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid avx2 lut16 block scorer: quantized lut16 not ready");
+		return false;
+	}
+
+	if (lut16->base_quantized == NULL || lut16->qjl_quantized == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid avx2 lut16 block scorer: quantized tables not initialized");
+		return false;
+	}
+
+	if (candidate_count == 0 || candidate_count > 16u)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid avx2 lut16 block scorer: candidate_count must be 1..16");
+		return false;
+	}
+
+	dimension = lut16->dimension;
+	base_quantized = lut16->base_quantized;
+	qjl_quantized = lut16->qjl_quantized;
+
+	base_acc32_lo = _mm256_setzero_si256();
+	base_acc32_hi = _mm256_setzero_si256();
+	qjl_acc32_lo = _mm256_setzero_si256();
+	qjl_acc32_hi = _mm256_setzero_si256();
+	base_acc16_lo = _mm_setzero_si128();
+	base_acc16_hi = _mm_setzero_si128();
+	qjl_acc16_lo = _mm_setzero_si128();
+	qjl_acc16_hi = _mm_setzero_si128();
+
+	for (dim = 0; dim < dimension; dim++)
+	{
+		__m128i		nib_vec;
+		__m128i		base_looked;
+		__m128i		qjl_looked;
+
+		nib_vec = _mm_loadu_si128((const __m128i *) (nibbles + (size_t) dim * 16u));
+
+		base_looked = _mm_shuffle_epi8(
+			_mm_loadu_si128((const __m128i *) (base_quantized + (size_t) dim * 16u)), nib_vec);
+		qjl_looked = _mm_shuffle_epi8(
+			_mm_loadu_si128((const __m128i *) (qjl_quantized + (size_t) dim * 16u)), nib_vec);
+
+		/* Sign-extend int8 -> int16, accumulate in int16 */
+		base_acc16_lo = _mm_add_epi16(base_acc16_lo, _mm_cvtepi8_epi16(base_looked));
+		base_acc16_hi = _mm_add_epi16(base_acc16_hi, _mm_cvtepi8_epi16(_mm_srli_si128(base_looked, 8)));
+		qjl_acc16_lo = _mm_add_epi16(qjl_acc16_lo, _mm_cvtepi8_epi16(qjl_looked));
+		qjl_acc16_hi = _mm_add_epi16(qjl_acc16_hi, _mm_cvtepi8_epi16(_mm_srli_si128(qjl_looked, 8)));
+
+		dims_since_drain++;
+
+		if (dims_since_drain == TQ_LUT16_INT16_DRAIN_INTERVAL)
+		{
+			/* Drain int16 -> int32 */
+			base_acc32_lo = _mm256_add_epi32(base_acc32_lo, _mm256_cvtepi16_epi32(base_acc16_lo));
+			base_acc32_hi = _mm256_add_epi32(base_acc32_hi, _mm256_cvtepi16_epi32(base_acc16_hi));
+			qjl_acc32_lo = _mm256_add_epi32(qjl_acc32_lo, _mm256_cvtepi16_epi32(qjl_acc16_lo));
+			qjl_acc32_hi = _mm256_add_epi32(qjl_acc32_hi, _mm256_cvtepi16_epi32(qjl_acc16_hi));
+
+			base_acc16_lo = _mm_setzero_si128();
+			base_acc16_hi = _mm_setzero_si128();
+			qjl_acc16_lo = _mm_setzero_si128();
+			qjl_acc16_hi = _mm_setzero_si128();
+			dims_since_drain = 0;
+		}
+	}
+
+	/* Final drain */
+	if (dims_since_drain > 0)
+	{
+		base_acc32_lo = _mm256_add_epi32(base_acc32_lo, _mm256_cvtepi16_epi32(base_acc16_lo));
+		base_acc32_hi = _mm256_add_epi32(base_acc32_hi, _mm256_cvtepi16_epi32(base_acc16_hi));
+		qjl_acc32_lo = _mm256_add_epi32(qjl_acc32_lo, _mm256_cvtepi16_epi32(qjl_acc16_lo));
+		qjl_acc32_hi = _mm256_add_epi32(qjl_acc32_hi, _mm256_cvtepi16_epi32(qjl_acc16_hi));
+	}
+
+	/* Single float conversion + global scale */
+	{
+		__m256	bscale = _mm256_set1_ps(lut16->base_global_scale);
+		__m256	qscale = _mm256_set1_ps(lut16->qjl_global_scale);
+
+		_mm256_storeu_ps(base_out, _mm256_mul_ps(_mm256_cvtepi32_ps(base_acc32_lo), bscale));
+		_mm256_storeu_ps(qjl_out, _mm256_mul_ps(_mm256_cvtepi32_ps(qjl_acc32_lo), qscale));
+	}
+	for (c = 0; c < candidate_count && c < 8u; c++)
+		scores[c] = base_out[c] + gammas[c] * qjl_out[c];
+
+	if (candidate_count > 8u)
+	{
+		__m256	bscale = _mm256_set1_ps(lut16->base_global_scale);
+		__m256	qscale = _mm256_set1_ps(lut16->qjl_global_scale);
+
+		_mm256_storeu_ps(base_out, _mm256_mul_ps(_mm256_cvtepi32_ps(base_acc32_hi), bscale));
+		_mm256_storeu_ps(qjl_out, _mm256_mul_ps(_mm256_cvtepi32_ps(qjl_acc32_hi), qscale));
+		for (c = 8u; c < candidate_count; c++)
+			scores[c] = base_out[c - 8u] + gammas[c] * qjl_out[c - 8u];
+	}
+
+	return true;
+}
 #endif
 
 #if TQ_CAN_COMPILE_NEON
@@ -581,6 +728,156 @@ tq_prod_score_code_from_lut_neon_impl(const TqProdCodecConfig *config,
 		}
 		*score = (tq_hsum_neon(base_sum_lo) + tq_hsum_neon(base_sum_hi)) + qjl_contribution;
 	}
+	return true;
+}
+
+/*
+ * NEON TBL-based LUT16 block scorer with global-scale int16 accumulation.
+ *
+ * Nibbles in dimension-major layout: nibbles[d * 16 + c].  For each dim,
+ * loads 16 nibbles + LUT row via vld1q_u8, uses vqtbl1q_u8 for parallel
+ * lookup, and accumulates results in int16 via vaddw_s8 (add-widening).
+ * Drains int16 into int32 every 256 dims to prevent overflow (256 * 127
+ * = 32512 < 32767).  Converts to float and applies the single global
+ * scale only once at the end.
+ */
+#define TQ_LUT16_INT16_DRAIN_INTERVAL 256u
+
+static bool
+tq_prod_score_block16_neon_impl(const TqProdLut16 *lut16,
+								const uint8_t *nibbles,
+								const float *gammas,
+								uint32_t candidate_count,
+								float *scores,
+								char *errmsg,
+								size_t errmsg_len)
+{
+	uint32_t	dim;
+	uint32_t	c;
+	uint32_t	dimension;
+	uint32_t	dims_since_drain = 0;
+	const int8_t *base_quantized;
+	const int8_t *qjl_quantized;
+
+	/* int32 drain accumulators: 4 groups of 4 candidates */
+	int32x4_t	base_acc32[4];
+	int32x4_t	qjl_acc32[4];
+
+	/* int16 running accumulators: 2 halves of 8 candidates */
+	int16x8_t	base_acc16_lo;
+	int16x8_t	base_acc16_hi;
+	int16x8_t	qjl_acc16_lo;
+	int16x8_t	qjl_acc16_hi;
+
+	if (lut16 == NULL || !lut16->quantized_ready)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid neon lut16 block scorer: quantized lut16 not ready");
+		return false;
+	}
+
+	if (lut16->base_quantized == NULL || lut16->qjl_quantized == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid neon lut16 block scorer: quantized tables not initialized");
+		return false;
+	}
+
+	if (candidate_count == 0 || candidate_count > 16u)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid neon lut16 block scorer: candidate_count must be 1..16");
+		return false;
+	}
+
+	dimension = lut16->dimension;
+	base_quantized = lut16->base_quantized;
+	qjl_quantized = lut16->qjl_quantized;
+
+	for (c = 0; c < 4; c++)
+	{
+		base_acc32[c] = vdupq_n_s32(0);
+		qjl_acc32[c] = vdupq_n_s32(0);
+	}
+	base_acc16_lo = vdupq_n_s16(0);
+	base_acc16_hi = vdupq_n_s16(0);
+	qjl_acc16_lo = vdupq_n_s16(0);
+	qjl_acc16_hi = vdupq_n_s16(0);
+
+	for (dim = 0; dim < dimension; dim++)
+	{
+		uint8x16_t	nib_vec;
+		int8x16_t	base_looked;
+		int8x16_t	qjl_looked;
+
+		nib_vec = vld1q_u8(nibbles + (size_t) dim * 16u);
+
+		base_looked = vreinterpretq_s8_u8(vqtbl1q_u8(
+			vld1q_u8((const uint8_t *) (base_quantized + (size_t) dim * 16u)), nib_vec));
+		qjl_looked = vreinterpretq_s8_u8(vqtbl1q_u8(
+			vld1q_u8((const uint8_t *) (qjl_quantized + (size_t) dim * 16u)), nib_vec));
+
+		/* Add-widening: int8 + int16 -> int16 */
+		base_acc16_lo = vaddw_s8(base_acc16_lo, vget_low_s8(base_looked));
+		base_acc16_hi = vaddw_s8(base_acc16_hi, vget_high_s8(base_looked));
+		qjl_acc16_lo = vaddw_s8(qjl_acc16_lo, vget_low_s8(qjl_looked));
+		qjl_acc16_hi = vaddw_s8(qjl_acc16_hi, vget_high_s8(qjl_looked));
+
+		dims_since_drain++;
+
+		if (dims_since_drain == TQ_LUT16_INT16_DRAIN_INTERVAL)
+		{
+			/* Drain int16 -> int32 via add-widening */
+			base_acc32[0] = vaddw_s16(base_acc32[0], vget_low_s16(base_acc16_lo));
+			base_acc32[1] = vaddw_s16(base_acc32[1], vget_high_s16(base_acc16_lo));
+			base_acc32[2] = vaddw_s16(base_acc32[2], vget_low_s16(base_acc16_hi));
+			base_acc32[3] = vaddw_s16(base_acc32[3], vget_high_s16(base_acc16_hi));
+			qjl_acc32[0] = vaddw_s16(qjl_acc32[0], vget_low_s16(qjl_acc16_lo));
+			qjl_acc32[1] = vaddw_s16(qjl_acc32[1], vget_high_s16(qjl_acc16_lo));
+			qjl_acc32[2] = vaddw_s16(qjl_acc32[2], vget_low_s16(qjl_acc16_hi));
+			qjl_acc32[3] = vaddw_s16(qjl_acc32[3], vget_high_s16(qjl_acc16_hi));
+
+			base_acc16_lo = vdupq_n_s16(0);
+			base_acc16_hi = vdupq_n_s16(0);
+			qjl_acc16_lo = vdupq_n_s16(0);
+			qjl_acc16_hi = vdupq_n_s16(0);
+			dims_since_drain = 0;
+		}
+	}
+
+	/* Final drain of remaining int16 -> int32 */
+	if (dims_since_drain > 0)
+	{
+		base_acc32[0] = vaddw_s16(base_acc32[0], vget_low_s16(base_acc16_lo));
+		base_acc32[1] = vaddw_s16(base_acc32[1], vget_high_s16(base_acc16_lo));
+		base_acc32[2] = vaddw_s16(base_acc32[2], vget_low_s16(base_acc16_hi));
+		base_acc32[3] = vaddw_s16(base_acc32[3], vget_high_s16(base_acc16_hi));
+		qjl_acc32[0] = vaddw_s16(qjl_acc32[0], vget_low_s16(qjl_acc16_lo));
+		qjl_acc32[1] = vaddw_s16(qjl_acc32[1], vget_high_s16(qjl_acc16_lo));
+		qjl_acc32[2] = vaddw_s16(qjl_acc32[2], vget_low_s16(qjl_acc16_hi));
+		qjl_acc32[3] = vaddw_s16(qjl_acc32[3], vget_high_s16(qjl_acc16_hi));
+	}
+
+	/* Single float conversion + global scale at the end */
+	for (c = 0; c < 4u; c++)
+	{
+		uint32_t	group_start = c * 4u;
+		uint32_t	i;
+		float		base_out[4];
+		float		qjl_out[4];
+
+		if (group_start >= candidate_count)
+			break;
+
+		vst1q_f32(base_out, vmulq_n_f32(vcvtq_f32_s32(base_acc32[c]),
+										 lut16->base_global_scale));
+		vst1q_f32(qjl_out, vmulq_n_f32(vcvtq_f32_s32(qjl_acc32[c]),
+										lut16->qjl_global_scale));
+
+		for (i = group_start; i < group_start + 4u && i < candidate_count; i++)
+			scores[i] = base_out[i - group_start] + gammas[i] * qjl_out[i - group_start];
+	}
+
 	return true;
 }
 #endif
@@ -872,6 +1169,95 @@ tq_prod_score_kernel_name(TqProdScoreKernel kernel)
 	return "unknown";
 }
 
+const char *
+tq_lookup_style_name(TqLookupStyle style)
+{
+	switch (style)
+	{
+		case TQ_LOOKUP_STYLE_SCALAR_LOOP:
+			return "scalar_loop";
+		case TQ_LOOKUP_STYLE_FLOAT_GATHER:
+			return "float_gather";
+		case TQ_LOOKUP_STYLE_LUT16_SCALAR:
+			return "lut16_scalar";
+		case TQ_LOOKUP_STYLE_LUT16_AVX2:
+			return "lut16_avx2";
+		case TQ_LOOKUP_STYLE_LUT16_NEON:
+			return "lut16_neon";
+		case TQ_LOOKUP_STYLE_LUT16_AVX512:
+			return "lut16_avx512";
+	}
+
+	return "unknown";
+}
+
+const char *
+tq_gamma_path_name(TqGammaPath path)
+{
+	switch (path)
+	{
+		case TQ_GAMMA_PATH_FLOAT32_SCALAR:
+			return "float32_scalar";
+		case TQ_GAMMA_PATH_FLOAT32_VECTOR:
+			return "float32_vector";
+		case TQ_GAMMA_PATH_FP16_VECTOR:
+			return "fp16_vector";
+	}
+
+	return "unknown";
+}
+
+const char *
+tq_qjl_path_name(TqQjlPath path)
+{
+	switch (path)
+	{
+		case TQ_QJL_PATH_FLOAT:
+			return "float";
+		case TQ_QJL_PATH_INT16_QUANTIZED:
+			return "int16_quantized";
+		case TQ_QJL_PATH_LUT16_QUANTIZED:
+			return "lut16_quantized";
+	}
+
+	return "unknown";
+}
+
+TqLookupStyle
+tq_lookup_style_for_kernel(TqProdScoreKernel kernel)
+{
+	switch (kernel)
+	{
+		case TQ_PROD_SCORE_AVX2:
+		case TQ_PROD_SCORE_NEON:
+		case TQ_PROD_SCORE_AVX512:
+			return TQ_LOOKUP_STYLE_FLOAT_GATHER;
+		case TQ_PROD_SCORE_SCALAR:
+		case TQ_PROD_SCORE_AUTO:
+		default:
+			return TQ_LOOKUP_STYLE_SCALAR_LOOP;
+	}
+}
+
+TqQjlPath
+tq_qjl_path_for_kernel(TqProdScoreKernel kernel, bool qjl_quantized)
+{
+	if (!qjl_quantized)
+		return TQ_QJL_PATH_FLOAT;
+
+	switch (kernel)
+	{
+		case TQ_PROD_SCORE_AVX2:
+		case TQ_PROD_SCORE_AVX512:
+		case TQ_PROD_SCORE_NEON:
+			return TQ_QJL_PATH_INT16_QUANTIZED;
+		case TQ_PROD_SCORE_SCALAR:
+		case TQ_PROD_SCORE_AUTO:
+		default:
+			return TQ_QJL_PATH_FLOAT;
+	}
+}
+
 bool
 tq_prod_score_query_dispatch(const TqProdCodecConfig *config,
 							 const float *query,
@@ -1011,4 +1397,83 @@ tq_prod_score_code_from_lut_dispatch(const TqProdCodecConfig *config,
 
 	return tq_prod_score_code_from_lut(config, lut, packed, packed_len,
 									   score, errmsg, errmsg_len);
+}
+
+bool
+tq_prod_score_block16_dispatch(const TqProdLut16 *lut16,
+							   const uint8_t *nibbles,
+							   const float *gammas,
+							   uint32_t candidate_count,
+							   TqProdScoreKernel kernel,
+							   float *scores,
+							   TqProdScoreKernel *used_kernel,
+							   char *errmsg,
+							   size_t errmsg_len)
+{
+	TqProdScoreKernel resolved_kernel = TQ_PROD_SCORE_SCALAR;
+
+	if (lut16 == NULL || nibbles == NULL || gammas == NULL || scores == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid block16 dispatch: all inputs must be non-null");
+		return false;
+	}
+
+	if (kernel == TQ_PROD_SCORE_AUTO)
+	{
+		if (!tq_simd_force_disabled && tq_simd_avx2_runtime_available()
+			&& lut16->quantized_ready)
+			resolved_kernel = TQ_PROD_SCORE_AVX2;
+		else if (!tq_simd_force_disabled && tq_simd_neon_runtime_available()
+				 && lut16->quantized_ready)
+			resolved_kernel = TQ_PROD_SCORE_NEON;
+		else
+			resolved_kernel = TQ_PROD_SCORE_SCALAR;
+	}
+	else if (kernel == TQ_PROD_SCORE_AVX2)
+	{
+		resolved_kernel = (!tq_simd_force_disabled && tq_simd_avx2_runtime_available()
+						   && lut16->quantized_ready)
+			? TQ_PROD_SCORE_AVX2 : TQ_PROD_SCORE_SCALAR;
+	}
+	else if (kernel == TQ_PROD_SCORE_NEON)
+	{
+		resolved_kernel = (!tq_simd_force_disabled && tq_simd_neon_runtime_available()
+						   && lut16->quantized_ready)
+			? TQ_PROD_SCORE_NEON : TQ_PROD_SCORE_SCALAR;
+	}
+	else
+	{
+		resolved_kernel = TQ_PROD_SCORE_SCALAR;
+	}
+
+	if (used_kernel != NULL)
+		*used_kernel = resolved_kernel;
+
+	if (resolved_kernel == TQ_PROD_SCORE_AVX2)
+	{
+#if TQ_CAN_COMPILE_AVX2
+		return tq_prod_score_block16_avx2_impl(lut16, nibbles, gammas, candidate_count,
+											   scores, errmsg, errmsg_len);
+#else
+		resolved_kernel = TQ_PROD_SCORE_SCALAR;
+		if (used_kernel != NULL)
+			*used_kernel = resolved_kernel;
+#endif
+	}
+
+	if (resolved_kernel == TQ_PROD_SCORE_NEON)
+	{
+#if TQ_CAN_COMPILE_NEON
+		return tq_prod_score_block16_neon_impl(lut16, nibbles, gammas, candidate_count,
+											   scores, errmsg, errmsg_len);
+#else
+		resolved_kernel = TQ_PROD_SCORE_SCALAR;
+		if (used_kernel != NULL)
+			*used_kernel = resolved_kernel;
+#endif
+	}
+
+	return tq_prod_score_block16_scalar(lut16, nibbles, gammas, candidate_count,
+										scores, errmsg, errmsg_len);
 }

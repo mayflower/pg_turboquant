@@ -40,6 +40,24 @@ seeded_unit_vector(uint32_t seed, float *values, size_t len)
 	normalize(values, len);
 }
 
+/*
+ * Transpose nibbles from candidate-major (nibbles[c * dim + d]) to
+ * dimension-major (out[d * 16 + c]) layout for block-16 scorers.
+ */
+static void
+transpose_nibbles_to_dim_major(const uint8_t *candidate_major,
+							   uint8_t *dim_major,
+							   uint32_t candidate_count,
+							   uint32_t dimension)
+{
+	uint32_t c, d;
+
+	memset(dim_major, 0, (size_t) dimension * 16u);
+	for (c = 0; c < candidate_count; c++)
+		for (d = 0; d < dimension; d++)
+			dim_major[(size_t) d * 16u + c] = candidate_major[(size_t) c * dimension + d];
+}
+
 static TqProdScoreKernel
 expected_code_domain_kernel(const TqProdCodecConfig *config)
 {
@@ -652,6 +670,290 @@ test_malformed_packed_input_rejected_cleanly(void)
 	tq_prod_lut_reset(&lut);
 }
 
+static void
+test_lut16_reference_matches_legacy_scalar_and_simd_code_domain(void)
+{
+	const uint32_t dimensions[] = {16, 32, 64, 128};
+	const size_t dim_count = sizeof(dimensions) / sizeof(dimensions[0]);
+	const uint32_t vec_count = 8;
+	size_t d = 0;
+
+	for (d = 0; d < dim_count; d++)
+	{
+		uint32_t dim = dimensions[d];
+		TqProdCodecConfig config = {.dimension = dim, .bits = 4, .qjl_seed = 113u, .qjl_dimension = dim};
+		TqProdPackedLayout layout;
+		TqProdLut lut;
+		TqProdLut16 lut16;
+		float *query = NULL;
+		float *input = NULL;
+		uint8_t *packed = NULL;
+		uint8_t *nibbles = NULL;
+		uint8_t *dim_major_nibbles = NULL;
+		uint32_t v = 0;
+		char errmsg[256];
+
+		memset(&layout, 0, sizeof(layout));
+		memset(&lut, 0, sizeof(lut));
+		memset(&lut16, 0, sizeof(lut16));
+
+		query = (float *) calloc(dim, sizeof(float));
+		input = (float *) calloc(dim, sizeof(float));
+		nibbles = (uint8_t *) calloc(dim, sizeof(uint8_t));
+		dim_major_nibbles = (uint8_t *) calloc((size_t) dim * 16u, sizeof(uint8_t));
+		assert(query != NULL && input != NULL && nibbles != NULL && dim_major_nibbles != NULL);
+
+		seeded_unit_vector(77u + dim, query, dim);
+		assert(tq_prod_packed_layout(&config, &layout, errmsg, sizeof(errmsg)));
+		packed = (uint8_t *) calloc(layout.total_bytes, sizeof(uint8_t));
+		assert(packed != NULL);
+		assert(tq_prod_lut_build(&config, query, &lut, errmsg, sizeof(errmsg)));
+		assert(tq_prod_lut16_build(&config, &lut, &lut16, errmsg, sizeof(errmsg)));
+
+		for (v = 0; v < vec_count; v++)
+		{
+			float scalar_score = 0.0f;
+			float simd_score = 0.0f;
+			float lut16_score = 0.0f;
+			float gamma = 0.0f;
+			TqProdScoreKernel used = TQ_PROD_SCORE_SCALAR;
+
+			memset(packed, 0, layout.total_bytes);
+			seeded_unit_vector(300u + v + dim, input, dim);
+			assert(tq_prod_encode(&config, input, packed, layout.total_bytes, errmsg, sizeof(errmsg)));
+			assert(tq_prod_read_gamma(&config, packed, layout.total_bytes, &gamma, errmsg, sizeof(errmsg)));
+
+			/* Legacy scalar path */
+			assert(tq_prod_score_code_from_lut(&config, &lut, packed, layout.total_bytes,
+											   &scalar_score, errmsg, sizeof(errmsg)));
+
+			/* SIMD dispatch (auto) */
+			assert(tq_prod_score_code_from_lut_dispatch(&config, &lut, packed, layout.total_bytes,
+														TQ_PROD_SCORE_AUTO, &simd_score, &used,
+														errmsg, sizeof(errmsg)));
+
+			/* LUT16 reference */
+			assert(tq_prod_extract_nibbles(&config, packed, layout.total_bytes,
+										   nibbles, dim, errmsg, sizeof(errmsg)));
+			transpose_nibbles_to_dim_major(nibbles, dim_major_nibbles, 1, dim);
+			assert(tq_prod_score_block16_scalar(&lut16, dim_major_nibbles, &gamma, 1, &lut16_score,
+												errmsg, sizeof(errmsg)));
+
+			assert(fabsf(lut16_score - scalar_score) < 1e-4f);
+			assert(fabsf(lut16_score - simd_score) < 1e-4f);
+		}
+
+		tq_prod_lut16_reset(&lut16);
+		tq_prod_lut_reset(&lut);
+		free(packed);
+		free(dim_major_nibbles);
+		free(nibbles);
+		free(input);
+		free(query);
+	}
+}
+
+static void
+test_block16_dispatch_selects_kernel_and_falls_back_to_scalar(void)
+{
+	const uint32_t dim = 32;
+	const uint32_t N = 8;
+	TqProdCodecConfig config = {.dimension = dim, .bits = 4, .qjl_seed = 199u, .qjl_dimension = dim};
+	TqProdPackedLayout layout;
+	TqProdLut lut;
+	TqProdLut16 lut16;
+	uint8_t packed[256];
+	uint8_t all_nibbles[8 * 32];
+	uint8_t dim_major_nibbles[32 * 16];
+	float gammas[8];
+	float scalar_scores[8];
+	float quantized_scalar_scores[8];
+	float dispatch_scores[8];
+	float query[32];
+	float input[32];
+	TqProdScoreKernel used_kernel = TQ_PROD_SCORE_AUTO;
+	uint32_t i = 0;
+	char errmsg[256];
+
+	memset(&layout, 0, sizeof(layout));
+	memset(&lut, 0, sizeof(lut));
+	memset(&lut16, 0, sizeof(lut16));
+	memset(all_nibbles, 0, sizeof(all_nibbles));
+
+	seeded_unit_vector(501u, query, dim);
+	assert(tq_prod_packed_layout(&config, &layout, errmsg, sizeof(errmsg)));
+	assert(tq_prod_lut_build(&config, query, &lut, errmsg, sizeof(errmsg)));
+	assert(tq_prod_lut16_build(&config, &lut, &lut16, errmsg, sizeof(errmsg)));
+	assert(tq_prod_lut16_quantize(&lut16, errmsg, sizeof(errmsg)));
+
+	for (i = 0; i < N; i++)
+	{
+		memset(packed, 0, sizeof(packed));
+		seeded_unit_vector(600u + i, input, dim);
+		assert(tq_prod_encode(&config, input, packed, layout.total_bytes, errmsg, sizeof(errmsg)));
+		assert(tq_prod_read_gamma(&config, packed, layout.total_bytes, &gammas[i], errmsg, sizeof(errmsg)));
+		assert(tq_prod_extract_nibbles(&config, packed, layout.total_bytes,
+									   all_nibbles + (size_t) i * dim, dim, errmsg, sizeof(errmsg)));
+	}
+
+	transpose_nibbles_to_dim_major(all_nibbles, dim_major_nibbles, N, dim);
+
+	/* Float scalar reference */
+	assert(tq_prod_score_block16_scalar(&lut16, dim_major_nibbles, gammas, N, scalar_scores,
+										errmsg, sizeof(errmsg)));
+
+	/* Quantized scalar reference (for comparing against SIMD dispatch) */
+	assert(tq_prod_score_block16_quantized_scalar(&lut16, dim_major_nibbles, gammas, N,
+												  quantized_scalar_scores, errmsg, sizeof(errmsg)));
+
+	/* Dispatch with auto: uses quantized SIMD if available, else float scalar */
+	assert(tq_prod_score_block16_dispatch(&lut16, dim_major_nibbles, gammas, N,
+										  TQ_PROD_SCORE_AUTO, dispatch_scores, &used_kernel,
+										  errmsg, sizeof(errmsg)));
+
+	if (used_kernel == TQ_PROD_SCORE_SCALAR)
+	{
+		for (i = 0; i < N; i++)
+			assert(fabsf(dispatch_scores[i] - scalar_scores[i]) < 1e-4f);
+	}
+	else
+	{
+		for (i = 0; i < N; i++)
+			assert(fabsf(dispatch_scores[i] - quantized_scalar_scores[i]) < 1e-4f);
+	}
+
+	/* Dispatch with explicit AVX2 request */
+	assert(tq_prod_score_block16_dispatch(&lut16, dim_major_nibbles, gammas, N,
+										  TQ_PROD_SCORE_AVX2, dispatch_scores, &used_kernel,
+										  errmsg, sizeof(errmsg)));
+	if (!tq_simd_avx2_runtime_available())
+		assert(used_kernel == TQ_PROD_SCORE_SCALAR);
+
+	if (used_kernel == TQ_PROD_SCORE_SCALAR)
+	{
+		for (i = 0; i < N; i++)
+			assert(fabsf(dispatch_scores[i] - scalar_scores[i]) < 1e-4f);
+	}
+	else
+	{
+		for (i = 0; i < N; i++)
+			assert(fabsf(dispatch_scores[i] - quantized_scalar_scores[i]) < 1e-4f);
+	}
+
+	/* Dispatch with explicit scalar */
+	assert(tq_prod_score_block16_dispatch(&lut16, dim_major_nibbles, gammas, N,
+										  TQ_PROD_SCORE_SCALAR, dispatch_scores, &used_kernel,
+										  errmsg, sizeof(errmsg)));
+	assert(used_kernel == TQ_PROD_SCORE_SCALAR);
+
+	for (i = 0; i < N; i++)
+		assert(fabsf(dispatch_scores[i] - scalar_scores[i]) < 1e-4f);
+
+	tq_prod_lut16_reset(&lut16);
+	tq_prod_lut_reset(&lut);
+}
+
+static void
+test_block16_dispatch_neon_matches_scalar_on_arm64(void)
+{
+	const uint32_t dim = 64;
+	const uint32_t N = 16;
+	TqProdCodecConfig config = {.dimension = dim, .bits = 4, .qjl_seed = 317u, .qjl_dimension = dim};
+	TqProdPackedLayout layout;
+	TqProdLut lut;
+	TqProdLut16 lut16;
+	uint8_t packed[512];
+	uint8_t *all_nibbles = NULL;
+	uint8_t *dim_major_nibbles = NULL;
+	float gammas[16];
+	float scalar_scores[16];
+	float quantized_scalar_scores[16];
+	float neon_scores[16];
+	float auto_scores[16];
+	float *query = NULL;
+	float *input = NULL;
+	TqProdScoreKernel used_kernel = TQ_PROD_SCORE_AUTO;
+	uint32_t i = 0;
+	char errmsg[256];
+
+	memset(&layout, 0, sizeof(layout));
+	memset(&lut, 0, sizeof(lut));
+	memset(&lut16, 0, sizeof(lut16));
+
+	query = (float *) calloc(dim, sizeof(float));
+	input = (float *) calloc(dim, sizeof(float));
+	all_nibbles = (uint8_t *) calloc((size_t) N * dim, sizeof(uint8_t));
+	dim_major_nibbles = (uint8_t *) calloc((size_t) dim * 16u, sizeof(uint8_t));
+	assert(query != NULL && input != NULL && all_nibbles != NULL && dim_major_nibbles != NULL);
+
+	seeded_unit_vector(777u, query, dim);
+	assert(tq_prod_packed_layout(&config, &layout, errmsg, sizeof(errmsg)));
+	assert(tq_prod_lut_build(&config, query, &lut, errmsg, sizeof(errmsg)));
+	assert(tq_prod_lut16_build(&config, &lut, &lut16, errmsg, sizeof(errmsg)));
+	assert(tq_prod_lut16_quantize(&lut16, errmsg, sizeof(errmsg)));
+
+	for (i = 0; i < N; i++)
+	{
+		memset(packed, 0, sizeof(packed));
+		seeded_unit_vector(900u + i, input, dim);
+		assert(tq_prod_encode(&config, input, packed, layout.total_bytes, errmsg, sizeof(errmsg)));
+		assert(tq_prod_read_gamma(&config, packed, layout.total_bytes, &gammas[i], errmsg, sizeof(errmsg)));
+		assert(tq_prod_extract_nibbles(&config, packed, layout.total_bytes,
+									   all_nibbles + (size_t) i * dim, dim, errmsg, sizeof(errmsg)));
+	}
+
+	transpose_nibbles_to_dim_major(all_nibbles, dim_major_nibbles, N, dim);
+
+	/* Float scalar reference */
+	assert(tq_prod_score_block16_dispatch(&lut16, dim_major_nibbles, gammas, N,
+										  TQ_PROD_SCORE_SCALAR, scalar_scores, &used_kernel,
+										  errmsg, sizeof(errmsg)));
+	assert(used_kernel == TQ_PROD_SCORE_SCALAR);
+
+	/* Quantized scalar reference (for comparing against SIMD dispatch) */
+	assert(tq_prod_score_block16_quantized_scalar(&lut16, dim_major_nibbles, gammas, N,
+												  quantized_scalar_scores, errmsg, sizeof(errmsg)));
+
+	/* Explicit NEON request */
+	assert(tq_prod_score_block16_dispatch(&lut16, dim_major_nibbles, gammas, N,
+										  TQ_PROD_SCORE_NEON, neon_scores, &used_kernel,
+										  errmsg, sizeof(errmsg)));
+	if (tq_simd_neon_runtime_available())
+		assert(used_kernel == TQ_PROD_SCORE_NEON);
+	else
+		assert(used_kernel == TQ_PROD_SCORE_SCALAR);
+
+	/* Auto dispatch */
+	assert(tq_prod_score_block16_dispatch(&lut16, dim_major_nibbles, gammas, N,
+										  TQ_PROD_SCORE_AUTO, auto_scores, &used_kernel,
+										  errmsg, sizeof(errmsg)));
+
+	/*
+	 * NEON/auto dispatch uses quantized kernel when SIMD is available,
+	 * otherwise falls back to float scalar.
+	 */
+	for (i = 0; i < N; i++)
+	{
+		if (tq_simd_neon_runtime_available() || tq_simd_avx2_runtime_available())
+		{
+			assert(fabsf(neon_scores[i] - quantized_scalar_scores[i]) < 1e-4f);
+			assert(fabsf(auto_scores[i] - quantized_scalar_scores[i]) < 1e-4f);
+		}
+		else
+		{
+			assert(fabsf(neon_scores[i] - scalar_scores[i]) < 1e-4f);
+			assert(fabsf(auto_scores[i] - scalar_scores[i]) < 1e-4f);
+		}
+	}
+
+	tq_prod_lut16_reset(&lut16);
+	tq_prod_lut_reset(&lut);
+	free(dim_major_nibbles);
+	free(all_nibbles);
+	free(input);
+	free(query);
+}
+
 int
 main(void)
 {
@@ -666,5 +968,8 @@ main(void)
 	test_code_domain_and_decode_fallback_match_ordering_on_seeded_fixture();
 	test_dispatch_falls_back_to_scalar_for_unsupported_shape_or_disabled_runtime();
 	test_malformed_packed_input_rejected_cleanly();
+	test_lut16_reference_matches_legacy_scalar_and_simd_code_domain();
+	test_block16_dispatch_selects_kernel_and_falls_back_to_scalar();
+	test_block16_dispatch_neon_matches_scalar_on_arm64();
 	return 0;
 }
