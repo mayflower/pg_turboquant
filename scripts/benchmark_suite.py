@@ -1918,7 +1918,13 @@ def synthetic_skew_probe_regression() -> dict:
 def scenario_benchmark_metadata(index_metadata: dict) -> dict:
     list_distribution = index_metadata.get("list_distribution", {})
     list_count = int(index_metadata.get("list_count", 0))
-    live_count = int(index_metadata.get("live_count", index_metadata.get("heap_live_rows", 0) or 0))
+    live_count = int(
+        index_metadata.get(
+            "live_count",
+            index_metadata.get("heap_live_rows_estimate", index_metadata.get("heap_live_rows", 0))
+            or 0,
+        )
+    )
     avg_list_size = float(
         list_distribution.get(
             "avg_live_count",
@@ -2080,7 +2086,7 @@ def query_turboquant_ordered_ids_and_scan_stats(
             + (
                 (
                     "SELECT coalesce(json_agg(source.id ORDER BY shadow.ordinality), '[]'::json)::text "
-                    f"FROM unnest(tq_last_shadow_decode_candidate_tids_core()) WITH ORDINALITY AS shadow(candidate_tid_text, ordinality) "
+                    f"FROM unnest(tq_last_shadow_decode_candidate_tids()) WITH ORDINALITY AS shadow(candidate_tid_text, ordinality) "
                     f"JOIN {table_name} source ON source.ctid = shadow.candidate_tid_text::tid;\n"
                 )
                 if shadow_decode_enabled

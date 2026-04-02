@@ -1,0 +1,6 @@
+comment = 'pg_turboquant regression-only support helpers'
+default_version = '0.1.0'
+module_pathname = '$libdir/pg_turboquant'
+relocatable = true
+requires = 'pg_turboquant'
+superuser = true

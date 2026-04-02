@@ -45,6 +45,7 @@ It is designed around PostgreSQL's storage and executor constraints rather than 
 Build and install against PostgreSQL 16 or 17 with PGXS:
 
 ```sh
+./scripts/bootstrap_dev.sh
 make
 make install
 ```
@@ -124,6 +125,7 @@ The public docs follow Diataxis:
   - [docs/reference/sql-api.md](docs/reference/sql-api.md)
   - [docs/reference/index-options.md](docs/reference/index-options.md)
   - [docs/reference/benchmark-output.md](docs/reference/benchmark-output.md)
+  - [docs/reference/compatibility.md](docs/reference/compatibility.md)
 - Explanation:
   - [docs/explanation/architecture.md](docs/explanation/architecture.md)
   - [docs/explanation/benchmark-results.md](docs/explanation/benchmark-results.md)
@@ -135,6 +137,7 @@ The docs hub lives at [docs/README.md](docs/README.md).
 
 - PostgreSQL: 16 and 17
 - pgvector: required for `vector` and `halfvec`
+- Tested pgvector contract: pinned development and CI reference `v0.8.1`
 - Current support boundary:
   - single-column indexes only
   - no index-only scans
@@ -156,4 +159,4 @@ make tapcheck
 
 The benchmark harness lives in `scripts/benchmark_suite.py`. The RAG evaluation harness lives under `benchmarks/rag/`.
 
-For scan observability, `tq_last_scan_stats()` exposes backend-local JSON for the most recent TurboQuant scan, including score mode, SIMD kernel, scan orchestration, and page pruning counters. `tq_index_metadata(...)` reports the algorithm version, quantizer family, residual sketch kind, and whether the index is eligible for the faithful fast path.
+For scan observability, `tq_last_scan_stats()` exposes backend-local JSON for the most recent TurboQuant scan, including score mode, SIMD kernel, scan orchestration, and page pruning counters. `tq_index_metadata(...)` reports the algorithm version, quantizer family, residual sketch kind, and whether the index is eligible for the faithful fast path. It now carries only cheap heap estimates; use `tq_index_heap_stats(...)` when you intentionally want an exact heap row count.

@@ -12,6 +12,7 @@ $node->start;
 
 $node->safe_psql('postgres', 'CREATE EXTENSION vector;');
 $node->safe_psql('postgres', 'CREATE EXTENSION pg_turboquant;');
+$node->safe_psql('postgres', 'CREATE EXTENSION pg_turboquant_test_support;');
 
 $node->safe_psql(
 	'postgres',

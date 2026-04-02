@@ -75,6 +75,13 @@ Returns JSON metadata for a TurboQuant index, including:
 - live/dead counts
 - page counts
 - capability flags
+- cheap heap estimate fields
+
+### `tq_index_heap_stats(regclass)`
+
+Returns exact heap statistics for a TurboQuant index.
+
+This helper is intentionally expensive. Use it when you want an exact heap row count and do not want that cost hidden behind the normal metadata API.
 
 ### `tq_runtime_simd_features()`
 
@@ -103,6 +110,12 @@ Scoring and pruning:
 - `page_prune_count`, `early_stop_count`
 - `near_exhaustive_crossover` — boolean, whether scan crossed the near-exhaustive threshold
 - `decoded_vector_count` — zero on the faithful fast path
+
+### `tq_last_shadow_decode_candidate_tids()`
+
+Returns backend-local shadow decode candidate CTIDs for the most recent TurboQuant scan in the current session.
+
+This is an expert diagnostic used by the benchmark harness. The raw `_core` helper is not part of the public API.
 
 ## Supported plan shapes
 

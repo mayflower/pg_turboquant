@@ -31,6 +31,7 @@ flowchart TD
 - [SQL API](reference/sql-api.md)
 - [Index options](reference/index-options.md)
 - [Benchmark output schema](reference/benchmark-output.md)
+- [Compatibility and upgrade policy](reference/compatibility.md)
 
 ## Explanation
 

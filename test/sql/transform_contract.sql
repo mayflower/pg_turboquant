@@ -1,5 +1,6 @@
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_turboquant;
+CREATE EXTENSION IF NOT EXISTS pg_turboquant_test_support;
 
 CREATE TABLE tq_transform_contract_docs (
 	id int4 PRIMARY KEY,
@@ -42,3 +43,5 @@ SELECT id
 FROM tq_transform_contract_docs
 ORDER BY embedding <=> '[1,0,0,0,0]'
 LIMIT 3;
+
+DROP EXTENSION pg_turboquant_test_support;

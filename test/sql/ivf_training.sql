@@ -3,6 +3,7 @@ DROP EXTENSION IF EXISTS pg_turboquant CASCADE;
 DROP EXTENSION IF EXISTS vector CASCADE;
 CREATE EXTENSION vector;
 CREATE EXTENSION pg_turboquant;
+CREATE EXTENSION pg_turboquant_test_support;
 
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
@@ -101,3 +102,5 @@ FROM (
 	ORDER BY embedding <=> '[1.0,0.0]'
 	LIMIT 2
 ) ranked;
+
+DROP EXTENSION pg_turboquant_test_support;

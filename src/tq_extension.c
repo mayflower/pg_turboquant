@@ -33,8 +33,11 @@ PG_FUNCTION_INFO_V1(tq_debug_validate_reloptions);
 PG_FUNCTION_INFO_V1(tq_debug_router_metadata);
 PG_FUNCTION_INFO_V1(tq_debug_transform_metadata);
 PG_FUNCTION_INFO_V1(tq_index_metadata_core);
+PG_FUNCTION_INFO_V1(tq_last_scan_stats);
 PG_FUNCTION_INFO_V1(tq_last_scan_stats_core);
+PG_FUNCTION_INFO_V1(tq_last_shadow_decode_candidate_tids);
 PG_FUNCTION_INFO_V1(tq_last_shadow_decode_candidate_tids_core);
+PG_FUNCTION_INFO_V1(tq_runtime_simd_features);
 PG_FUNCTION_INFO_V1(tq_runtime_simd_features_core);
 
 typedef struct TqListAggregate
@@ -85,6 +88,9 @@ static bool tq_append_list_metadata_json(StringInfo buf,
 										 uint32_t *reclaimable_pages,
 										 char *errmsg,
 										 size_t errmsg_len);
+static text *tq_last_scan_stats_text_value(void);
+static ArrayType *tq_last_shadow_decode_candidate_tids_array(void);
+static text *tq_runtime_simd_features_text_value(void);
 
 static const char *
 tq_distance_kind_name(TqDistanceKind distance_kind)
@@ -837,7 +843,25 @@ tq_index_metadata_core(PG_FUNCTION_ARGS)
 }
 
 Datum
+tq_last_scan_stats(PG_FUNCTION_ARGS)
+{
+	text	   *json_text;
+
+	(void) fcinfo;
+
+	json_text = tq_last_scan_stats_text_value();
+	return DirectFunctionCall1(jsonb_in, CStringGetDatum(text_to_cstring(json_text)));
+}
+
+Datum
 tq_last_scan_stats_core(PG_FUNCTION_ARGS)
+{
+	(void) fcinfo;
+	PG_RETURN_TEXT_P(tq_last_scan_stats_text_value());
+}
+
+static text *
+tq_last_scan_stats_text_value(void)
 {
 	TqScanStats stats;
 	char		json[4096];
@@ -851,11 +875,25 @@ tq_last_scan_stats_core(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("turboquant could not serialize last scan stats")));
 
-	PG_RETURN_TEXT_P(cstring_to_text(json));
+	return cstring_to_text(json);
+}
+
+Datum
+tq_last_shadow_decode_candidate_tids(PG_FUNCTION_ARGS)
+{
+	(void) fcinfo;
+	PG_RETURN_ARRAYTYPE_P(tq_last_shadow_decode_candidate_tids_array());
 }
 
 Datum
 tq_last_shadow_decode_candidate_tids_core(PG_FUNCTION_ARGS)
+{
+	(void) fcinfo;
+	PG_RETURN_ARRAYTYPE_P(tq_last_shadow_decode_candidate_tids_array());
+}
+
+static ArrayType *
+tq_last_shadow_decode_candidate_tids_array(void)
 {
 	ArrayType  *result = NULL;
 	Datum	   *values = NULL;
@@ -863,15 +901,13 @@ tq_last_shadow_decode_candidate_tids_core(PG_FUNCTION_ARGS)
 	size_t		count = 0;
 	size_t		index = 0;
 
-	(void) fcinfo;
-
 	if (!tq_scan_stats_copy_shadow_decode_tids(NULL, 0, &count))
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("turboquant could not inspect shadow decode candidate tids")));
 
 	if (count == 0)
-		PG_RETURN_ARRAYTYPE_P(construct_empty_array(TEXTOID));
+		return construct_empty_array(TEXTOID);
 
 	tids = (TqTid *) palloc(sizeof(TqTid) * count);
 	values = (Datum *) palloc(sizeof(Datum) * count);
@@ -888,15 +924,31 @@ tq_last_shadow_decode_candidate_tids_core(PG_FUNCTION_ARGS)
 					 (unsigned int) tids[index].offset_number));
 
 	result = construct_array(values, (int) count, TEXTOID, -1, false, 'i');
-	PG_RETURN_ARRAYTYPE_P(result);
+	return result;
+}
+
+Datum
+tq_runtime_simd_features(PG_FUNCTION_ARGS)
+{
+	text	   *json_text;
+
+	(void) fcinfo;
+
+	json_text = tq_runtime_simd_features_text_value();
+	return DirectFunctionCall1(jsonb_in, CStringGetDatum(text_to_cstring(json_text)));
 }
 
 Datum
 tq_runtime_simd_features_core(PG_FUNCTION_ARGS)
 {
-	StringInfoData buf;
-
 	(void) fcinfo;
+	PG_RETURN_TEXT_P(tq_runtime_simd_features_text_value());
+}
+
+static text *
+tq_runtime_simd_features_text_value(void)
+{
+	StringInfoData buf;
 
 	initStringInfo(&buf);
 	appendStringInfoChar(&buf, '{');
@@ -922,5 +974,5 @@ tq_runtime_simd_features_core(PG_FUNCTION_ARGS)
 					 tq_simd_avx512_runtime_available() ? "true" : "false",
 					 tq_simd_neon_runtime_available() ? "true" : "false");
 
-	PG_RETURN_TEXT_P(cstring_to_text(buf.data));
+	return cstring_to_text(buf.data);
 }

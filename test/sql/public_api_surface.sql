@@ -1,0 +1,91 @@
+SET client_min_messages = warning;
+DROP EXTENSION IF EXISTS pg_turboquant_test_support CASCADE;
+DROP EXTENSION IF EXISTS pg_turboquant CASCADE;
+DROP EXTENSION IF EXISTS vector CASCADE;
+RESET client_min_messages;
+
+CREATE EXTENSION vector;
+CREATE EXTENSION pg_turboquant;
+
+CREATE TABLE tq_public_api_docs (
+	id int4 PRIMARY KEY,
+	embedding vector(4)
+);
+
+INSERT INTO tq_public_api_docs (id, embedding) VALUES
+	(1, '[1,0,0,0]'),
+	(2, '[0,1,0,0]'),
+	(3, '[0,0,1,0]');
+
+CREATE INDEX tq_public_api_idx
+	ON tq_public_api_docs
+	USING turboquant (embedding tq_cosine_ops)
+	WITH (bits = 4, lists = 1, lanes = auto, transform = 'hadamard', normalized = true);
+
+SELECT
+	to_regprocedure('tq_debug_validate_reloptions(text[])') IS NULL AS debug_reloptions_hidden,
+	to_regprocedure('tq_debug_router_metadata(regclass)') IS NULL AS debug_router_hidden,
+	to_regprocedure('tq_debug_transform_metadata(regclass)') IS NULL AS debug_transform_hidden;
+
+SELECT
+	meta ? 'heap_live_rows_estimate' AS has_heap_estimate,
+	NOT (meta ? 'heap_live_rows') AS omits_exact_heap_rows,
+	(meta->>'heap_relation') = 'tq_public_api_docs' AS keeps_heap_relation
+FROM (SELECT tq_index_metadata('tq_public_api_idx'::regclass) AS meta) AS s;
+
+SELECT
+	(stats->>'heap_live_rows_exact')::int AS heap_live_rows_exact
+FROM (SELECT tq_index_heap_stats('tq_public_api_idx'::regclass) AS stats) AS s;
+
+SELECT proname
+FROM (
+	SELECT DISTINCT p.proname
+	FROM pg_amproc AS ap
+	JOIN pg_opfamily AS opf
+		ON opf.oid = ap.amprocfamily
+	JOIN pg_am AS am
+		ON am.oid = opf.opfmethod
+	JOIN pg_proc AS p
+		ON p.oid = ap.amproc
+	WHERE am.amname = 'turboquant'
+	  AND p.proname LIKE 'tq_%'
+) wrapper_functions
+ORDER BY proname;
+
+SELECT proname, proacl IS NOT NULL AS acl_is_explicit
+FROM pg_proc
+WHERE proname IN (
+	'tq_index_metadata_core',
+	'tq_last_scan_stats_core',
+	'tq_last_shadow_decode_candidate_tids_core',
+	'tq_runtime_simd_features_core'
+)
+ORDER BY proname;
+
+CREATE ROLE tq_public_api_user;
+
+SET ROLE tq_public_api_user;
+
+SELECT
+	jsonb_typeof(tq_last_scan_stats()) = 'object' AS public_scan_stats_wrapper_works,
+	jsonb_typeof(tq_runtime_simd_features()) = 'object' AS public_simd_wrapper_works,
+	cardinality(tq_last_shadow_decode_candidate_tids()) = 0 AS public_shadow_decode_wrapper_empty_before_scan;
+
+SELECT tq_last_scan_stats_core();
+SELECT tq_runtime_simd_features_core();
+SELECT tq_last_shadow_decode_candidate_tids_core();
+
+RESET ROLE;
+
+DROP ROLE tq_public_api_user;
+
+CREATE EXTENSION pg_turboquant_test_support;
+
+SELECT
+	to_regprocedure('tq_debug_validate_reloptions(text[])') IS NOT NULL AS debug_reloptions_available,
+	to_regprocedure('tq_debug_router_metadata(regclass)') IS NOT NULL AS debug_router_available,
+	to_regprocedure('tq_debug_transform_metadata(regclass)') IS NOT NULL AS debug_transform_available,
+	to_regprocedure('tq_test_corrupt_meta_magic(regclass)') IS NOT NULL AS corrupt_magic_available,
+	to_regprocedure('tq_test_corrupt_first_batch_occupied_count(regclass)') IS NOT NULL AS corrupt_batch_available;
+
+DROP EXTENSION pg_turboquant_test_support;

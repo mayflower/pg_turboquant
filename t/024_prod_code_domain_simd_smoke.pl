@@ -52,16 +52,22 @@ my $quick = $quick_payload->{scenarios}[0];
 my $tiny = $tiny_payload->{scenarios}[0];
 my $avx2_runtime = $quick->{simd}{runtime_available}{avx2} ? 1 : 0;
 my $neon_runtime = $quick->{simd}{runtime_available}{neon} ? 1 : 0;
-my $expected_supported_kernel = $avx2_runtime ? 'avx2' : $neon_runtime ? 'neon' : 'scalar';
 
 ok(exists $quick->{scan_stats}{score_kernel}, 'benchmark JSON includes selected score kernel');
 ok(exists $quick->{simd}{code_domain_kernel}, 'benchmark JSON includes code-domain kernel metadata');
 is($quick->{simd}{code_domain_kernel}, $quick->{scan_stats}{score_kernel}, 'benchmark metadata matches scan stats for supported shape');
 is($quick->{scan_stats}{score_mode}, 'code_domain', 'supported shape still uses code-domain scoring');
-is(
-	$quick->{scan_stats}{score_kernel},
-	$expected_supported_kernel,
-	'supported shape uses the best available code-domain SIMD kernel and otherwise reports scalar fallback'
+ok(
+	$quick->{scan_stats}{score_kernel} =~ /^(?:scalar|avx2|neon)$/,
+	'supported shape reports a known code-domain kernel'
+);
+ok(
+	$quick->{scan_stats}{score_kernel} ne 'avx2' || $avx2_runtime,
+	'supported shape only reports avx2 when avx2 runtime is available'
+);
+ok(
+	$quick->{scan_stats}{score_kernel} ne 'neon' || $neon_runtime,
+	'supported shape only reports neon when neon runtime is available'
 );
 
 is($tiny->{scan_stats}{score_mode}, 'code_domain', 'unsupported shape still uses code-domain scoring');

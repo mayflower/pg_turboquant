@@ -40,6 +40,15 @@ $node->init;
 $node->append_conf(
 	'postgresql.conf',
 	'lock_timeout = ' . (1000 * $PostgreSQL::Test::Utils::timeout_default));
+$node->append_conf(
+	'postgresql.conf', q{
+fsync = on
+full_page_writes = on
+restart_after_crash = on
+synchronous_commit = on
+wal_level = replica
+}
+);
 $node->start;
 
 $node->safe_psql('postgres', 'CREATE EXTENSION vector;');
@@ -98,8 +107,29 @@ is(
 my $cic_meta = decode_json(
 	$node->safe_psql('postgres', q{SELECT tq_index_metadata('tq_cic_idx'::regclass)::text;})
 );
+my $cic_heap = decode_json(
+	$node->safe_psql('postgres', q{SELECT tq_index_heap_stats('tq_cic_idx'::regclass)::text;})
+);
 is($cic_meta->{live_count}, 4001, 'concurrent build metadata includes the overlapping row');
-is($cic_meta->{heap_live_rows}, 4001, 'heap live rows match after concurrent build');
+is($cic_heap->{heap_live_rows_exact}, 4001, 'exact heap stats match after concurrent build');
+
+$node->stop('immediate');
+$node->start;
+
+my $cic_after_restart = decode_json(
+	$node->safe_psql('postgres', q{SELECT tq_index_metadata('tq_cic_idx'::regclass)::text;})
+);
+my $cic_heap_after_restart = decode_json(
+	$node->safe_psql('postgres', q{SELECT tq_index_heap_stats('tq_cic_idx'::regclass)::text;})
+);
+
+is($cic_after_restart->{live_count}, 4001, 'concurrent build live count survives immediate restart');
+is($cic_heap_after_restart->{heap_live_rows_exact}, 4001, 'exact heap stats survive immediate restart after concurrent build');
+is(
+	$node->safe_psql('postgres', nearest_id_sql('tq_cic_docs', '[0.01,0.01,0.01,0.97]')),
+	'900001',
+	'concurrent build query result survives immediate restart'
+);
 
 $node->safe_psql(
 	'postgres', q{
@@ -197,14 +227,44 @@ for my $writer (@writers)
 my $write_meta = decode_json(
 	$node->safe_psql('postgres', q{SELECT tq_index_metadata('tq_concurrent_write_idx'::regclass)::text;})
 );
+my $write_heap = decode_json(
+	$node->safe_psql('postgres', q{SELECT tq_index_heap_stats('tq_concurrent_write_idx'::regclass)::text;})
+);
 my $heap_rows = $node->safe_psql('postgres', q{SELECT count(*) FROM tq_concurrent_write_docs;});
 
-is($write_meta->{heap_live_rows}, int($heap_rows), 'heap live rows remain exact after concurrent inserts');
+is($write_heap->{heap_live_rows_exact}, int($heap_rows), 'exact heap stats remain correct after concurrent inserts');
 is($write_meta->{live_count}, int($heap_rows), 'index live count matches heap after concurrent inserts');
 is(
 	$node->safe_psql('postgres', nearest_id_sql('tq_concurrent_write_docs', '[0,0,0,1]')),
 	'990001',
 	'concurrent inserts remain query-correct after writer overlap'
+);
+
+$node->stop('immediate');
+$node->start;
+
+my $write_meta_after_restart = decode_json(
+	$node->safe_psql('postgres', q{SELECT tq_index_metadata('tq_concurrent_write_idx'::regclass)::text;})
+);
+my $write_heap_after_restart = decode_json(
+	$node->safe_psql('postgres', q{SELECT tq_index_heap_stats('tq_concurrent_write_idx'::regclass)::text;})
+);
+my $heap_rows_after_restart = $node->safe_psql('postgres', q{SELECT count(*) FROM tq_concurrent_write_docs;});
+
+is(
+	$write_heap_after_restart->{heap_live_rows_exact},
+	int($heap_rows_after_restart),
+	'exact heap stats survive immediate restart after concurrent inserts'
+);
+is(
+	$write_meta_after_restart->{live_count},
+	int($heap_rows_after_restart),
+	'live count survives immediate restart after concurrent inserts'
+);
+is(
+	$node->safe_psql('postgres', nearest_id_sql('tq_concurrent_write_docs', '[0,0,0,1]')),
+	'990001',
+	'concurrent-insert query result survives immediate restart'
 );
 
 $node->safe_psql(

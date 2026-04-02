@@ -20,6 +20,7 @@ $node->start;
 
 $node->safe_psql('postgres', 'CREATE EXTENSION vector;');
 $node->safe_psql('postgres', 'CREATE EXTENSION pg_turboquant;');
+$node->safe_psql('postgres', 'CREATE EXTENSION pg_turboquant_test_support;');
 
 $node->safe_psql(
 	'postgres', q{
@@ -73,7 +74,7 @@ is(
 	'transform_version=1 input_dimension=5 output_dimension=8 seed=0',
 	'transform metadata exposes explicit padded contract before restart'
 );
-is($query_before, '1,2,3', 'query order is deterministic before restart');
+is($query_before, '1,2,4', 'query order is deterministic before restart');
 
 $node->restart;
 

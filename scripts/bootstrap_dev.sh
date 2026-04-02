@@ -27,6 +27,7 @@ PGXS_PATH="$("${PG_CONFIG_BIN}" --pgxs)"
 PG_REGRESS_BIN="$(cd "$(dirname "${PGXS_PATH}")/../test/regress" 2>/dev/null && pwd)/pg_regress"
 
 "${ROOT_DIR}/scripts/fetch_pgvector.sh"
+"${ROOT_DIR}/scripts/install_pgvector.sh" "${PG_CONFIG_BIN}"
 "${ROOT_DIR}/scripts/fetch_postgres_test_libs.sh"
 
 if [[ -x "${PG_BIN_DIR}/postgres" && -x "${PG_REGRESS_BIN}" ]]; then

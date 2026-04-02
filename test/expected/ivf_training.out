@@ -3,6 +3,7 @@ DROP EXTENSION IF EXISTS pg_turboquant CASCADE;
 DROP EXTENSION IF EXISTS vector CASCADE;
 CREATE EXTENSION vector;
 CREATE EXTENSION pg_turboquant;
+CREATE EXTENSION pg_turboquant_test_support;
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
 SET turboquant.probes = 2;
@@ -118,3 +119,4 @@ FROM (
  {1}
 (1 row)
 
+DROP EXTENSION pg_turboquant_test_support;

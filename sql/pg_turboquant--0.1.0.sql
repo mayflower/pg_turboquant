@@ -6,28 +6,6 @@ STRICT;
 
 COMMENT ON FUNCTION tq_smoke() IS 'Bootstrap smoke-test function for pg_turboquant';
 
-CREATE FUNCTION tq_debug_validate_reloptions(text[])
-RETURNS text
-AS 'MODULE_PATHNAME', 'tq_debug_validate_reloptions'
-LANGUAGE C
-STRICT;
-
-COMMENT ON FUNCTION tq_debug_validate_reloptions(text[]) IS 'Test-only helper that validates turboquant reloptions';
-
-CREATE FUNCTION tq_debug_router_metadata(regclass)
-RETURNS text
-LANGUAGE C STRICT
-AS 'MODULE_PATHNAME', 'tq_debug_router_metadata';
-
-COMMENT ON FUNCTION tq_debug_router_metadata(regclass) IS 'Test-only helper that reads persisted turboquant router metadata';
-
-CREATE FUNCTION tq_debug_transform_metadata(regclass)
-RETURNS text
-LANGUAGE C STRICT
-AS 'MODULE_PATHNAME', 'tq_debug_transform_metadata';
-
-COMMENT ON FUNCTION tq_debug_transform_metadata(regclass) IS 'Test-only helper that reads persisted turboquant transform metadata';
-
 CREATE FUNCTION tq_index_metadata_core(regclass)
 RETURNS text
 LANGUAGE C STRICT
@@ -50,25 +28,32 @@ AS 'MODULE_PATHNAME', 'tq_runtime_simd_features_core';
 
 CREATE FUNCTION tq_last_scan_stats()
 RETURNS jsonb
-LANGUAGE sql
+LANGUAGE C
 VOLATILE
-AS $$
-	SELECT tq_last_scan_stats_core()::jsonb;
-$$;
+AS 'MODULE_PATHNAME', 'tq_last_scan_stats';
 
 COMMENT ON FUNCTION tq_last_scan_stats() IS 'Returns backend-local JSON metrics for the last turboquant scan in the current session.';
 
-COMMENT ON FUNCTION tq_last_shadow_decode_candidate_tids_core() IS 'Diagnostic helper that returns backend-local shadow decode candidate CTIDs from the last turboquant scan in the current session.';
+CREATE FUNCTION tq_last_shadow_decode_candidate_tids()
+RETURNS text[]
+LANGUAGE C
+VOLATILE
+AS 'MODULE_PATHNAME', 'tq_last_shadow_decode_candidate_tids';
+
+COMMENT ON FUNCTION tq_last_shadow_decode_candidate_tids() IS 'Returns backend-local shadow decode candidate CTIDs from the last turboquant scan in the current session.';
 
 CREATE FUNCTION tq_runtime_simd_features()
 RETURNS jsonb
-LANGUAGE sql
+LANGUAGE C
 STABLE
-AS $$
-	SELECT tq_runtime_simd_features_core()::jsonb;
-$$;
+AS 'MODULE_PATHNAME', 'tq_runtime_simd_features';
 
 COMMENT ON FUNCTION tq_runtime_simd_features() IS 'Returns compile-time and runtime SIMD availability plus the preferred turboquant score kernel.';
+
+REVOKE EXECUTE ON FUNCTION tq_index_metadata_core(regclass) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION tq_last_scan_stats_core() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION tq_last_shadow_decode_candidate_tids_core() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION tq_runtime_simd_features_core() FROM PUBLIC;
 
 CREATE FUNCTION tq_index_metadata(indexed_index regclass)
 RETURNS jsonb
@@ -77,7 +62,7 @@ AS $$
 DECLARE
 	meta jsonb;
 	heap_relation regclass;
-	heap_live_rows bigint;
+	heap_live_rows_estimate bigint;
 	opclass_name text;
 	input_type text;
 BEGIN
@@ -86,25 +71,29 @@ BEGIN
 	SELECT
 		i.indrelid::regclass,
 		opc.opcname,
-		opc.opcintype::regtype::text
+		opc.opcintype::regtype::text,
+		CASE
+			WHEN heap_class.reltuples < 0 THEN NULL
+			ELSE round(heap_class.reltuples)::bigint
+		END
 	INTO
 		heap_relation,
 		opclass_name,
-		input_type
+		input_type,
+		heap_live_rows_estimate
 	FROM pg_index AS i
 	JOIN pg_opclass AS opc
 		ON opc.oid = i.indclass[0]
+	JOIN pg_class AS heap_class
+		ON heap_class.oid = i.indrelid
 	WHERE i.indexrelid = indexed_index;
-
-	EXECUTE format('SELECT count(*) FROM %s', heap_relation)
-	INTO heap_live_rows;
 
 	RETURN meta || jsonb_build_object(
 		'access_method', 'turboquant',
 		'opclass', opclass_name,
 		'input_type', input_type,
 		'heap_relation', heap_relation::text,
-		'heap_live_rows', heap_live_rows,
+		'heap_live_rows_estimate', heap_live_rows_estimate,
 		'capabilities', jsonb_build_object(
 			'ordered_scan', true,
 			'bitmap_scan', true,
@@ -116,7 +105,37 @@ BEGIN
 END;
 $$;
 
-COMMENT ON FUNCTION tq_index_metadata(regclass) IS 'Returns stable JSON metadata, capability flags, and maintenance stats for a turboquant index.';
+COMMENT ON FUNCTION tq_index_metadata(regclass) IS 'Returns stable JSON metadata, capability flags, and cheap estimated heap stats for a turboquant index.';
+
+CREATE FUNCTION tq_index_heap_stats(indexed_index regclass)
+RETURNS jsonb
+LANGUAGE plpgsql
+AS $$
+DECLARE
+	heap_relation regclass;
+	heap_live_rows_exact bigint;
+BEGIN
+	SELECT i.indrelid::regclass
+	INTO heap_relation
+	FROM pg_index AS i
+	WHERE i.indexrelid = indexed_index;
+
+	IF heap_relation IS NULL THEN
+		RAISE EXCEPTION 'relation % is not a valid turboquant index', indexed_index
+			USING ERRCODE = '22023';
+	END IF;
+
+	EXECUTE format('SELECT count(*) FROM %s', heap_relation)
+	INTO heap_live_rows_exact;
+
+	RETURN jsonb_build_object(
+		'heap_relation', heap_relation::text,
+		'heap_live_rows_exact', heap_live_rows_exact
+	);
+END;
+$$;
+
+COMMENT ON FUNCTION tq_index_heap_stats(regclass) IS 'Returns exact heap statistics for a turboquant index. This helper is intentionally expensive.';
 
 CREATE FUNCTION tq_metric_order_operator(metric text)
 RETURNS text
@@ -506,6 +525,66 @@ $$;
 COMMENT ON FUNCTION tq_rerank_candidates(regclass, name, name, vector, text, integer, integer, integer, integer) IS 'Returns approximate candidates reranked exactly within SQL over the candidate set.';
 COMMENT ON FUNCTION tq_rerank_candidates(regclass, name, name, halfvec, text, integer, integer, integer, integer) IS 'Returns approximate candidates reranked exactly within SQL over the candidate set.';
 
+CREATE FUNCTION tq_vector_negative_inner_product(left_vector vector, right_vector vector)
+RETURNS double precision
+LANGUAGE sql
+IMMUTABLE
+STRICT
+PARALLEL SAFE
+AS $$
+	SELECT -((left_vector <#> right_vector)::double precision);
+$$;
+
+CREATE FUNCTION tq_vector_l2_squared_distance(left_vector vector, right_vector vector)
+RETURNS double precision
+LANGUAGE sql
+IMMUTABLE
+STRICT
+PARALLEL SAFE
+AS $$
+	SELECT power((left_vector <-> right_vector)::double precision, 2);
+$$;
+
+CREATE FUNCTION tq_vector_norm(input_vector vector)
+RETURNS double precision
+LANGUAGE sql
+IMMUTABLE
+STRICT
+PARALLEL SAFE
+AS $$
+	SELECT sqrt(GREATEST(-((input_vector <#> input_vector)::double precision), 0.0));
+$$;
+
+CREATE FUNCTION tq_halfvec_negative_inner_product(left_vector halfvec, right_vector halfvec)
+RETURNS double precision
+LANGUAGE sql
+IMMUTABLE
+STRICT
+PARALLEL SAFE
+AS $$
+	SELECT -((left_vector <#> right_vector)::double precision);
+$$;
+
+CREATE FUNCTION tq_halfvec_l2_squared_distance(left_vector halfvec, right_vector halfvec)
+RETURNS double precision
+LANGUAGE sql
+IMMUTABLE
+STRICT
+PARALLEL SAFE
+AS $$
+	SELECT power((left_vector <-> right_vector)::double precision, 2);
+$$;
+
+CREATE FUNCTION tq_halfvec_norm(input_vector halfvec)
+RETURNS double precision
+LANGUAGE sql
+IMMUTABLE
+STRICT
+PARALLEL SAFE
+AS $$
+	SELECT sqrt(GREATEST(-((input_vector <#> input_vector)::double precision), 0.0));
+$$;
+
 CREATE FUNCTION tq_bitmap_cosine_filter(query_vector vector,
 										distance_threshold double precision)
 RETURNS bytea
@@ -572,32 +651,32 @@ CREATE OPERATOR CLASS tq_cosine_ops
 DEFAULT FOR TYPE vector USING turboquant FAMILY tq_vector_cosine_turboquant_ops AS
 	OPERATOR 1 <?=> (vector, bytea),
 	OPERATOR 1 <=> (vector, vector) FOR ORDER BY float_ops,
-	FUNCTION 1 vector_negative_inner_product(vector, vector),
-	FUNCTION 2 vector_norm(vector);
+	FUNCTION 1 tq_vector_negative_inner_product(vector, vector),
+	FUNCTION 2 tq_vector_norm(vector);
 
 CREATE OPERATOR CLASS tq_ip_ops
 FOR TYPE vector USING turboquant FAMILY tq_vector_ip_turboquant_ops AS
 	OPERATOR 1 <#> (vector, vector) FOR ORDER BY float_ops,
-	FUNCTION 1 vector_negative_inner_product(vector, vector);
+	FUNCTION 1 tq_vector_negative_inner_product(vector, vector);
 
 CREATE OPERATOR CLASS tq_l2_ops
 FOR TYPE vector USING turboquant FAMILY tq_vector_l2_turboquant_ops AS
 	OPERATOR 1 <-> (vector, vector) FOR ORDER BY float_ops,
-	FUNCTION 1 vector_l2_squared_distance(vector, vector);
+	FUNCTION 1 tq_vector_l2_squared_distance(vector, vector);
 
 CREATE OPERATOR CLASS tq_halfvec_cosine_ops
 DEFAULT FOR TYPE halfvec USING turboquant FAMILY tq_halfvec_cosine_turboquant_ops AS
 	OPERATOR 1 <?=> (halfvec, bytea),
 	OPERATOR 1 <=> (halfvec, halfvec) FOR ORDER BY float_ops,
-	FUNCTION 1 halfvec_negative_inner_product(halfvec, halfvec),
-	FUNCTION 2 l2_norm(halfvec);
+	FUNCTION 1 tq_halfvec_negative_inner_product(halfvec, halfvec),
+	FUNCTION 2 tq_halfvec_norm(halfvec);
 
 CREATE OPERATOR CLASS tq_halfvec_ip_ops
 FOR TYPE halfvec USING turboquant FAMILY tq_halfvec_ip_turboquant_ops AS
 	OPERATOR 1 <#> (halfvec, halfvec) FOR ORDER BY float_ops,
-	FUNCTION 1 halfvec_negative_inner_product(halfvec, halfvec);
+	FUNCTION 1 tq_halfvec_negative_inner_product(halfvec, halfvec);
 
 CREATE OPERATOR CLASS tq_halfvec_l2_ops
 FOR TYPE halfvec USING turboquant FAMILY tq_halfvec_l2_turboquant_ops AS
 	OPERATOR 1 <-> (halfvec, halfvec) FOR ORDER BY float_ops,
-	FUNCTION 1 halfvec_l2_squared_distance(halfvec, halfvec);
+	FUNCTION 1 tq_halfvec_l2_squared_distance(halfvec, halfvec);

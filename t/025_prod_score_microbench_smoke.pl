@@ -7,12 +7,13 @@ use Test::More;
 
 my $output_path = 'tmp/prod-score-microbench.json';
 
-command_ok(
+command_exit_is(
 	[
 		'python3',
 		'scripts/prod_score_microbench.py',
 		'--output=' . $output_path,
 	],
+	0,
 	'prod score microbenchmark helper emits JSON output'
 );
 

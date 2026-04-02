@@ -47,7 +47,8 @@ SELECT
 	(meta->>'list_count')::int AS list_count,
 	(meta->>'live_count')::int AS live_count,
 	(meta->>'dead_count')::int AS dead_count,
-	(meta->>'heap_live_rows')::int AS heap_live_rows,
+	(meta->>'heap_live_rows_estimate')::int AS heap_live_rows_estimate,
+	(stats->>'heap_live_rows_exact')::int AS heap_live_rows_exact,
 	meta #>> '{transform,kind}' AS transform_kind,
 	(meta #>> '{transform,version}')::int AS transform_version,
 	(meta->>'faithful_fast_path')::boolean AS faithful_fast_path,
@@ -60,10 +61,14 @@ SELECT
 	(meta #>> '{residual_sketch,projected_dimension}')::int AS residual_projected_dimension,
 	(meta #>> '{residual_sketch,bit_budget}')::int AS residual_bit_budget,
 	meta #>> '{estimator,mode}' AS estimator_mode
-FROM (SELECT tq_index_metadata('tq_admin_flat_idx'::regclass) AS meta) AS s;
- format_version | algorithm_version | metric |    opclass    | list_count | live_count | dead_count | heap_live_rows | transform_kind | transform_version | faithful_fast_path | compatibility_fallback_only | page_summary_mode | page_summary_safe_pruning | quantizer_family | residual_sketch_kind | residual_bits_per_dimension | residual_projected_dimension | residual_bit_budget |  estimator_mode   
-----------------+-------------------+--------+---------------+------------+------------+------------+----------------+----------------+-------------------+--------------------+-----------------------------+-------------------+---------------------------+------------------+----------------------+-----------------------------+------------------------------+---------------------+-------------------
-             12 |                 3 | cosine | tq_cosine_ops |          0 |          4 |          0 |              4 | hadamard       |                 1 | t                  | f                           | disabled          | f                         | beta_lloyd_max   | 1bit_qjl             |                           1 |                            2 |                   2 | qprod_unbiased_ip
+FROM (
+	SELECT
+		tq_index_metadata('tq_admin_flat_idx'::regclass) AS meta,
+		tq_index_heap_stats('tq_admin_flat_idx'::regclass) AS stats
+) AS s;
+ format_version | algorithm_version | metric |    opclass    | list_count | live_count | dead_count | heap_live_rows_estimate | heap_live_rows_exact | transform_kind | transform_version | faithful_fast_path | compatibility_fallback_only | page_summary_mode | page_summary_safe_pruning | quantizer_family | residual_sketch_kind | residual_bits_per_dimension | residual_projected_dimension | residual_bit_budget |  estimator_mode   
+----------------+-------------------+--------+---------------+------------+------------+------------+-------------------------+----------------------+----------------+-------------------+--------------------+-----------------------------+-------------------+---------------------------+------------------+----------------------+-----------------------------+------------------------------+---------------------+-------------------
+             12 |                 3 | cosine | tq_cosine_ops |          0 |          4 |          0 |                       4 |                    4 | hadamard       |                 1 | t                  | f                           | disabled          | f                         | beta_lloyd_max   | 1bit_qjl             |                           1 |                            2 |                   2 | qprod_unbiased_ip
 (1 row)
 
 INSERT INTO tq_admin_docs (id, embedding) VALUES
@@ -71,45 +76,61 @@ INSERT INTO tq_admin_docs (id, embedding) VALUES
 SELECT
 	(meta->>'live_count')::int AS live_count,
 	(meta->>'dead_count')::int AS dead_count,
-	(meta->>'heap_live_rows')::int AS heap_live_rows
-FROM (SELECT tq_index_metadata('tq_admin_flat_idx'::regclass) AS meta) AS s;
- live_count | dead_count | heap_live_rows 
-------------+------------+----------------
-          5 |          0 |              5
+	(stats->>'heap_live_rows_exact')::int AS heap_live_rows_exact
+FROM (
+	SELECT
+		tq_index_metadata('tq_admin_flat_idx'::regclass) AS meta,
+		tq_index_heap_stats('tq_admin_flat_idx'::regclass) AS stats
+) AS s;
+ live_count | dead_count | heap_live_rows_exact 
+------------+------------+----------------------
+          5 |          0 |                    5
 (1 row)
 
 DELETE FROM tq_admin_docs WHERE id = 5;
 SELECT
 	(meta->>'live_count')::int AS live_count,
 	(meta->>'dead_count')::int AS dead_count,
-	(meta->>'heap_live_rows')::int AS heap_live_rows
-FROM (SELECT tq_index_metadata('tq_admin_flat_idx'::regclass) AS meta) AS s;
- live_count | dead_count | heap_live_rows 
-------------+------------+----------------
-          5 |          0 |              4
+	(stats->>'heap_live_rows_exact')::int AS heap_live_rows_exact
+FROM (
+	SELECT
+		tq_index_metadata('tq_admin_flat_idx'::regclass) AS meta,
+		tq_index_heap_stats('tq_admin_flat_idx'::regclass) AS stats
+) AS s;
+ live_count | dead_count | heap_live_rows_exact 
+------------+------------+----------------------
+          5 |          0 |                    4
 (1 row)
 
 VACUUM tq_admin_docs;
 SELECT
 	(meta->>'live_count')::int AS live_count,
 	(meta->>'dead_count')::int AS dead_count,
-	(meta->>'heap_live_rows')::int AS heap_live_rows,
+	(stats->>'heap_live_rows_exact')::int AS heap_live_rows_exact,
 	(meta->>'reclaimable_pages')::int AS reclaimable_pages
-FROM (SELECT tq_index_metadata('tq_admin_flat_idx'::regclass) AS meta) AS s;
- live_count | dead_count | heap_live_rows | reclaimable_pages 
-------------+------------+----------------+-------------------
-          4 |          0 |              4 |                 0
+FROM (
+	SELECT
+		tq_index_metadata('tq_admin_flat_idx'::regclass) AS meta,
+		tq_index_heap_stats('tq_admin_flat_idx'::regclass) AS stats
+) AS s;
+ live_count | dead_count | heap_live_rows_exact | reclaimable_pages 
+------------+------------+----------------------+-------------------
+          4 |          0 |                    4 |                 0
 (1 row)
 
 REINDEX INDEX tq_admin_flat_idx;
 SELECT
 	(meta->>'live_count')::int AS live_count,
 	(meta->>'dead_count')::int AS dead_count,
-	(meta->>'heap_live_rows')::int AS heap_live_rows
-FROM (SELECT tq_index_metadata('tq_admin_flat_idx'::regclass) AS meta) AS s;
- live_count | dead_count | heap_live_rows 
-------------+------------+----------------
-          4 |          0 |              4
+	(stats->>'heap_live_rows_exact')::int AS heap_live_rows_exact
+FROM (
+	SELECT
+		tq_index_metadata('tq_admin_flat_idx'::regclass) AS meta,
+		tq_index_heap_stats('tq_admin_flat_idx'::regclass) AS stats
+) AS s;
+ live_count | dead_count | heap_live_rows_exact 
+------------+------------+----------------------
+          4 |          0 |                    4
 (1 row)
 
 CREATE INDEX tq_admin_ivf_idx

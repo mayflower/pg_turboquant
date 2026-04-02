@@ -4,6 +4,7 @@ DROP EXTENSION IF EXISTS vector CASCADE;
 RESET client_min_messages;
 CREATE EXTENSION vector;
 CREATE EXTENSION pg_turboquant;
+CREATE EXTENSION pg_turboquant_test_support;
 
 CREATE OPERATOR FAMILY tq_int4_test_fam USING turboquant;
 
@@ -37,3 +38,5 @@ WITH (lanes = 8);
 SELECT tq_debug_validate_reloptions(
   ARRAY['bits=4', 'lists=0', 'lanes=auto', 'transform=hadamard', 'normalized=true']
 );
+
+DROP EXTENSION pg_turboquant_test_support;

@@ -39,7 +39,11 @@ jobs:
       - name: Bootstrap dependency
         env:
           PG_CONFIG: /usr/lib/postgresql/${{ matrix.postgresql_version }}/bin/pg_config
+          PGVECTOR_REF: v0.8.1
         run: ./scripts/bootstrap_dev.sh
+
+      - name: Validate packaging contract
+        run: python3 -m unittest tests.test_packaging_contract
 
       - name: Build and test
         env:
@@ -51,6 +55,117 @@ jobs:
           make unitcheck
           make installcheck
           make tapcheck
+
+  compatibility-matrix:
+    name: Compatibility (${{ matrix.postgresql_version }}, ${{ matrix.pgvector_track }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        postgresql_version: [16, 17]
+        pgvector_track: [latest_supported]
+        include:
+          - pgvector_track: latest_supported
+            pgvector_ref: v0.8.1
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add PostgreSQL apt repository
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ca-certificates curl gnupg
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor -o /usr/share/keyrings/postgresql.gpg
+          echo "deb [signed-by=/usr/share/keyrings/postgresql.gpg] http://apt.postgresql.org/pub/repos/apt noble-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            perl \
+            postgresql-${{ matrix.postgresql_version }} \
+            postgresql-client-${{ matrix.postgresql_version }} \
+            postgresql-server-dev-${{ matrix.postgresql_version }} \
+            postgresql-contrib-${{ matrix.postgresql_version }} \
+            libipc-run-perl
+
+      - name: Bootstrap dependency
+        env:
+          PG_CONFIG: /usr/lib/postgresql/${{ matrix.postgresql_version }}/bin/pg_config
+          PGVECTOR_REF: ${{ matrix.pgvector_ref }}
+        run: ./scripts/bootstrap_dev.sh
+
+      - name: Validate compatibility contract
+        run: python3 -m unittest tests.test_packaging_contract
+
+      - name: Build and targeted compatibility checks
+        env:
+          PG_CONFIG: /usr/lib/postgresql/${{ matrix.postgresql_version }}/bin/pg_config
+        run: |
+          export PATH="/usr/lib/postgresql/${{ matrix.postgresql_version }}/bin:$PATH"
+          make
+          make install
+          PGXS="$(${PG_CONFIG} --pgxs)"
+          ./scripts/run_installcheck.sh "${PG_CONFIG}" "${PGXS}" "/usr/lib/postgresql/${{ matrix.postgresql_version }}/bin" public_api_surface corruption_guardrails
+
+  sanitizer:
+    name: Sanitizers
+    runs-on: ubuntu-latest
+    env:
+      PG_CONFIG: /usr/lib/postgresql/17/bin/pg_config
+      PGVECTOR_REF: v0.8.1
+      ASAN_OPTIONS: detect_leaks=0:halt_on_error=1
+      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add PostgreSQL apt repository
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ca-certificates curl gnupg
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor -o /usr/share/keyrings/postgresql.gpg
+          echo "deb [signed-by=/usr/share/keyrings/postgresql.gpg] http://apt.postgresql.org/pub/repos/apt noble-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            perl \
+            postgresql-17 \
+            postgresql-client-17 \
+            postgresql-server-dev-17 \
+            postgresql-contrib-17 \
+            libipc-run-perl
+
+      - name: Bootstrap dependency
+        run: ./scripts/bootstrap_dev.sh
+
+      - name: Validate packaging contract
+        run: python3 -m unittest tests.test_packaging_contract
+
+      - name: Build with ASan and UBSan
+        run: |
+          export PATH="/usr/lib/postgresql/17/bin:$PATH"
+          make clean
+          make COPT="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" LDFLAGS="-fsanitize=address,undefined"
+          make install COPT="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" LDFLAGS="-fsanitize=address,undefined"
+
+      - name: Run targeted sanitized checks
+        run: |
+          export PATH="/usr/lib/postgresql/17/bin:$PATH"
+          make unitcheck COPT="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" LDFLAGS="-fsanitize=address,undefined"
+          PGXS="$(${PG_CONFIG} --pgxs)"
+          ./scripts/run_installcheck.sh "${PG_CONFIG}" "${PGXS}" "/usr/lib/postgresql/17/bin" public_api_surface corruption_guardrails
+          ./scripts/fetch_postgres_test_libs.sh
+          ./scripts/install_perl_test_deps.sh
+          ./scripts/run_tapcheck.sh "${PGXS}" "/usr/lib/postgresql/17/bin" "$PWD/third_party/postgresql-source/src/test/perl" "$PWD/third_party/perl5" "t/012_maintenance_reuse_restart.pl t/015_concurrent_build_and_write.pl"
 
   coverage:
     name: Coverage
@@ -85,6 +200,8 @@ jobs:
           pip install gcovr
 
       - name: Bootstrap dependency
+        env:
+          PGVECTOR_REF: v0.8.1
         run: ./scripts/bootstrap_dev.sh
 
       - name: Build extension with coverage
@@ -125,7 +242,7 @@ jobs:
   sonarqube:
     name: SonarQube
     runs-on: mayflower-k8s-runners
-    needs: [build-and-test, coverage]
+    needs: [build-and-test, compatibility-matrix, sanitizer, coverage]
     steps:
       - uses: actions/checkout@v4
         with:

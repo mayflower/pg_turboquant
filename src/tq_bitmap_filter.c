@@ -8,9 +8,6 @@
 #include "utils/builtins.h"
 
 #include "src/tq_bitmap_filter.h"
-#include "third_party/pgvector/src/halfutils.h"
-#include "third_party/pgvector/src/halfvec.h"
-#include "third_party/pgvector/src/vector.h"
 
 #define TQ_BITMAP_FILTER_MAGIC UINT32_C(0x54425146)
 #define TQ_BITMAP_FILTER_VERSION UINT16_C(1)
@@ -86,114 +83,6 @@ tq_bitmap_distance_from_vectors(TqDistanceKind distance_kind,
 								"invalid turboquant bitmap filter: unsupported distance kind");
 			return false;
 	}
-}
-
-static bool
-tq_bitmap_filter_match_vector_value(const Vector *left_vector,
-									bytea *filter,
-									TqDistanceKind expected_distance,
-									bool *matches,
-									char *errmsg,
-									size_t errmsg_len)
-{
-	float	   *right_values = NULL;
-	uint32_t	right_dimension = 0;
-	double		threshold = 0.0;
-	double		distance = 0.0;
-
-	if (left_vector == NULL || matches == NULL)
-	{
-		tq_bitmap_set_error(errmsg, errmsg_len,
-							"invalid turboquant bitmap filter: vector and match output must be non-null");
-		return false;
-	}
-
-	if (!tq_bitmap_filter_parse(filter, expected_distance, &right_values,
-								&right_dimension, &threshold,
-								errmsg, errmsg_len))
-		return false;
-
-	if ((uint32_t) left_vector->dim != right_dimension)
-	{
-		pfree(right_values);
-		tq_bitmap_set_error(errmsg, errmsg_len,
-							"invalid turboquant bitmap filter: vector dimension does not match filter");
-		return false;
-	}
-
-	if (!tq_bitmap_distance_from_vectors(expected_distance,
-										 left_vector->x,
-										 right_values,
-										 right_dimension,
-										 &distance,
-										 errmsg,
-										 errmsg_len))
-	{
-		pfree(right_values);
-		return false;
-	}
-
-	pfree(right_values);
-	*matches = distance <= threshold;
-	return true;
-}
-
-static bool
-tq_bitmap_filter_match_halfvec_value(const HalfVector *left_vector,
-									 bytea *filter,
-									 TqDistanceKind expected_distance,
-									 bool *matches,
-									 char *errmsg,
-									 size_t errmsg_len)
-{
-	float	   *left_values = NULL;
-	float	   *right_values = NULL;
-	uint32_t	right_dimension = 0;
-	double		threshold = 0.0;
-	double		distance = 0.0;
-	uint32_t	i = 0;
-
-	if (left_vector == NULL || matches == NULL)
-	{
-		tq_bitmap_set_error(errmsg, errmsg_len,
-							"invalid turboquant bitmap filter: halfvec and match output must be non-null");
-		return false;
-	}
-
-	if (!tq_bitmap_filter_parse(filter, expected_distance, &right_values,
-								&right_dimension, &threshold,
-								errmsg, errmsg_len))
-		return false;
-
-	if ((uint32_t) left_vector->dim != right_dimension)
-	{
-		pfree(right_values);
-		tq_bitmap_set_error(errmsg, errmsg_len,
-							"invalid turboquant bitmap filter: halfvec dimension does not match filter");
-		return false;
-	}
-
-	left_values = (float *) palloc(sizeof(float) * (size_t) right_dimension);
-	for (i = 0; i < right_dimension; i++)
-		left_values[i] = HalfToFloat4(left_vector->x[i]);
-
-	if (!tq_bitmap_distance_from_vectors(expected_distance,
-										 left_values,
-										 right_values,
-										 right_dimension,
-										 &distance,
-										 errmsg,
-										 errmsg_len))
-	{
-		pfree(left_values);
-		pfree(right_values);
-		return false;
-	}
-
-	pfree(left_values);
-	pfree(right_values);
-	*matches = distance <= threshold;
-	return true;
 }
 
 bytea *
@@ -398,16 +287,23 @@ tq_bitmap_filter_match_datum(Datum value,
 Datum
 tq_bitmap_cosine_filter(PG_FUNCTION_ARGS)
 {
-	Vector	   *vector = PG_GETARG_VECTOR_P(0);
-	float	   *query_values;
+	Datum		value = PG_GETARG_DATUM(0);
+	float	   *query_values = NULL;
 	uint32_t	dimension = 0;
 	bytea	   *result;
 	char		error_buf[256];
 
-	query_values = (float *) palloc(sizeof(float) * (size_t) vector->dim);
 	memset(error_buf, 0, sizeof(error_buf));
-	if (!tq_vector_copy_from_pgvector(vector, query_values, (size_t) vector->dim,
-									  &dimension, error_buf, sizeof(error_buf)))
+	if (!tq_vector_dimension_from_datum_typed(value, TQ_VECTOR_INPUT_VECTOR,
+											  &dimension, error_buf, sizeof(error_buf)))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_EXCEPTION),
+				 errmsg("%s", error_buf)));
+
+	query_values = (float *) palloc(sizeof(float) * (size_t) dimension);
+	if (!tq_vector_copy_from_datum_typed(value, TQ_VECTOR_INPUT_VECTOR,
+										 query_values, (size_t) dimension,
+										 &dimension, error_buf, sizeof(error_buf)))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_EXCEPTION),
 				 errmsg("%s", error_buf)));
@@ -423,16 +319,23 @@ tq_bitmap_cosine_filter(PG_FUNCTION_ARGS)
 Datum
 tq_bitmap_cosine_filter_halfvec(PG_FUNCTION_ARGS)
 {
-	HalfVector *halfvec = PG_GETARG_HALFVEC_P(0);
-	float	   *query_values;
+	Datum		value = PG_GETARG_DATUM(0);
+	float	   *query_values = NULL;
 	uint32_t	dimension = 0;
 	bytea	   *result;
 	char		error_buf[256];
 
-	query_values = (float *) palloc(sizeof(float) * (size_t) halfvec->dim);
 	memset(error_buf, 0, sizeof(error_buf));
-	if (!tq_vector_copy_from_halfvec(halfvec, query_values, (size_t) halfvec->dim,
-									 &dimension, error_buf, sizeof(error_buf)))
+	if (!tq_vector_dimension_from_datum_typed(value, TQ_VECTOR_INPUT_HALFVEC,
+											  &dimension, error_buf, sizeof(error_buf)))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_EXCEPTION),
+				 errmsg("%s", error_buf)));
+
+	query_values = (float *) palloc(sizeof(float) * (size_t) dimension);
+	if (!tq_vector_copy_from_datum_typed(value, TQ_VECTOR_INPUT_HALFVEC,
+										 query_values, (size_t) dimension,
+										 &dimension, error_buf, sizeof(error_buf)))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_EXCEPTION),
 				 errmsg("%s", error_buf)));
@@ -448,17 +351,17 @@ tq_bitmap_cosine_filter_halfvec(PG_FUNCTION_ARGS)
 Datum
 tq_bitmap_cosine_match(PG_FUNCTION_ARGS)
 {
-	Vector	   *left_vector = PG_GETARG_VECTOR_P(0);
 	bool		matches = false;
 	char		error_buf[256];
 
 	memset(error_buf, 0, sizeof(error_buf));
-	if (!tq_bitmap_filter_match_vector_value(left_vector,
-											 PG_GETARG_BYTEA_PP(1),
-											 TQ_DISTANCE_COSINE,
-											 &matches,
-											 error_buf,
-											 sizeof(error_buf)))
+	if (!tq_bitmap_filter_match_datum(PG_GETARG_DATUM(0),
+									  TQ_VECTOR_INPUT_VECTOR,
+									  PG_GETARG_BYTEA_PP(1),
+									  TQ_DISTANCE_COSINE,
+									  &matches,
+									  error_buf,
+									  sizeof(error_buf)))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_EXCEPTION),
 				 errmsg("%s", error_buf)));
@@ -469,17 +372,17 @@ tq_bitmap_cosine_match(PG_FUNCTION_ARGS)
 Datum
 tq_bitmap_cosine_match_halfvec(PG_FUNCTION_ARGS)
 {
-	HalfVector *left_vector = PG_GETARG_HALFVEC_P(0);
 	bool		matches = false;
 	char		error_buf[256];
 
 	memset(error_buf, 0, sizeof(error_buf));
-	if (!tq_bitmap_filter_match_halfvec_value(left_vector,
-											  PG_GETARG_BYTEA_PP(1),
-											  TQ_DISTANCE_COSINE,
-											  &matches,
-											  error_buf,
-											  sizeof(error_buf)))
+	if (!tq_bitmap_filter_match_datum(PG_GETARG_DATUM(0),
+									  TQ_VECTOR_INPUT_HALFVEC,
+									  PG_GETARG_BYTEA_PP(1),
+									  TQ_DISTANCE_COSINE,
+									  &matches,
+									  error_buf,
+									  sizeof(error_buf)))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_EXCEPTION),
 				 errmsg("%s", error_buf)));

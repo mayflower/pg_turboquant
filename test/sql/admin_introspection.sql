@@ -52,7 +52,8 @@ SELECT
 	(meta->>'list_count')::int AS list_count,
 	(meta->>'live_count')::int AS live_count,
 	(meta->>'dead_count')::int AS dead_count,
-	(meta->>'heap_live_rows')::int AS heap_live_rows,
+	(meta->>'heap_live_rows_estimate')::int AS heap_live_rows_estimate,
+	(stats->>'heap_live_rows_exact')::int AS heap_live_rows_exact,
 	meta #>> '{transform,kind}' AS transform_kind,
 	(meta #>> '{transform,version}')::int AS transform_version,
 	(meta->>'faithful_fast_path')::boolean AS faithful_fast_path,
@@ -65,7 +66,11 @@ SELECT
 	(meta #>> '{residual_sketch,projected_dimension}')::int AS residual_projected_dimension,
 	(meta #>> '{residual_sketch,bit_budget}')::int AS residual_bit_budget,
 	meta #>> '{estimator,mode}' AS estimator_mode
-FROM (SELECT tq_index_metadata('tq_admin_flat_idx'::regclass) AS meta) AS s;
+FROM (
+	SELECT
+		tq_index_metadata('tq_admin_flat_idx'::regclass) AS meta,
+		tq_index_heap_stats('tq_admin_flat_idx'::regclass) AS stats
+) AS s;
 
 INSERT INTO tq_admin_docs (id, embedding) VALUES
 	(5, '[0,0,0,1]');
@@ -73,33 +78,49 @@ INSERT INTO tq_admin_docs (id, embedding) VALUES
 SELECT
 	(meta->>'live_count')::int AS live_count,
 	(meta->>'dead_count')::int AS dead_count,
-	(meta->>'heap_live_rows')::int AS heap_live_rows
-FROM (SELECT tq_index_metadata('tq_admin_flat_idx'::regclass) AS meta) AS s;
+	(stats->>'heap_live_rows_exact')::int AS heap_live_rows_exact
+FROM (
+	SELECT
+		tq_index_metadata('tq_admin_flat_idx'::regclass) AS meta,
+		tq_index_heap_stats('tq_admin_flat_idx'::regclass) AS stats
+) AS s;
 
 DELETE FROM tq_admin_docs WHERE id = 5;
 
 SELECT
 	(meta->>'live_count')::int AS live_count,
 	(meta->>'dead_count')::int AS dead_count,
-	(meta->>'heap_live_rows')::int AS heap_live_rows
-FROM (SELECT tq_index_metadata('tq_admin_flat_idx'::regclass) AS meta) AS s;
+	(stats->>'heap_live_rows_exact')::int AS heap_live_rows_exact
+FROM (
+	SELECT
+		tq_index_metadata('tq_admin_flat_idx'::regclass) AS meta,
+		tq_index_heap_stats('tq_admin_flat_idx'::regclass) AS stats
+) AS s;
 
 VACUUM tq_admin_docs;
 
 SELECT
 	(meta->>'live_count')::int AS live_count,
 	(meta->>'dead_count')::int AS dead_count,
-	(meta->>'heap_live_rows')::int AS heap_live_rows,
+	(stats->>'heap_live_rows_exact')::int AS heap_live_rows_exact,
 	(meta->>'reclaimable_pages')::int AS reclaimable_pages
-FROM (SELECT tq_index_metadata('tq_admin_flat_idx'::regclass) AS meta) AS s;
+FROM (
+	SELECT
+		tq_index_metadata('tq_admin_flat_idx'::regclass) AS meta,
+		tq_index_heap_stats('tq_admin_flat_idx'::regclass) AS stats
+) AS s;
 
 REINDEX INDEX tq_admin_flat_idx;
 
 SELECT
 	(meta->>'live_count')::int AS live_count,
 	(meta->>'dead_count')::int AS dead_count,
-	(meta->>'heap_live_rows')::int AS heap_live_rows
-FROM (SELECT tq_index_metadata('tq_admin_flat_idx'::regclass) AS meta) AS s;
+	(stats->>'heap_live_rows_exact')::int AS heap_live_rows_exact
+FROM (
+	SELECT
+		tq_index_metadata('tq_admin_flat_idx'::regclass) AS meta,
+		tq_index_heap_stats('tq_admin_flat_idx'::regclass) AS stats
+) AS s;
 
 CREATE INDEX tq_admin_ivf_idx
 	ON tq_admin_docs

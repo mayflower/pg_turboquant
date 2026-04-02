@@ -12,6 +12,7 @@ This guide covers the supported installation path for local development and benc
 ## Build and install
 
 ```sh
+./scripts/bootstrap_dev.sh
 make
 make install
 ```
@@ -60,6 +61,8 @@ make tapcheck
 
 - `CREATE EXTENSION vector` fails:
   pgvector is not installed in the target PostgreSQL instance.
+- `make install` succeeds but `CREATE EXTENSION vector` still fails:
+  `make install` no longer installs pgvector as a side effect. Provision pgvector through `./scripts/bootstrap_dev.sh`, your package manager, or your deployment tooling.
 - `make installcheck` fails on macOS with only `libpq` installed:
   you need a full server toolchain, not just the client library.
 - Queries fail on `halfvec` or `vector` operators:

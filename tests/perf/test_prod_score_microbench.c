@@ -146,6 +146,18 @@ test_unpack_bits(const uint8_t *packed, uint32_t bit_offset, uint32_t bit_count)
 	return value;
 }
 
+static void
+expand_single_candidate_nibbles(const uint8_t *candidate_nibbles,
+								  uint32_t dimension,
+								  uint8_t *block16_nibbles)
+{
+	uint32_t dim = 0;
+
+	memset(block16_nibbles, 0, (size_t) dimension * 16u);
+	for (dim = 0; dim < dimension; dim++)
+		block16_nibbles[(size_t) dim * 16u] = candidate_nibbles[dim];
+}
+
 static float
 quantized_qjl_score(const TqProdCodecConfig *config,
 					  const TqProdLut *lut,
@@ -1019,7 +1031,8 @@ run_lut16_reference_bench(uint32_t dimension,
 	TqProdLut lut;
 	TqProdLut16 lut16;
 	uint8_t *packed = NULL;
-	uint8_t *nibbles = NULL;
+	uint8_t *candidate_nibbles = NULL;
+	uint8_t *block16_nibbles = NULL;
 	float *query = NULL;
 	float *input = NULL;
 	float gamma = 0.0f;
@@ -1037,8 +1050,10 @@ run_lut16_reference_bench(uint32_t dimension,
 
 	query = (float *) calloc(dimension, sizeof(float));
 	input = (float *) calloc(dimension, sizeof(float));
-	nibbles = (uint8_t *) calloc(dimension, sizeof(uint8_t));
-	if (query == NULL || input == NULL || nibbles == NULL)
+	candidate_nibbles = (uint8_t *) calloc(dimension, sizeof(uint8_t));
+	block16_nibbles = (uint8_t *) calloc((size_t) dimension * 16u, sizeof(uint8_t));
+	if (query == NULL || input == NULL || candidate_nibbles == NULL
+		|| block16_nibbles == NULL)
 		goto cleanup;
 
 	seeded_unit_vector(17u + dimension, query, dimension);
@@ -1056,13 +1071,16 @@ run_lut16_reference_bench(uint32_t dimension,
 		|| !tq_prod_encode(&config, input, packed, layout.total_bytes, errmsg, errmsg_len)
 		|| !tq_prod_read_gamma(&config, packed, layout.total_bytes, &gamma, errmsg, errmsg_len)
 		|| !tq_prod_extract_nibbles(&config, packed, layout.total_bytes,
-									nibbles, dimension, errmsg, errmsg_len))
+									candidate_nibbles, dimension, errmsg, errmsg_len))
 		goto cleanup;
+
+	/* The block16 scorer consumes a dimension*16 lane-major nibble matrix. */
+	expand_single_candidate_nibbles(candidate_nibbles, dimension, block16_nibbles);
 
 	started_ns = monotonic_now_ns();
 	for (i = 0; i < iterations; i++)
 	{
-		if (!tq_prod_score_block16_scalar(&lut16, nibbles, &gamma, 1, &score,
+		if (!tq_prod_score_block16_scalar(&lut16, block16_nibbles, &gamma, 1, &score,
 										  errmsg, errmsg_len))
 			goto cleanup;
 		sink += score;
@@ -1112,7 +1130,8 @@ cleanup:
 	tq_prod_lut16_reset(&lut16);
 	tq_prod_lut_reset(&lut);
 	free(packed);
-	free(nibbles);
+	free(candidate_nibbles);
+	free(block16_nibbles);
 	free(query);
 	free(input);
 	return ok;
@@ -1129,7 +1148,8 @@ run_lut16_dispatch_bench(uint32_t dimension,
 	TqProdLut lut;
 	TqProdLut16 lut16;
 	uint8_t *packed = NULL;
-	uint8_t *nibbles = NULL;
+	uint8_t *candidate_nibbles = NULL;
+	uint8_t *block16_nibbles = NULL;
 	float *query = NULL;
 	float *input = NULL;
 	float gamma = 0.0f;
@@ -1148,8 +1168,10 @@ run_lut16_dispatch_bench(uint32_t dimension,
 
 	query = (float *) calloc(dimension, sizeof(float));
 	input = (float *) calloc(dimension, sizeof(float));
-	nibbles = (uint8_t *) calloc(dimension, sizeof(uint8_t));
-	if (query == NULL || input == NULL || nibbles == NULL)
+	candidate_nibbles = (uint8_t *) calloc(dimension, sizeof(uint8_t));
+	block16_nibbles = (uint8_t *) calloc((size_t) dimension * 16u, sizeof(uint8_t));
+	if (query == NULL || input == NULL || candidate_nibbles == NULL
+		|| block16_nibbles == NULL)
 		goto cleanup;
 
 	seeded_unit_vector(17u + dimension, query, dimension);
@@ -1168,13 +1190,15 @@ run_lut16_dispatch_bench(uint32_t dimension,
 		|| !tq_prod_encode(&config, input, packed, layout.total_bytes, errmsg, errmsg_len)
 		|| !tq_prod_read_gamma(&config, packed, layout.total_bytes, &gamma, errmsg, errmsg_len)
 		|| !tq_prod_extract_nibbles(&config, packed, layout.total_bytes,
-									nibbles, dimension, errmsg, errmsg_len))
+									candidate_nibbles, dimension, errmsg, errmsg_len))
 		goto cleanup;
+
+	expand_single_candidate_nibbles(candidate_nibbles, dimension, block16_nibbles);
 
 	started_ns = monotonic_now_ns();
 	for (i = 0; i < iterations; i++)
 	{
-		if (!tq_prod_score_block16_dispatch(&lut16, nibbles, &gamma, 1,
+		if (!tq_prod_score_block16_dispatch(&lut16, block16_nibbles, &gamma, 1,
 											TQ_PROD_SCORE_AUTO, &score, &used_kernel,
 											errmsg, errmsg_len))
 			goto cleanup;
@@ -1228,7 +1252,8 @@ cleanup:
 	tq_prod_lut16_reset(&lut16);
 	tq_prod_lut_reset(&lut);
 	free(packed);
-	free(nibbles);
+	free(candidate_nibbles);
+	free(block16_nibbles);
 	free(query);
 	free(input);
 	return ok;
@@ -1245,7 +1270,8 @@ run_lut16_quantized_fused_bench(uint32_t dimension,
 	TqProdLut lut;
 	TqProdLut16 lut16;
 	uint8_t *packed = NULL;
-	uint8_t *nibbles = NULL;
+	uint8_t *candidate_nibbles = NULL;
+	uint8_t *block16_nibbles = NULL;
 	float *query = NULL;
 	float *input = NULL;
 	float gamma = 0.0f;
@@ -1263,8 +1289,10 @@ run_lut16_quantized_fused_bench(uint32_t dimension,
 
 	query = (float *) calloc(dimension, sizeof(float));
 	input = (float *) calloc(dimension, sizeof(float));
-	nibbles = (uint8_t *) calloc(dimension, sizeof(uint8_t));
-	if (query == NULL || input == NULL || nibbles == NULL)
+	candidate_nibbles = (uint8_t *) calloc(dimension, sizeof(uint8_t));
+	block16_nibbles = (uint8_t *) calloc((size_t) dimension * 16u, sizeof(uint8_t));
+	if (query == NULL || input == NULL || candidate_nibbles == NULL
+		|| block16_nibbles == NULL)
 		goto cleanup;
 
 	seeded_unit_vector(17u + dimension, query, dimension);
@@ -1283,13 +1311,15 @@ run_lut16_quantized_fused_bench(uint32_t dimension,
 		|| !tq_prod_encode(&config, input, packed, layout.total_bytes, errmsg, errmsg_len)
 		|| !tq_prod_read_gamma(&config, packed, layout.total_bytes, &gamma, errmsg, errmsg_len)
 		|| !tq_prod_extract_nibbles(&config, packed, layout.total_bytes,
-									nibbles, dimension, errmsg, errmsg_len))
+									candidate_nibbles, dimension, errmsg, errmsg_len))
 		goto cleanup;
+
+	expand_single_candidate_nibbles(candidate_nibbles, dimension, block16_nibbles);
 
 	started_ns = monotonic_now_ns();
 	for (i = 0; i < iterations; i++)
 	{
-		if (!tq_prod_score_block16_quantized_scalar(&lut16, nibbles, &gamma, 1, &score,
+		if (!tq_prod_score_block16_quantized_scalar(&lut16, block16_nibbles, &gamma, 1, &score,
 													errmsg, errmsg_len))
 			goto cleanup;
 		sink += score;
@@ -1339,7 +1369,8 @@ cleanup:
 	tq_prod_lut16_reset(&lut16);
 	tq_prod_lut_reset(&lut);
 	free(packed);
-	free(nibbles);
+	free(candidate_nibbles);
+	free(block16_nibbles);
 	free(query);
 	free(input);
 	return ok;

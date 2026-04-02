@@ -38,10 +38,16 @@ my $built = decode_json(
 		q{SELECT tq_index_metadata('admin_introspection_idx'::regclass)::text;}
 	)
 );
+my $built_heap = decode_json(
+	$node->safe_psql(
+		'postgres',
+		q{SELECT tq_index_heap_stats('admin_introspection_idx'::regclass)::text;}
+	)
+);
 
 is($built->{live_count}, 4, 'introspection reports build live count');
 is($built->{dead_count}, 0, 'introspection reports no dead tuples after build');
-is($built->{heap_live_rows}, 4, 'introspection reports heap live rows after build');
+is($built_heap->{heap_live_rows_exact}, 4, 'exact heap stats report live rows after build');
 
 $node->safe_psql('postgres', q{DELETE FROM admin_introspection_docs WHERE id = 4;});
 
@@ -51,9 +57,15 @@ my $deleted = decode_json(
 		q{SELECT tq_index_metadata('admin_introspection_idx'::regclass)::text;}
 	)
 );
+my $deleted_heap = decode_json(
+	$node->safe_psql(
+		'postgres',
+		q{SELECT tq_index_heap_stats('admin_introspection_idx'::regclass)::text;}
+	)
+);
 
 is($deleted->{live_count}, 4, 'index live count is unchanged before vacuum');
-is($deleted->{heap_live_rows}, 3, 'heap live rows update immediately after delete');
+is($deleted_heap->{heap_live_rows_exact}, 3, 'exact heap stats update immediately after delete');
 
 $node->safe_psql('postgres', q{VACUUM admin_introspection_docs;});
 
