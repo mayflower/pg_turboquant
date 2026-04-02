@@ -7,11 +7,11 @@ flowchart LR
     A["vector / halfvec column"] --> B["turboquant access method"]
     B --> C["structured transform metadata"]
     C --> D["Faithful TurboQuant v2 payload"]
-    D --> E["lane-adaptive batch pages"]
+    D --> E["SoA batch pages\n(4-bit packed nibbles)"]
     E --> F["flat scan or IVF probe scan"]
-    Q["query vector"] --> G["query-side transform + lookup preparation"]
+    Q["query vector"] --> G["query-side transform +\nLUT16 build + quantize"]
     G --> F
-    F --> H["approximate TID candidates"]
+    F -->|"NEON TBL / AVX2 VPSHUFB\nblock-16 kernel"| H["approximate TID candidates"]
     H --> I["SQL rerank helper"]
     I --> J["executor visibility + final ordering"]
 ```
@@ -49,6 +49,20 @@ The v2 codec implements the paper-faithful TurboQuant `Qprod` construction:
 
 This payload enables an unbiased inner-product estimator that operates directly on the quantized codes without decoding.
 
+### LUT16 quantization
+
+For the SIMD fast path (bits=4, dimension divisible by 8), the 3-bit idx code and 1-bit QJL sign are combined into a 4-bit nibble, enabling 16-entry lookup tables. At scan time:
+
+- `tq_prod_lut16_build` constructs 16-entry float LUTs per dimension from the query-dependent `Qprod` lookup tables
+- `tq_prod_lut16_quantize` quantizes all LUT entries to int8 using a **single global scale** per component (base and QJL), enabling pure integer accumulation across all dimensions without per-dimension float conversion
+
+## Page format
+
+Batch pages support two layouts, selected automatically at index build time:
+
+- **SoA (Structure of Arrays)**: used when LUT16 is supported and the layout fits in the page. Stores a contiguous TID array, gamma array, and a 4-bit packed dimension-major nibble block (two candidates per byte). A single representative packed code is stored at the end for page pruning bounds. The SIMD kernel reads nibbles directly from the page buffer with no intermediate copy.
+- **AoS (Array of Structures)**: legacy interleaved layout with per-lane TID + packed code entries. Used for dimensions that don't support LUT16 (not divisible by 8) or when the SoA layout exceeds the page budget (e.g., dim > ~480 after Hadamard padding with 16 lanes).
+
 ## Scan model
 
 There are two principal query paths:
@@ -61,9 +75,21 @@ There are two principal query paths:
 Within those paths there are two scoring modes:
 
 - **code-domain fast path** (`score_mode = 'code_domain'`):
-  normalized cosine and inner-product queries score directly on the quantized Qprod payload without decoding vectors. This is the faithful fast path.
+  normalized cosine and inner-product queries score directly on the quantized Qprod payload without decoding vectors. This is the faithful fast path. When the page uses SoA format with block-16 SIMD support, scoring uses the zero-copy kernel that reads 4-bit packed nibbles directly from the page buffer.
 - **decode-score fallback** (`score_mode = 'decode_score'`):
   L2 and non-normalized scans decode vectors from the stored codes and compute exact distances. This path does not claim faithful TurboQuant semantics.
+
+### SIMD kernels
+
+The block-16 scoring kernel processes 16 candidates per dimension in parallel:
+
+- **NEON (arm64)**: `vqtbl1q_u8` (TBL) for 16-wide lookup from quantized int8 LUT, `vaddw_s8` for add-widening accumulation in int16, drain to int32 every 256 dimensions
+- **AVX2 (x86_64)**: `_mm_shuffle_epi8` (VPSHUFB) for equivalent lookup, `_mm_add_epi16` for int16 accumulation, drain via `_mm256_cvtepi16_epi32`
+- **Scalar**: reference implementation using int32 accumulators
+
+All kernels apply the global dequantization scale only once after all dimensions are processed. The scalar path is the source of truth; SIMD kernels are validated against it.
+
+### Scan orchestration
 
 IVF scans additionally select a scan orchestration:
 

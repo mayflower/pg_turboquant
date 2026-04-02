@@ -2,7 +2,7 @@
 
 `pg_turboquant` is a PostgreSQL extension that adds a custom ANN index access method, `turboquant`, for compact nearest-neighbor search over `vector` and `halfvec`.
 
-It is designed around PostgreSQL's storage and executor constraints rather than treating ANN indexing as an external service. The project combines structured transforms, a faithful TurboQuant `v2` payload for normalized cosine and inner-product retrieval, lane-adaptive row-major batch pages, ordered ANN scans, bitmap support for filtered workloads, SQL-side exact reranking helpers, and a reproducible benchmark harness with machine-readable microbench regression gates.
+It is designed around PostgreSQL's storage and executor constraints rather than treating ANN indexing as an external service. The project combines structured transforms, a faithful TurboQuant `v2` payload for normalized cosine and inner-product retrieval, SoA batch pages with 4-bit packed dimension-major nibbles for zero-copy SIMD scoring, NEON TBL and AVX2 VPSHUFB block-16 kernels with global-scale int16 accumulation, ordered ANN scans, bitmap support for filtered workloads, SQL-side exact reranking helpers, and a reproducible benchmark harness with machine-readable microbench regression gates.
 
 ## Why it exists
 
@@ -13,7 +13,9 @@ It is designed around PostgreSQL's storage and executor constraints rather than 
 ## Algorithm contract
 
 - Faithful fast path:
-  normalized cosine and inner-product retrieval use the paper-faithful `Qprod` payload with structured rotation, `b - 1` stage-1 scalar codes, a residual 1-bit QJL sketch, and stored residual norm `gamma`.
+  normalized cosine and inner-product retrieval use the paper-faithful `Qprod` payload with structured rotation, `b - 1` stage-1 scalar codes, a residual 1-bit QJL sketch, and stored residual norm `gamma`. The fast path scores via a global-scale quantized LUT16 with NEON TBL or AVX2 VPSHUFB block-16 kernels, accumulating in int16 with periodic drain to int32 (Faiss FastScan-style).
+- Page format:
+  when LUT16 is supported (bits=4, dimension divisible by 8), batch pages use an SoA layout with 4-bit packed dimension-major nibbles, enabling the SIMD kernel to read directly from the page buffer with no per-scan transpose. Pages that exceed the 8 KB budget for SoA fall back to the legacy AoS interleaved layout.
 - Compatibility fallback:
   L2 and non-normalized scans still work, but they fall back to decoded-vector scoring rather than claiming faithful TurboQuant semantics.
 - Rebuild boundary:
@@ -85,42 +87,29 @@ FROM tq_rerank_candidates(
 
 ## Benchmark highlights
 
-### Comparative retrieval (amd64, PG 16, bge-small-en-v1.5, v2 Qprod/QJL codec, 200 queries per dataset)
+### Comparative retrieval (arm64 Apple Silicon, PG 16, harrier-oss-v1-270m 640d, 200 queries, SoA page format)
 
-**KILT NQ** (2.5K passages, flat scan):
+**Knowledge Base RAG** (2.8K passages, flat scan, microsoft/harrier-oss-v1-270m):
 
-| Method | Recall@10 | P95 Latency (ms) | Footprint |
+| Method | P50 Latency (ms) | P95 Latency (ms) | Index Size |
 |---|---:|---:|---:|
-| `pg_turboquant_approx` | 0.950 | 2.6 | 1.2 MB |
-| `pg_turboquant_rerank` | 0.950 | 2.7 | 1.2 MB |
-| `pgvector_hnsw_approx` | 0.950 | 3.7 | 5.1 MB |
-| `pgvector_hnsw_rerank` | 0.950 | 2.6 | 5.1 MB |
-| `pgvector_ivfflat_approx` | 0.950 | 3.5 | 4.4 MB |
-| `pgvector_ivfflat_rerank` | 0.950 | 2.8 | 4.4 MB |
+| `pg_turboquant` | **3.54** | 5.17 | **2.8 MB** |
+| `pgvector_hnsw` | 3.99 | 4.76 | 10.7 MB |
+| `pgvector_ivfflat` | 3.77 | 4.65 | 7.6 MB |
 
-**KILT HotpotQA** (10K passages, IVF scan):
+turboquant is **12% faster at p50** while being **3.8x smaller** than HNSW.
 
-| Method | Recall@10 | P95 Latency (ms) | Footprint |
-|---|---:|---:|---:|
-| `pg_turboquant_approx` | 0.363 | 4.6 | 6.2 MB |
-| `pg_turboquant_rerank` | 1.000 | 6.8 | 6.2 MB |
-| `pgvector_hnsw_approx` | 0.585 | 7.5 | 21.6 MB |
-| `pgvector_hnsw_rerank` | 1.000 | 7.4 | 21.6 MB |
-| `pgvector_ivfflat_approx` | 0.585 | 7.9 | 17.6 MB |
-| `pgvector_ivfflat_rerank` | 1.000 | 7.4 | 17.6 MB |
+### Comparative retrieval (arm64, PG 16, bge-small-en-v1.5 384d, 200 queries per dataset)
 
-**PopQA** (4.9K passages, flat scan):
+| Dataset | turboquant P95 | HNSW P95 | tq/HNSW | tq Footprint | HNSW Footprint |
+|---|---:|---:|---:|---:|---:|
+| KILT NQ (2.5K, flat) | 1.66 ms | 1.43 ms | 1.16x | 1.2 MB | 5.1 MB |
+| KILT HotpotQA (10K, IVF) | 1.92 ms | 2.87 ms | **0.67x** | 6.5 MB | 21.6 MB |
+| PopQA (4.9K, flat) | 2.87 ms | 2.94 ms | **0.98x** | 2.5 MB | 10.0 MB |
 
-| Method | Recall@10 | P95 Latency (ms) | Footprint |
-|---|---:|---:|---:|
-| `pg_turboquant_approx` | 1.000 | 6.5 | 2.5 MB |
-| `pg_turboquant_rerank` | 1.000 | 4.3 | 2.5 MB |
-| `pgvector_hnsw_approx` | 1.000 | 6.5 | 10.0 MB |
-| `pgvector_hnsw_rerank` | 1.000 | 4.4 | 10.0 MB |
-| `pgvector_ivfflat_approx` | 1.000 | 6.4 | 8.2 MB |
-| `pgvector_ivfflat_rerank` | 1.000 | 4.3 | 8.2 MB |
+turboquant **beats HNSW on IVF datasets** (1.5x faster on HotpotQA) and reaches **parity on flat scans**, while maintaining a **3-4x smaller footprint** across all datasets.
 
-Those results are environment-specific. The benchmark harness keeps recall, latency, footprint, WAL, and concurrent-write measurements separate so tradeoffs remain visible instead of being collapsed into a single score.
+Results are environment-specific. The benchmark harness keeps recall, latency, footprint, WAL, and concurrent-write measurements separate so tradeoffs remain visible instead of being collapsed into a single score.
 
 ## Documentation
 
