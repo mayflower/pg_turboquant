@@ -7,6 +7,7 @@
 
 #include "access/amapi.h"
 #include "access/genam.h"
+#include "access/itup.h"
 #include "access/reloptions.h"
 #include "access/stratnum.h"
 #include "access/tableam.h"
@@ -22,6 +23,7 @@
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
 #include "storage/itemptr.h"
+#include "utils/array.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
@@ -43,8 +45,15 @@
 
 PG_FUNCTION_INFO_V1(turboquanthandler);
 
-#define TQ_MAX_SUPPORTED_KEY_ATTRIBUTES 2
+#define TQ_MAX_SUPPORTED_KEY_ATTRIBUTES (1 + TQ_MAX_STORED_INT4_ATTRIBUTES)
 #define TQ_FILTER_EQ_STRATEGY 1
+
+typedef enum TqIterativeScanMode
+{
+	TQ_ITERATIVE_SCAN_OFF = 0,
+	TQ_ITERATIVE_SCAN_STRICT_ORDER,
+	TQ_ITERATIVE_SCAN_RELAXED_ORDER
+} TqIterativeScanMode;
 
 typedef struct TqBuildState
 {
@@ -65,12 +74,13 @@ typedef struct TqBuildState
 	float	   *transformed_values;
 	float	   *collected_vectors;
 	TqTid	   *collected_tids;
-	int32	   *collected_filter_values;
+	int32	   *collected_int4_attributes;
 	uint8_t	   *packed_code;
 	size_t		vector_count;
 	size_t		vector_capacity;
 	double		index_tuples;
-	bool		filter_enabled;
+	uint16_t	int4_attribute_count;
+	uint16_t	key_filter_attribute_count;
 } TqBuildState;
 
 typedef struct TqScanOpaque
@@ -89,8 +99,10 @@ typedef struct TqScanOpaque
 	TqVectorInputKind input_kind;
 	bool		normalized;
 	bool		shadow_decode_diagnostics;
-	bool		filter_enabled;
-	int32		filter_value;
+	uint16_t	int4_attribute_count;
+	uint16_t	key_filter_attribute_count;
+	uint16_t	filter_clause_count;
+	TqInt4FilterClause filter_clauses[TQ_MAX_STORED_INT4_ATTRIBUTES];
 	bool		prepared;
 } TqScanOpaque;
 
@@ -118,39 +130,82 @@ tq_prod_qjl_seed(uint64_t transform_seed)
 	return transform_seed ^ UINT64_C(0x9e3779b97f4a7c15);
 }
 
-static bool
-tq_relation_uses_int4_filter(Relation index_relation,
-							 char *errmsg,
-							 size_t errmsg_len)
+static uint16_t
+tq_relation_int4_attribute_count(Relation index_relation,
+								 char *errmsg,
+								 size_t errmsg_len)
 {
-	int key_attribute_count = 0;
+	int attribute_count = 0;
+	int attno = 0;
 
 	if (index_relation == NULL)
 	{
 		snprintf(errmsg, errmsg_len,
 				 "invalid turboquant index definition: index relation must be non-null");
-		return false;
+		return 0;
+	}
+
+	attribute_count = IndexRelationGetNumberOfAttributes(index_relation);
+	if (attribute_count <= 1)
+		return 0;
+	if (attribute_count - 1 > TQ_MAX_STORED_INT4_ATTRIBUTES)
+	{
+		snprintf(errmsg, errmsg_len,
+				 "turboquant supports at most %d stored int4 metadata attributes after the embedding key",
+				 TQ_MAX_STORED_INT4_ATTRIBUTES);
+		return UINT16_MAX;
+	}
+
+	for (attno = 1; attno < attribute_count; attno++)
+	{
+		if (TupleDescAttr(index_relation->rd_att, attno)->atttypid != INT4OID)
+		{
+			snprintf(errmsg, errmsg_len,
+					 "turboquant metadata columns after the embedding key must all be int4");
+			return UINT16_MAX;
+		}
+	}
+
+	return (uint16_t) (attribute_count - 1);
+}
+
+static uint16_t
+tq_relation_filter_key_attribute_count(Relation index_relation,
+									   char *errmsg,
+									   size_t errmsg_len)
+{
+	int key_attribute_count = 0;
+	int attno = 0;
+
+	if (index_relation == NULL)
+	{
+		snprintf(errmsg, errmsg_len,
+				 "invalid turboquant index definition: index relation must be non-null");
+		return 0;
 	}
 
 	key_attribute_count = IndexRelationGetNumberOfKeyAttributes(index_relation);
 	if (key_attribute_count <= 1)
-		return false;
-
-	if (key_attribute_count != TQ_MAX_SUPPORTED_KEY_ATTRIBUTES)
+		return 0;
+	if (key_attribute_count > TQ_MAX_SUPPORTED_KEY_ATTRIBUTES)
 	{
 		snprintf(errmsg, errmsg_len,
-				 "turboquant supports at most two key columns: one embedding key plus one int4 equality filter key");
-		return false;
+				 "turboquant supports at most one embedding key plus %d int4 filter keys",
+				 TQ_MAX_STORED_INT4_ATTRIBUTES);
+		return UINT16_MAX;
 	}
 
-	if (TupleDescAttr(index_relation->rd_att, 1)->atttypid != INT4OID)
+	for (attno = 1; attno < key_attribute_count; attno++)
 	{
-		snprintf(errmsg, errmsg_len,
-				 "turboquant multicolumn indexes require the second key column to be int4");
-		return false;
+		if (TupleDescAttr(index_relation->rd_att, attno)->atttypid != INT4OID)
+		{
+			snprintf(errmsg, errmsg_len,
+					 "turboquant filter key columns after the embedding key must be int4");
+			return UINT16_MAX;
+		}
 	}
 
-	return true;
+	return (uint16_t) (key_attribute_count - 1);
 }
 
 static void
@@ -158,6 +213,8 @@ tq_validate_index_schema(Relation index_relation)
 {
 	int attribute_count = 0;
 	int key_attribute_count = 0;
+	uint16_t int4_attribute_count = 0;
+	uint16_t key_filter_attribute_count = 0;
 	char error_buf[256];
 
 	if (index_relation == NULL)
@@ -166,15 +223,10 @@ tq_validate_index_schema(Relation index_relation)
 	attribute_count = IndexRelationGetNumberOfAttributes(index_relation);
 	key_attribute_count = IndexRelationGetNumberOfKeyAttributes(index_relation);
 
-	if (attribute_count != key_attribute_count)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("turboquant does not support included columns")));
-
 	if (key_attribute_count < 1 || key_attribute_count > TQ_MAX_SUPPORTED_KEY_ATTRIBUTES)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("turboquant supports one embedding key column plus an optional second int4 equality filter key")));
+				 errmsg("turboquant supports one embedding key column plus compact int4 filter keys")));
 
 	if (key_attribute_count >= 1)
 	{
@@ -188,17 +240,31 @@ tq_validate_index_schema(Relation index_relation)
 					 errmsg("turboquant indexes require the first key column to be vector or halfvec")));
 	}
 
-	if (key_attribute_count == 2
-		&& !tq_relation_uses_int4_filter(index_relation, error_buf, sizeof(error_buf)))
+	int4_attribute_count = tq_relation_int4_attribute_count(index_relation,
+															 error_buf,
+															 sizeof(error_buf));
+	key_filter_attribute_count = tq_relation_filter_key_attribute_count(index_relation,
+																	 error_buf,
+																	 sizeof(error_buf));
+	if (int4_attribute_count == UINT16_MAX || key_filter_attribute_count == UINT16_MAX)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("%s", error_buf)));
+
+	if (attribute_count > key_attribute_count
+		&& int4_attribute_count == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("turboquant INCLUDE columns must be compact int4 metadata columns")));
 }
 
 static void tq_load_option_config(Relation index_relation, TqOptionConfig *config);
-static bool tq_relation_uses_int4_filter(Relation index_relation,
-										 char *errmsg,
-										 size_t errmsg_len);
+static uint16_t tq_relation_int4_attribute_count(Relation index_relation,
+												 char *errmsg,
+												 size_t errmsg_len);
+static uint16_t tq_relation_filter_key_attribute_count(Relation index_relation,
+													   char *errmsg,
+													   size_t errmsg_len);
 static void tq_validate_index_schema(Relation index_relation);
 static void tq_reset_scan_opaque(TqScanOpaque *opaque);
 static void tq_buildstate_reset(TqBuildState *state);
@@ -220,7 +286,7 @@ static void tq_build_callback(Relation index, ItemPointer tid, Datum *values,
 static void tq_buildstate_initialize(TqBuildState *state, uint32_t dimension);
 static void tq_buildstate_collect_vector(TqBuildState *state, const float *values,
 										 ItemPointer tid,
-										 int32 filter_value);
+										 const int32 *int4_attributes);
 static void tq_buildstate_flush(TqBuildState *state);
 static void tq_write_centroid_pages(Relation index_relation,
 									const TqRouterModel *model,
@@ -293,7 +359,8 @@ static void tq_append_packed_tuple(Relation index_relation,
 								   const TqProdCodecConfig *prod_config,
 								   uint32_t list_id,
 								   const TqTid *heap_tid,
-								   const int32 *filter_value,
+								   const int32 *int4_values,
+								   uint16_t int4_value_count,
 								   const uint8_t *packed_code,
 								   size_t packed_code_len);
 static void tq_summarize_index(Relation index_relation,
@@ -481,8 +548,10 @@ tq_reset_scan_opaque(TqScanOpaque *opaque)
 	opaque->query_values = NULL;
 	opaque->query_dimension = 0;
 	opaque->shadow_decode_diagnostics = false;
-	opaque->filter_enabled = false;
-	opaque->filter_value = 0;
+	opaque->int4_attribute_count = 0;
+	opaque->key_filter_attribute_count = 0;
+	opaque->filter_clause_count = 0;
+	memset(opaque->filter_clauses, 0, sizeof(opaque->filter_clauses));
 	opaque->prepared = false;
 }
 
@@ -502,8 +571,8 @@ tq_buildstate_reset(TqBuildState *state)
 		pfree(state->collected_vectors);
 	if (state->collected_tids != NULL)
 		pfree(state->collected_tids);
-	if (state->collected_filter_values != NULL)
-		pfree(state->collected_filter_values);
+	if (state->collected_int4_attributes != NULL)
+		pfree(state->collected_int4_attributes);
 	if (state->packed_code != NULL)
 		pfree(state->packed_code);
 	memset(state, 0, sizeof(*state));
@@ -623,7 +692,8 @@ tq_buildstate_initialize(TqBuildState *state, uint32_t dimension)
 	lane_config.page_header_bytes = TQ_PAGE_HEADER_BYTES;
 	lane_config.special_space_bytes = TQ_PAGE_SPECIAL_BYTES;
 	lane_config.reserve_bytes = TQ_PAGE_RESERVED_BYTES;
-	lane_config.tid_bytes = TQ_TID_BYTES + (state->filter_enabled ? (int) sizeof(int32) : 0);
+	lane_config.tid_bytes = TQ_TID_BYTES
+		+ ((int) state->int4_attribute_count * (int) sizeof(int32_t));
 
 	if (!tq_resolve_lane_count(&lane_config, &resolved_lane_count,
 							   error_buf, sizeof(error_buf)))
@@ -678,7 +748,7 @@ static void
 tq_buildstate_collect_vector(TqBuildState *state,
 							 const float *values,
 							 ItemPointer tid,
-							 int32 filter_value)
+							 const int32 *int4_attributes)
 {
 	size_t		required_count = state->vector_count + 1;
 	size_t		new_capacity = 0;
@@ -706,13 +776,15 @@ tq_buildstate_collect_vector(TqBuildState *state,
 			state->collected_tids = (TqTid *) repalloc(state->collected_tids,
 													   sizeof(TqTid) * new_capacity);
 
-		if (state->filter_enabled)
+		if (state->int4_attribute_count > 0)
 		{
-			if (state->collected_filter_values == NULL)
-				state->collected_filter_values = (int32 *) palloc(sizeof(int32) * new_capacity);
+			size_t byte_count = sizeof(int32) * new_capacity * (size_t) state->int4_attribute_count;
+
+			if (state->collected_int4_attributes == NULL)
+				state->collected_int4_attributes = (int32 *) palloc(byte_count);
 			else
-				state->collected_filter_values = (int32 *) repalloc(state->collected_filter_values,
-																	 sizeof(int32) * new_capacity);
+				state->collected_int4_attributes = (int32 *) repalloc(state->collected_int4_attributes,
+																	  byte_count);
 		}
 
 		state->vector_capacity = new_capacity;
@@ -725,8 +797,10 @@ tq_buildstate_collect_vector(TqBuildState *state,
 		   state->transformed_values,
 		   sizeof(float) * (size_t) state->dimension);
 	state->collected_tids[state->vector_count] = page_tid;
-	if (state->filter_enabled)
-		state->collected_filter_values[state->vector_count] = filter_value;
+	if (state->int4_attribute_count > 0 && int4_attributes != NULL)
+		memcpy(state->collected_int4_attributes + (state->vector_count * (size_t) state->int4_attribute_count),
+			   int4_attributes,
+			   sizeof(int32_t) * (size_t) state->int4_attribute_count);
 	state->vector_count = required_count;
 	state->index_tuples += 1.0;
 }
@@ -1469,13 +1543,13 @@ tq_write_batch_pages(TqBuildState *state,
 				params.code_bytes = (uint32_t) state->prod_layout.total_bytes;
 				params.list_id = list_id;
 				params.next_block = TQ_INVALID_BLOCK_NUMBER;
-				params.has_int4_filter = state->filter_enabled;
-				if (!state->filter_enabled
-					&& tq_prod_lut16_is_supported(&state->prod_config, NULL, 0)
-					&& tq_batch_page_can_fit_soa(tq_relation_payload_size(),
-												 params.lane_count,
-												 state->prod_config.dimension,
-												 params.code_bytes))
+				params.int4_attribute_count = state->int4_attribute_count;
+				if (tq_prod_lut16_is_supported(&state->prod_config, NULL, 0)
+					&& tq_batch_page_can_fit_soa_with_int4_attributes(tq_relation_payload_size(),
+																	 params.lane_count,
+																	 state->prod_config.dimension,
+																	 params.code_bytes,
+																	 state->int4_attribute_count))
 					params.dimension = state->prod_config.dimension;
 
 				new_buffer = ReadBufferExtended(state->index_relation, MAIN_FORKNUM, P_NEW, RBM_NORMAL, NULL);
@@ -1506,6 +1580,12 @@ tq_write_batch_pages(TqBuildState *state,
 				lanes_used = 0;
 			}
 
+			{
+				const int32_t *row_int4_attributes = state->int4_attribute_count > 0
+					? state->collected_int4_attributes
+						+ (vector_index * (size_t) state->int4_attribute_count)
+					: NULL;
+
 			if (!tq_prod_encode(&state->prod_config, vector, state->packed_code,
 								state->prod_layout.total_bytes, error_buf, sizeof(error_buf)))
 				elog(ERROR, "%s", error_buf);
@@ -1527,7 +1607,10 @@ tq_write_batch_pages(TqBuildState *state,
 										   state->prod_layout.total_bytes,
 										   &gamma, error_buf, sizeof(error_buf))
 					|| !tq_wal_append_batch_soa(state->index_relation, current_buffer,
-												tid, nibbles,
+												tid,
+												row_int4_attributes,
+												state->int4_attribute_count,
+												nibbles,
 												state->prod_config.dimension, gamma,
 												&lanes_used, error_buf, sizeof(error_buf))
 					|| !tq_refresh_batch_page_summary(state->index_relation,
@@ -1545,9 +1628,8 @@ tq_write_batch_pages(TqBuildState *state,
 			{
 				if (!tq_wal_append_batch_code(state->index_relation, current_buffer,
 											  tid,
-											  state->filter_enabled
-												? &state->collected_filter_values[vector_index]
-												: NULL,
+											  row_int4_attributes,
+											  state->int4_attribute_count,
 											  state->packed_code,
 											  state->prod_layout.total_bytes,
 											  &lanes_used, error_buf, sizeof(error_buf))
@@ -1559,6 +1641,7 @@ tq_write_batch_pages(TqBuildState *state,
 					LockBuffer(current_buffer, BUFFER_LOCK_UNLOCK);
 					elog(ERROR, "%s", error_buf);
 				}
+			}
 			}
 			LockBuffer(current_buffer, BUFFER_LOCK_UNLOCK);
 
@@ -1667,7 +1750,8 @@ tq_build_callback(Relation index, ItemPointer tid, Datum *values,
 {
 	TqBuildState *state = (TqBuildState *) stateptr;
 	uint32_t	dimension = 0;
-	int32		filter_value = 0;
+	int			attno = 0;
+	int32		int4_attributes[TQ_MAX_STORED_INT4_ATTRIBUTES];
 	char		error_buf[256];
 
 	(void) index;
@@ -1694,14 +1778,20 @@ tq_build_callback(Relation index, ItemPointer tid, Datum *values,
 				(errcode(ERRCODE_DATA_EXCEPTION),
 				 errmsg("turboquant build requires consistent vector dimensions")));
 
-	if (state->filter_enabled)
+	memset(int4_attributes, 0, sizeof(int4_attributes));
+	for (attno = 0; attno < state->int4_attribute_count; attno++)
 	{
-		if (isnull[1])
-			return;
-		filter_value = DatumGetInt32(values[1]);
+		if (isnull[attno + 1])
+			ereport(ERROR,
+					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+					 errmsg("turboquant compact int4 metadata columns must be non-null")));
+		int4_attributes[attno] = DatumGetInt32(values[attno + 1]);
 	}
 
-	tq_buildstate_collect_vector(state, state->source_values, tid, filter_value);
+	tq_buildstate_collect_vector(state,
+								 state->source_values,
+								 tid,
+								 state->int4_attribute_count > 0 ? int4_attributes : NULL);
 }
 
 static IndexBuildResult *
@@ -1717,9 +1807,15 @@ tq_ambuild(Relation heap_relation, Relation index_relation, IndexInfo *index_inf
 	build_state.index_relation = index_relation;
 	build_state.distance_kind = tq_distance_kind_from_index(index_relation);
 	build_state.input_kind = tq_input_kind_from_index(index_relation);
-	build_state.filter_enabled = tq_relation_uses_int4_filter(index_relation,
-															  error_buf,
-															  sizeof(error_buf));
+	build_state.int4_attribute_count = tq_relation_int4_attribute_count(index_relation,
+																		error_buf,
+																		sizeof(error_buf));
+	build_state.key_filter_attribute_count = tq_relation_filter_key_attribute_count(index_relation,
+																			  error_buf,
+																			  sizeof(error_buf));
+	if (build_state.int4_attribute_count == UINT16_MAX
+		|| build_state.key_filter_attribute_count == UINT16_MAX)
+		elog(ERROR, "%s", error_buf);
 	tq_load_option_config(index_relation, &build_state.option_config);
 	tq_write_meta_page(index_relation, &build_state.meta_fields);
 
@@ -1800,8 +1896,9 @@ tq_aminsert(Relation index_relation, Datum *values, bool *isnull,
 	TqDistanceKind distance_kind;
 	TqVectorInputKind input_kind;
 	bool		needs_meta_write = false;
-	bool		filter_enabled = false;
-	int32		filter_value = 0;
+	uint16_t	int4_attribute_count = 0;
+	int32		int4_attributes[TQ_MAX_STORED_INT4_ATTRIBUTES];
+	int			attno = 0;
 	char		error_buf[256];
 
 	(void) heap_relation;
@@ -1825,17 +1922,20 @@ tq_aminsert(Relation index_relation, Datum *values, bool *isnull,
 	memset(&lane_config, 0, sizeof(lane_config));
 	memset(&distance_kind, 0, sizeof(distance_kind));
 	memset(&input_kind, 0, sizeof(input_kind));
+	memset(int4_attributes, 0, sizeof(int4_attributes));
 
 	distance_kind = tq_distance_kind_from_index(index_relation);
 	input_kind = tq_input_kind_from_index(index_relation);
-	filter_enabled = tq_relation_uses_int4_filter(index_relation,
-												  error_buf,
-												  sizeof(error_buf));
-	if (filter_enabled)
+	int4_attribute_count = tq_relation_int4_attribute_count(index_relation,
+															error_buf,
+															sizeof(error_buf));
+	if (int4_attribute_count == UINT16_MAX)
+		elog(ERROR, "%s", error_buf);
+	for (attno = 0; attno < int4_attribute_count; attno++)
 	{
-		if (isnull[1])
+		if (isnull[attno + 1])
 			return false;
-		filter_value = DatumGetInt32(values[1]);
+		int4_attributes[attno] = DatumGetInt32(values[attno + 1]);
 	}
 
 	meta_buffer = tq_lock_meta_page_buffer(index_relation);
@@ -1875,7 +1975,8 @@ tq_aminsert(Relation index_relation, Datum *values, bool *isnull,
 		lane_config.page_header_bytes = TQ_PAGE_HEADER_BYTES;
 		lane_config.special_space_bytes = TQ_PAGE_SPECIAL_BYTES;
 		lane_config.reserve_bytes = TQ_PAGE_RESERVED_BYTES;
-		lane_config.tid_bytes = TQ_TID_BYTES + (filter_enabled ? (int) sizeof(int32) : 0);
+		lane_config.tid_bytes = TQ_TID_BYTES
+			+ ((int) int4_attribute_count * (int) sizeof(int32_t));
 		if (!tq_resolve_lane_count(&lane_config, &resolved_lane_count,
 								   error_buf, sizeof(error_buf)))
 			elog(ERROR, "%s", error_buf);
@@ -2021,7 +2122,8 @@ tq_aminsert(Relation index_relation, Datum *values, bool *isnull,
 
 	tq_append_packed_tuple(index_relation, &meta_fields, &prod_config, list_id,
 						   &page_tid,
-						   filter_enabled ? &filter_value : NULL,
+						   int4_attribute_count > 0 ? int4_attributes : NULL,
+						   int4_attribute_count,
 						   packed_code, prod_layout.total_bytes);
 	LockBuffer(meta_buffer, BUFFER_LOCK_UNLOCK);
 	ReleaseBuffer(meta_buffer);
@@ -2214,6 +2316,11 @@ tq_amrescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 	tq_reset_scan_opaque(opaque);
 	scan->xs_recheck = false;
 	scan->xs_recheckorderby = false;
+	if (scan->xs_itup != NULL)
+	{
+		pfree(scan->xs_itup);
+		scan->xs_itup = NULL;
+	}
 }
 
 static bool
@@ -2577,7 +2684,8 @@ tq_append_packed_tuple(Relation index_relation,
 					   const TqProdCodecConfig *prod_config,
 					   uint32_t list_id,
 					   const TqTid *heap_tid,
-					   const int32 *filter_value,
+					   const int32 *int4_values,
+					   uint16_t int4_value_count,
 					   const uint8_t *packed_code,
 					   size_t packed_code_len)
 {
@@ -2637,13 +2745,13 @@ tq_append_packed_tuple(Relation index_relation,
 			params.code_bytes = (uint32_t) packed_code_len;
 			params.list_id = list_id;
 			params.next_block = TQ_INVALID_BLOCK_NUMBER;
-			params.has_int4_filter = filter_value != NULL;
-			if (filter_value == NULL
-				&& tq_prod_lut16_is_supported(prod_config, NULL, 0)
-				&& tq_batch_page_can_fit_soa(tq_relation_payload_size(),
-											 params.lane_count,
-											 prod_config->dimension,
-											 params.code_bytes))
+			params.int4_attribute_count = int4_value_count;
+			if (tq_prod_lut16_is_supported(prod_config, NULL, 0)
+				&& tq_batch_page_can_fit_soa_with_int4_attributes(tq_relation_payload_size(),
+																 params.lane_count,
+																 prod_config->dimension,
+																 params.code_bytes,
+																 int4_value_count))
 				params.dimension = prod_config->dimension;
 
 			buffer = ReadBufferExtended(index_relation, MAIN_FORKNUM, detached_block, RBM_NORMAL, NULL);
@@ -2676,13 +2784,13 @@ tq_append_packed_tuple(Relation index_relation,
 		params.code_bytes = (uint32_t) packed_code_len;
 		params.list_id = list_id;
 		params.next_block = TQ_INVALID_BLOCK_NUMBER;
-		params.has_int4_filter = filter_value != NULL;
-		if (filter_value == NULL
-			&& tq_prod_lut16_is_supported(prod_config, NULL, 0)
-			&& tq_batch_page_can_fit_soa(tq_relation_payload_size(),
-										 params.lane_count,
-										 prod_config->dimension,
-										 params.code_bytes))
+		params.int4_attribute_count = int4_value_count;
+		if (tq_prod_lut16_is_supported(prod_config, NULL, 0)
+			&& tq_batch_page_can_fit_soa_with_int4_attributes(tq_relation_payload_size(),
+															 params.lane_count,
+															 prod_config->dimension,
+															 params.code_bytes,
+															 int4_value_count))
 			params.dimension = prod_config->dimension;
 
 		buffer = ReadBufferExtended(index_relation, MAIN_FORKNUM, P_NEW, RBM_NORMAL, NULL);
@@ -2743,6 +2851,8 @@ tq_append_packed_tuple(Relation index_relation,
 			}
 
 			if (!tq_wal_append_batch_soa(index_relation, buffer, heap_tid,
+										 int4_values,
+										 int4_value_count,
 										 nibbles, prod_config->dimension, gamma,
 										 &lane_index, error_buf, sizeof(error_buf))
 				|| !tq_refresh_batch_page_summary(index_relation,
@@ -2761,7 +2871,8 @@ tq_append_packed_tuple(Relation index_relation,
 		else
 		{
 			if (!tq_wal_append_batch_code(index_relation, buffer, heap_tid,
-										  filter_value,
+										  int4_values,
+										  int4_value_count,
 										  packed_code, packed_code_len, &lane_index,
 										  error_buf, sizeof(error_buf))
 				|| !tq_refresh_batch_page_summary(index_relation,
@@ -3094,21 +3205,22 @@ tq_scan_batch_block(Relation index_relation,
 
 	buffer = ReadBufferExtended(index_relation, MAIN_FORKNUM, block_number, RBM_NORMAL, NULL);
 	page = BufferGetPage(buffer);
-	if (!tq_batch_page_scan_prod_with_scratch(tq_page_payload(page),
-											  tq_page_payload_size(page),
-											  &opaque->prod_config,
-											  opaque->normalized,
-											  opaque->distance_kind,
-											  &opaque->lut,
-											  opaque->query_values,
-											  opaque->query_dimension,
-											  opaque->filter_enabled,
-											  opaque->filter_value,
-											  heap,
-											  shadow_decode_heap,
-											  &opaque->scan_scratch,
-											  errmsg,
-											  errmsg_len))
+	if (!tq_batch_page_scan_prod_with_scratch_filtered(tq_page_payload(page),
+													   tq_page_payload_size(page),
+													   &opaque->prod_config,
+													   opaque->normalized,
+													   opaque->distance_kind,
+													   &opaque->lut,
+													   opaque->query_values,
+													   opaque->query_dimension,
+													   opaque->filter_clauses,
+													   opaque->filter_clause_count,
+													   opaque->int4_attribute_count,
+													   heap,
+													   shadow_decode_heap,
+													   &opaque->scan_scratch,
+													   errmsg,
+													   errmsg_len))
 	{
 		ReleaseBuffer(buffer);
 		return false;
@@ -3502,7 +3614,9 @@ tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque)
 	TqTid	   *pre_candidate_tids = NULL;
 	size_t		pre_candidate_tid_count = 0;
 	bool		decode_rescore_enabled = false;
-	bool		index_filter_enabled = false;
+	uint16_t	int4_attribute_count = 0;
+	uint16_t	key_filter_attribute_count = 0;
+	int			key_index = 0;
 	char		error_buf[256];
 
 	tq_validate_index_schema(scan->indexRelation);
@@ -3511,30 +3625,84 @@ tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque)
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("turboquant scans require exactly one ORDER BY expression")));
 
-	index_filter_enabled = tq_relation_uses_int4_filter(scan->indexRelation,
-														 error_buf,
-														 sizeof(error_buf));
-	if (scan->numberOfKeys > 1)
+	int4_attribute_count = tq_relation_int4_attribute_count(scan->indexRelation,
+															error_buf,
+															sizeof(error_buf));
+	key_filter_attribute_count = tq_relation_filter_key_attribute_count(scan->indexRelation,
+																		error_buf,
+																		sizeof(error_buf));
+	if (int4_attribute_count == UINT16_MAX
+		|| key_filter_attribute_count == UINT16_MAX)
+		elog(ERROR, "%s", error_buf);
+	if (scan->numberOfKeys > (int) key_filter_attribute_count)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("turboquant ordered scans support at most one equality filter on the second key column")));
+				 errmsg("turboquant ordered scans support equality or int4 ANY filters on compact int4 key columns")));
 
-	opaque->filter_enabled = false;
-	opaque->filter_value = 0;
-	if (scan->numberOfKeys == 1)
+	opaque->int4_attribute_count = int4_attribute_count;
+	opaque->key_filter_attribute_count = key_filter_attribute_count;
+	opaque->filter_clause_count = 0;
+	memset(opaque->filter_clauses, 0, sizeof(opaque->filter_clauses));
+	for (key_index = 0; key_index < scan->numberOfKeys; key_index++)
 	{
-		ScanKey filter_key = &scan->keyData[0];
+		ScanKey filter_key = &scan->keyData[key_index];
+		TqInt4FilterClause *clause = NULL;
 
-		if (!index_filter_enabled
-			|| filter_key->sk_attno != 2
+		if (filter_key->sk_attno < 2
+			|| filter_key->sk_attno > key_filter_attribute_count + 1
 			|| filter_key->sk_strategy != TQ_FILTER_EQ_STRATEGY
 			|| (filter_key->sk_flags & SK_ISNULL) != 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("turboquant ordered scans only support a non-null equality filter on the second int4 key column")));
+					 errmsg("turboquant ordered scans only support non-null int4 equality or ANY filters on compact key columns")));
 
-		opaque->filter_enabled = true;
-		opaque->filter_value = DatumGetInt32(filter_key->sk_argument);
+		clause = &opaque->filter_clauses[opaque->filter_clause_count++];
+		clause->attribute_index = (uint16_t) (filter_key->sk_attno - 2);
+		clause->value_count = 0;
+
+		if ((filter_key->sk_flags & SK_SEARCHARRAY) != 0)
+		{
+			ArrayType  *array_value = DatumGetArrayTypeP(filter_key->sk_argument);
+			Datum	   *elements = NULL;
+			bool	   *nulls = NULL;
+			int			element_count = 0;
+			int			element_index = 0;
+
+			if (ARR_ELEMTYPE(array_value) != INT4OID)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("turboquant ANY filters require int4 arrays")));
+
+			deconstruct_array(array_value,
+							  INT4OID,
+							  4,
+							  true,
+							  TYPALIGN_INT,
+							  &elements,
+							  &nulls,
+							  &element_count);
+			if (element_count > TQ_MAX_FILTER_VALUES_PER_CLAUSE)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("turboquant int4 ANY filters support at most %d values per clause",
+								TQ_MAX_FILTER_VALUES_PER_CLAUSE)));
+
+			for (element_index = 0; element_index < element_count; element_index++)
+			{
+				if (nulls[element_index])
+					continue;
+				clause->values[clause->value_count++] = DatumGetInt32(elements[element_index]);
+			}
+			if (elements != NULL)
+				pfree(elements);
+			if (nulls != NULL)
+				pfree(nulls);
+		}
+		else
+		{
+			clause->value_count = 1;
+			clause->values[0] = DatumGetInt32(filter_key->sk_argument);
+		}
 	}
 
 	buffer = ReadBufferExtended(scan->indexRelation, MAIN_FORKNUM, 0, RBM_NORMAL, NULL);
@@ -3832,13 +4000,15 @@ tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque)
 					elog(ERROR, "%s", error_buf);
 				}
 				tq_scan_stats_add_selected_live((size_t) header.live_count);
-				if (!tq_batch_page_scan_prod_with_scratch(
+				if (!tq_batch_page_scan_prod_with_scratch_filtered(
 						tq_page_payload(BufferGetPage(buffer)),
 						tq_page_payload_size(BufferGetPage(buffer)),
 						&opaque->prod_config, opaque->normalized,
 						opaque->distance_kind, &opaque->lut,
 						opaque->query_values, opaque->query_dimension,
-						opaque->filter_enabled, opaque->filter_value,
+						opaque->filter_clauses,
+						opaque->filter_clause_count,
+						opaque->int4_attribute_count,
 						active_heap, shadow_heap, &opaque->scan_scratch,
 						error_buf, sizeof(error_buf)))
 					elog(ERROR, "%s", error_buf);
@@ -3909,6 +4079,9 @@ tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque)
 		size_t		max_pages = 0;
 		bool		near_exhaustive_scan = false;
 		bool		adaptive_probe_budget = false;
+		bool		iterative_filtered_completion = false;
+		size_t		min_rows_after_filter = 0;
+		size_t		iterative_selected_list_count = 0;
 		TqCandidateHeap *active_heap = &opaque->candidates;
 		TqCandidateHeap *shadow_heap = opaque->shadow_decode_diagnostics
 			? &opaque->shadow_decode_candidates
@@ -4051,23 +4224,39 @@ tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque)
 									   probe_budget.effective_probe_count,
 									   probe_budget.max_visited_codes,
 									   probe_budget.max_visited_pages);
+		iterative_filtered_completion = opaque->filter_clause_count > 0
+			&& tq_guc_iterative_scan != TQ_ITERATIVE_SCAN_OFF
+			&& tq_guc_min_rows_after_filter > 0;
+		min_rows_after_filter = (size_t) tq_guc_min_rows_after_filter;
 		near_exhaustive_scan = tq_should_use_near_exhaustive_scan(
 			probe_budget.selected_live_count,
 			total_ranked_live,
 			probe_budget.selected_page_count,
 			total_ranked_pages);
+		if (iterative_filtered_completion)
+			near_exhaustive_scan = true;
 		tq_scan_stats_set_scan_orchestration(
 			near_exhaustive_scan ? TQ_SCAN_ORCHESTRATION_IVF_NEAR_EXHAUSTIVE
 			: TQ_SCAN_ORCHESTRATION_IVF_BOUNDED_PAGES,
-			near_exhaustive_scan);
+			near_exhaustive_scan && !iterative_filtered_completion);
 
 		for (index = 0; index < effective_count; index++)
 		{
 			size_t ranked_index = selected_indexes[index];
 
 			total_live += ranked_live_counts[ranked_index];
-			tq_scan_stats_record_selected_list((size_t) ranked_live_counts[ranked_index],
-											  (size_t) ranked_page_counts[ranked_index]);
+		}
+		if (iterative_filtered_completion)
+			total_live = total_ranked_live;
+		else
+		{
+			for (index = 0; index < effective_count; index++)
+			{
+				size_t ranked_index = selected_indexes[index];
+
+				tq_scan_stats_record_selected_list((size_t) ranked_live_counts[ranked_index],
+												  (size_t) ranked_page_counts[ranked_index]);
+			}
 		}
 
 		if (total_live > 0
@@ -4106,7 +4295,89 @@ tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque)
 		max_pages = (size_t) Max((BlockNumber) 1, RelationGetNumberOfBlocks(scan->indexRelation));
 		page_candidates = (TqBoundedPageCandidate *) palloc0(sizeof(TqBoundedPageCandidate) * max_pages);
 
-		if (!near_exhaustive_scan)
+		if (iterative_filtered_completion)
+		{
+			size_t selected_live_prefix = 0;
+			size_t selected_page_prefix = 0;
+
+			for (index = 0; index < ranked_count; index++)
+			{
+				size_t ranked_index = index;
+				size_t list_page_start = page_count;
+				bool must_scan_list = index < effective_count;
+				bool fits_code_budget = tq_guc_max_visited_codes == 0
+					|| selected_live_prefix + (size_t) ranked_live_counts[ranked_index]
+						<= (size_t) tq_guc_max_visited_codes;
+				bool fits_page_budget = tq_guc_max_visited_pages == 0
+					|| selected_page_prefix + (size_t) ranked_page_counts[ranked_index]
+						<= (size_t) tq_guc_max_visited_pages;
+
+				if (!must_scan_list && active_heap->count >= min_rows_after_filter)
+					break;
+				if (!must_scan_list && (!fits_code_budget || !fits_page_budget))
+					break;
+
+				selected_live_prefix += (size_t) ranked_live_counts[ranked_index];
+				selected_page_prefix += (size_t) ranked_page_counts[ranked_index];
+				iterative_selected_list_count += 1;
+				tq_scan_stats_record_selected_list((size_t) ranked_live_counts[ranked_index],
+												  (size_t) ranked_page_counts[ranked_index]);
+
+				if (!tq_collect_live_pages_for_list(scan->indexRelation,
+												   &selected_entries[ranked_index],
+												   page_candidates,
+												   max_pages,
+												   &page_count,
+												   error_buf,
+												   sizeof(error_buf)))
+				{
+					tq_router_reset(&router_model);
+					pfree(all_entries);
+					pfree(selected_entries);
+					pfree(ranked_scores);
+					pfree(ranked_live_counts);
+					pfree(ranked_page_counts);
+					pfree(selected_indexes);
+					pfree(page_candidates);
+					pfree(ranked_probes);
+					elog(ERROR, "%s", error_buf);
+				}
+
+				for (; list_page_start < page_count; list_page_start++)
+				{
+					if (!tq_scan_batch_block(scan->indexRelation,
+											 page_candidates[list_page_start].block_number,
+											 opaque,
+											 active_heap,
+											 shadow_heap,
+											 error_buf,
+											 sizeof(error_buf)))
+					{
+						tq_router_reset(&router_model);
+						pfree(all_entries);
+						pfree(selected_entries);
+						pfree(ranked_scores);
+						pfree(ranked_live_counts);
+						pfree(ranked_page_counts);
+						pfree(selected_indexes);
+						pfree(page_candidates);
+						pfree(ranked_probes);
+						elog(ERROR, "%s", error_buf);
+					}
+				}
+			}
+
+			effective_count = (uint32_t) iterative_selected_list_count;
+			tq_scan_stats_set_probe_budget(probe_budget.nominal_probe_count,
+										   effective_count,
+										   tq_guc_max_visited_codes > 0
+											   ? selected_live_prefix
+											   : probe_budget.max_visited_codes,
+										   tq_guc_max_visited_pages > 0
+											   ? selected_page_prefix
+											   : probe_budget.max_visited_pages);
+		}
+		else if (!near_exhaustive_scan)
 		{
 			for (index = 0; index < effective_count; index++)
 			{
@@ -4433,6 +4704,21 @@ tq_scan_all_live_tids_to_bitmap(Relation index_relation,
 }
 
 static bool
+tq_amcanreturn(Relation index_relation, int attno)
+{
+	int attribute_count = 0;
+
+	if (index_relation == NULL)
+		return false;
+
+	attribute_count = IndexRelationGetNumberOfAttributes(index_relation);
+	if (attno <= 1 || attno > attribute_count)
+		return false;
+
+	return TupleDescAttr(index_relation->rd_att, attno - 1)->atttypid == INT4OID;
+}
+
+static bool
 tq_amgettuple(IndexScanDesc scan, ScanDirection direction)
 {
 	TqScanOpaque *opaque = (TqScanOpaque *) scan->opaque;
@@ -4454,6 +4740,37 @@ tq_amgettuple(IndexScanDesc scan, ScanDirection direction)
 	scan->xs_recheck = false;
 	scan->xs_recheckorderby = false;
 	scan->xs_heap_continue = false;
+	if (scan->xs_itup != NULL)
+	{
+		pfree(scan->xs_itup);
+		scan->xs_itup = NULL;
+	}
+
+	if (scan->xs_want_itup)
+	{
+		TupleDesc tupdesc = RelationGetDescr(scan->indexRelation);
+		int attribute_count = IndexRelationGetNumberOfAttributes(scan->indexRelation);
+		Datum *values = (Datum *) palloc0(sizeof(Datum) * (size_t) attribute_count);
+		bool *isnull = (bool *) palloc(sizeof(bool) * (size_t) attribute_count);
+		int attno = 0;
+
+		memset(isnull, true, sizeof(bool) * (size_t) attribute_count);
+		for (attno = 1; attno < attribute_count; attno++)
+		{
+			int metadata_index = attno - 1;
+
+			if (metadata_index < entry.int4_attribute_count)
+			{
+				values[attno] = Int32GetDatum(entry.int4_attributes[metadata_index]);
+				isnull[attno] = false;
+			}
+		}
+
+		scan->xs_itup = index_form_tuple(tupdesc, values, isnull);
+		scan->xs_itupdesc = tupdesc;
+		pfree(values);
+		pfree(isnull);
+	}
 
 	if (scan->xs_orderbyvals != NULL && scan->numberOfOrderBys > 0)
 	{
@@ -4544,6 +4861,8 @@ tq_amendscan(IndexScanDesc scan)
 		pfree(scan->xs_orderbyvals);
 	if (scan->numberOfOrderBys > 0 && scan->xs_orderbynulls != NULL)
 		pfree(scan->xs_orderbynulls);
+	if (scan->xs_itup != NULL)
+		pfree(scan->xs_itup);
 	if (opaque != NULL)
 		pfree(opaque);
 	scan->opaque = NULL;
@@ -4563,7 +4882,7 @@ turboquanthandler(PG_FUNCTION_ARGS)
 	amroutine->aminsert = tq_aminsert;
 	amroutine->ambulkdelete = tq_ambulkdelete;
 	amroutine->amvacuumcleanup = tq_amvacuumcleanup;
-	amroutine->amcanreturn = NULL;
+	amroutine->amcanreturn = tq_amcanreturn;
 	amroutine->amcostestimate = tq_amcostestimate;
 	amroutine->amoptions = tq_amoptions;
 	amroutine->amproperty = NULL;

@@ -7,14 +7,23 @@ CREATE EXTENSION pg_turboquant;
 CREATE TABLE tq_capability_docs (
 	id int4 PRIMARY KEY,
 	category int4 NOT NULL,
+	f1 int4 NOT NULL,
+	f2 int4 NOT NULL,
+	f3 int4 NOT NULL,
+	f4 int4 NOT NULL,
+	f5 int4 NOT NULL,
+	f6 int4 NOT NULL,
+	f7 int4 NOT NULL,
 	payload text NOT NULL,
 	embedding vector(4)
 );
 
-INSERT INTO tq_capability_docs (id, category, payload, embedding) VALUES
-	(1, 1, 'alpha', '[1,0,0,0]'),
-	(2, 1, 'beta', '[0.98,0.02,0,0]'),
-	(3, 2, 'gamma', '[0,1,0,0]');
+INSERT INTO tq_capability_docs
+	(id, category, f1, f2, f3, f4, f5, f6, f7, payload, embedding)
+VALUES
+	(1, 1, 11, 12, 13, 14, 15, 16, 17, 'alpha', '[1,0,0,0]'),
+	(2, 1, 21, 22, 23, 24, 25, 26, 27, 'beta', '[0.98,0.02,0,0]'),
+	(3, 2, 31, 32, 33, 34, 35, 36, 37, 'gamma', '[0,1,0,0]');
 
 CREATE INDEX tq_capability_embedding_idx
 	ON tq_capability_docs
@@ -74,7 +83,14 @@ CREATE INDEX tq_capability_too_wide_idx
 	USING turboquant (
 		embedding tq_cosine_ops,
 		category tq_int4_filter_ops,
-		id tq_int4_filter_ops
+		id tq_int4_filter_ops,
+		f1 tq_int4_filter_ops,
+		f2 tq_int4_filter_ops,
+		f3 tq_int4_filter_ops,
+		f4 tq_int4_filter_ops,
+		f5 tq_int4_filter_ops,
+		f6 tq_int4_filter_ops,
+		f7 tq_int4_filter_ops
 	);
 
 CREATE INDEX tq_capability_include_idx

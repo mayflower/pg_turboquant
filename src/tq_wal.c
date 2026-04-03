@@ -82,7 +82,8 @@ typedef struct TqWalBatchSummaryArgs
 typedef struct TqWalBatchAppendArgs
 {
 	const TqTid *tid;
-	const int32_t *filter_value;
+	const int32_t *int4_values;
+	uint16_t	int4_value_count;
 	const uint8_t *packed_code;
 	size_t		packed_code_len;
 	uint16_t   *lane_index;
@@ -91,6 +92,8 @@ typedef struct TqWalBatchAppendArgs
 typedef struct TqWalBatchSoaAppendArgs
 {
 	const TqTid *tid;
+	const int32_t *int4_values;
+	uint16_t	int4_value_count;
 	const uint8_t *nibbles;
 	uint32_t	dimension;
 	float		gamma;
@@ -362,17 +365,26 @@ tq_wal_mutate_batch_append(Page page, void *arg, char *errmsg, size_t errmsg_len
 {
 	const TqWalBatchAppendArgs *args = (const TqWalBatchAppendArgs *) arg;
 	uint16_t	lane_index = 0;
+	uint16_t	attribute_index = 0;
 
 	if (!tq_batch_page_append_lane(tq_wal_payload(page), tq_wal_payload_size(page),
 								   args->tid, &lane_index, errmsg, errmsg_len)
-		|| (args->filter_value != NULL
-			&& !tq_batch_page_set_filter_int4(tq_wal_payload(page), tq_wal_payload_size(page),
-											  lane_index, *args->filter_value,
-											  errmsg, errmsg_len))
 		|| !tq_batch_page_set_code(tq_wal_payload(page), tq_wal_payload_size(page),
 								   lane_index, args->packed_code, args->packed_code_len,
 								   errmsg, errmsg_len))
 		return false;
+
+	for (attribute_index = 0; attribute_index < args->int4_value_count; attribute_index++)
+	{
+		if (!tq_batch_page_set_int4_attribute(tq_wal_payload(page),
+											  tq_wal_payload_size(page),
+											  lane_index,
+											  attribute_index,
+											  args->int4_values[attribute_index],
+											  errmsg,
+											  errmsg_len))
+			return false;
+	}
 
 	if (args->lane_index != NULL)
 		*args->lane_index = lane_index;
@@ -385,6 +397,7 @@ tq_wal_mutate_batch_soa_append(Page page, void *arg, char *errmsg, size_t errmsg
 {
 	const TqWalBatchSoaAppendArgs *args = (const TqWalBatchSoaAppendArgs *) arg;
 	uint16_t	lane_index = 0;
+	uint16_t	attribute_index = 0;
 
 	if (!tq_batch_page_append_lane(tq_wal_payload(page), tq_wal_payload_size(page),
 								   args->tid, &lane_index, errmsg, errmsg_len)
@@ -392,6 +405,18 @@ tq_wal_mutate_batch_soa_append(Page page, void *arg, char *errmsg, size_t errmsg
 											   lane_index, args->nibbles, args->dimension,
 											   args->gamma, errmsg, errmsg_len))
 		return false;
+
+	for (attribute_index = 0; attribute_index < args->int4_value_count; attribute_index++)
+	{
+		if (!tq_batch_page_set_int4_attribute(tq_wal_payload(page),
+											  tq_wal_payload_size(page),
+											  lane_index,
+											  attribute_index,
+											  args->int4_values[attribute_index],
+											  errmsg,
+											  errmsg_len))
+			return false;
+	}
 
 	if (args->lane_index != NULL)
 		*args->lane_index = lane_index;
@@ -631,7 +656,8 @@ bool
 tq_wal_append_batch_code(Relation relation,
 						 Buffer buffer,
 						 const TqTid *tid,
-						 const int32_t *filter_value,
+						 const int32_t *int4_values,
+						 uint16_t int4_value_count,
 						 const uint8_t *packed_code,
 						 size_t packed_code_len,
 						 uint16_t *lane_index,
@@ -642,7 +668,8 @@ tq_wal_append_batch_code(Relation relation,
 
 	memset(&args, 0, sizeof(args));
 	args.tid = tid;
-	args.filter_value = filter_value;
+	args.int4_values = int4_values;
+	args.int4_value_count = int4_value_count;
 	args.packed_code = packed_code;
 	args.packed_code_len = packed_code_len;
 	args.lane_index = lane_index;
@@ -654,6 +681,8 @@ bool
 tq_wal_append_batch_soa(Relation relation,
 						 Buffer buffer,
 						 const TqTid *tid,
+						 const int32_t *int4_values,
+						 uint16_t int4_value_count,
 						 const uint8_t *nibbles,
 						 uint32_t dimension,
 						 float gamma,
@@ -665,6 +694,8 @@ tq_wal_append_batch_soa(Relation relation,
 
 	memset(&args, 0, sizeof(args));
 	args.tid = tid;
+	args.int4_values = int4_values;
+	args.int4_value_count = int4_value_count;
 	args.nibbles = nibbles;
 	args.dimension = dimension;
 	args.gamma = gamma;

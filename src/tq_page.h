@@ -9,10 +9,11 @@
 #include "src/tq_transform.h"
 
 #define TQ_PAGE_MAGIC UINT32_C(0x54515047)
-#define TQ_PAGE_FORMAT_VERSION 12
+#define TQ_PAGE_FORMAT_VERSION 14
 #define TQ_INVALID_BLOCK_NUMBER UINT32_MAX
 #define TQ_DETACHED_FREE_LIST_ID UINT32_MAX
 #define TQ_BATCH_PAGE_NO_REPRESENTATIVE UINT16_MAX
+#define TQ_MAX_STORED_INT4_ATTRIBUTES 8
 
 #define TQ_ALGORITHM_VERSION 3
 #define TQ_QUANTIZER_VERSION 2
@@ -103,7 +104,7 @@ typedef struct TqBatchPageParams
 	uint32_t	list_id;
 	uint32_t	next_block;
 	uint32_t	dimension;		/* >0 selects SoA nibble layout; 0 uses legacy AoS */
-	bool		has_int4_filter;
+	uint16_t	int4_attribute_count;
 } TqBatchPageParams;
 
 typedef struct TqBatchPageHeaderView
@@ -320,6 +321,25 @@ extern bool tq_batch_page_has_filter_int4(const void *page,
 										  bool *has_filter,
 										  char *errmsg,
 										  size_t errmsg_len);
+extern bool tq_batch_page_get_int4_attribute_count(const void *page,
+												   size_t page_size,
+												   uint16_t *attribute_count,
+												   char *errmsg,
+												   size_t errmsg_len);
+extern bool tq_batch_page_set_int4_attribute(void *page,
+											 size_t page_size,
+											 uint16_t lane_index,
+											 uint16_t attribute_index,
+											 int32_t value,
+											 char *errmsg,
+											 size_t errmsg_len);
+extern bool tq_batch_page_get_int4_attribute(const void *page,
+											 size_t page_size,
+											 uint16_t lane_index,
+											 uint16_t attribute_index,
+											 int32_t *value,
+											 char *errmsg,
+											 size_t errmsg_len);
 extern bool tq_batch_page_set_code(void *page,
 								   size_t page_size,
 								   uint16_t lane_index,
@@ -375,8 +395,26 @@ extern bool tq_batch_page_set_nibble_and_gamma(void *page, size_t page_size,
 											   char *errmsg, size_t errmsg_len);
 extern size_t tq_batch_page_soa_required_bytes(uint16_t lane_count, uint32_t dimension,
 											   uint32_t representative_code_bytes);
+extern size_t tq_batch_page_soa_required_bytes_with_filter(uint16_t lane_count,
+														   uint32_t dimension,
+														   uint32_t representative_code_bytes,
+														   bool has_int4_filter);
+extern size_t tq_batch_page_soa_required_bytes_with_int4_attributes(uint16_t lane_count,
+																	uint32_t dimension,
+																	uint32_t representative_code_bytes,
+																	uint16_t int4_attribute_count);
 extern bool tq_batch_page_can_fit_soa(size_t page_size, uint16_t lane_count,
 									  uint32_t dimension, uint32_t representative_code_bytes);
+extern bool tq_batch_page_can_fit_soa_with_filter(size_t page_size,
+												  uint16_t lane_count,
+												  uint32_t dimension,
+												  uint32_t representative_code_bytes,
+												  bool has_int4_filter);
+extern bool tq_batch_page_can_fit_soa_with_int4_attributes(size_t page_size,
+															uint16_t lane_count,
+															uint32_t dimension,
+															uint32_t representative_code_bytes,
+															uint16_t int4_attribute_count);
 extern bool tq_batch_page_set_representative_code(void *page, size_t page_size,
 												  const uint8_t *code, size_t code_len,
 												  char *errmsg, size_t errmsg_len);

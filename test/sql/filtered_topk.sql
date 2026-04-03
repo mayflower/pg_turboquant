@@ -48,6 +48,12 @@ WHERE category = 1
 ORDER BY embedding <=> '[1,0,0,0]'::vector(4)
 LIMIT 2;
 
+SELECT
+	(tq_last_scan_stats()->>'score_mode') = 'code_domain' AS filtered_score_mode_is_code_domain,
+	(tq_last_scan_stats()->>'decoded_vector_count')::int = 0 AS filtered_no_decodes,
+	(tq_last_scan_stats()->>'faithful_fast_path')::boolean AS filtered_faithful_fast_path,
+	(tq_last_scan_stats()->>'compatibility_fallback')::boolean AS filtered_compatibility_fallback;
+
 SELECT id, category
 FROM tq_filtered_docs
 WHERE category = 2

@@ -20,6 +20,7 @@ from benchmarks.rag.ingestion_pipeline import (
     parse_hf_source_path,
     run_hf_ingestion,
     run_campaign,
+    build_index_sql,
 )
 from benchmarks.rag.run_ingestion_pipeline import build_embedder
 
@@ -224,7 +225,7 @@ class RagIngestionPipelineContractTest(unittest.TestCase):
         self.assertEqual(len(insert_params), 3)
         self.assertEqual(insert_params[0][0], "doc-1:p1")
         self.assertEqual(insert_params[0][1], "doc-1")
-        self.assertEqual(insert_params[0][4], "[5.0,0.0,1.0]")
+        self.assertEqual(insert_params[0][-1], "[5.0,0.0,1.0]")
 
     def test_build_backend_indexes_rejects_unknown_backend_kind(self):
         config = CampaignConfig(
@@ -238,6 +239,64 @@ class RagIngestionPipelineContractTest(unittest.TestCase):
         connection = FakeConnection()
         with self.assertRaisesRegex(ValueError, "unsupported backend kind"):
             build_backend_indexes(connection, config)
+
+    def test_schema_includes_rag_filter_and_covering_columns(self):
+        config = CampaignConfig(
+            dataset=DatasetConfig(name="tiny", version="v1", source_path="tiny.jsonl"),
+            embedding=EmbeddingConfig(model="embed", dimension=3, normalized=True),
+            chunking=ChunkingConfig(strategy="fixed", chunk_size=64, chunk_overlap=8),
+            schema={"documents_table": "rag_documents", "passages_table": "rag_passages"},
+            backends=[],
+        )
+        connection = FakeConnection()
+
+        ensure_schema(connection, config)
+
+        executed_sql = "\n".join(sql for cursor in connection.cursors for sql, _ in cursor.executed)
+        self.assertIn("tenant_id integer NOT NULL", executed_sql)
+        self.assertIn("source_id integer NOT NULL", executed_sql)
+        self.assertIn("lang_id integer NOT NULL", executed_sql)
+        self.assertIn("doc_version integer NOT NULL", executed_sql)
+        self.assertIn("doc_id_int integer NOT NULL", executed_sql)
+        self.assertIn("chunk_id_int integer NOT NULL", executed_sql)
+
+    def test_turboquant_index_sql_supports_multiple_filter_keys_and_include_payload(self):
+        sql = build_index_sql(
+            "rag_passages",
+            "pg_turboquant",
+            "rag_passages_tq_idx",
+            "cosine",
+            {
+                "kind": "pg_turboquant",
+                "index_name": "rag_passages_tq_idx",
+                "metric": "cosine",
+                "filter_columns": ["tenant_id", "source_id", "lang_id"],
+                "include_columns": ["doc_id_int", "chunk_id_int", "doc_version"],
+                "options": {"lists": 32, "normalized": True},
+            },
+        )
+
+        self.assertIn("USING turboquant (embedding tq_cosine_ops, tenant_id tq_int4_filter_ops, source_id tq_int4_filter_ops, lang_id tq_int4_filter_ops)", sql)
+        self.assertIn("INCLUDE (doc_id_int, chunk_id_int, doc_version)", sql)
+
+    def test_delta_merge_backend_config_emits_base_and_delta_indexes(self):
+        sql = build_index_sql(
+            "rag_passages_delta",
+            "pg_turboquant",
+            "rag_passages_delta_tq_idx",
+            "cosine",
+            {
+                "kind": "pg_turboquant",
+                "index_name": "rag_passages_delta_tq_idx",
+                "metric": "cosine",
+                "filter_columns": ["tenant_id", "source_id", "lang_id"],
+                "include_columns": ["doc_id_int", "chunk_id_int", "doc_version"],
+                "options": {"lists": 0, "normalized": True},
+            },
+        )
+
+        self.assertIn("CREATE INDEX IF NOT EXISTS rag_passages_delta_tq_idx", sql)
+        self.assertIn("INCLUDE (doc_id_int, chunk_id_int, doc_version)", sql)
 
     def test_parse_hf_source_path_supports_subset_split_and_limit(self):
         parsed = parse_hf_source_path("hf://kilt_tasks/nq[validation][:10000]")

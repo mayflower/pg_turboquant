@@ -13,6 +13,8 @@ int			tq_guc_probes = TQ_DEFAULT_PROBES;
 int			tq_guc_oversample_factor = TQ_DEFAULT_OVERSAMPLE_FACTOR;
 int			tq_guc_max_visited_codes = 0;
 int			tq_guc_max_visited_pages = 0;
+int			tq_guc_iterative_scan = 0;
+int			tq_guc_min_rows_after_filter = 0;
 int			tq_guc_decode_rescore_factor = 1;
 int			tq_guc_decode_rescore_extra_candidates = -1;
 bool		tq_guc_enable_summary_bounds = true;
@@ -22,6 +24,13 @@ bool		tq_guc_force_decode_score_diagnostics = false;
 void		_PG_init(void);
 
 #ifndef TQ_UNIT_TEST
+static const struct config_enum_entry tq_iterative_scan_options[] = {
+	{"off", 0, false},
+	{"strict_order", 1, false},
+	{"relaxed_order", 2, false},
+	{NULL, 0, false}
+};
+
 void
 _PG_init(void)
 {
@@ -68,6 +77,31 @@ _PG_init(void)
 							"TurboQuant IVF page-visit budget.",
 							"When greater than zero, IVF probing also stops adding lower-ranked lists once their cumulative page count would exceed this budget, except for the first mandatory list.",
 							&tq_guc_max_visited_pages,
+							0,
+							0,
+							INT_MAX,
+							PGC_USERSET,
+							0,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomEnumVariable("turboquant.iterative_scan",
+							 "TurboQuant filtered ordered-scan completion policy.",
+							 "When enabled for filtered IVF scans, TurboQuant keeps expanding lower-ranked lists in router order until enough rows survive the filters or the work budget is exhausted.",
+							 &tq_guc_iterative_scan,
+							 0,
+							 tq_iterative_scan_options,
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	DefineCustomIntVariable("turboquant.min_rows_after_filter",
+							"TurboQuant minimum surviving rows target for filtered IVF scans.",
+							"When iterative filtered completion is enabled, TurboQuant continues probing until at least this many rows survive the metadata filters, or until the configured work budget is exhausted.",
+							&tq_guc_min_rows_after_filter,
 							0,
 							0,
 							INT_MAX,

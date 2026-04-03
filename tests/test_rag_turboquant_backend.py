@@ -130,6 +130,90 @@ class PgTurboquantBackendContractTest(unittest.TestCase):
         self.assertEqual(metadata["metric"], "l2")
         self.assertFalse(metadata["normalized"])
 
+    def test_filtered_covering_plan_uses_stage1_payload_projection(self):
+        backend = PgTurboquantBackend(
+            index_name="rag_docs_embedding_tq_idx",
+            metric="cosine",
+            normalized=True,
+            mode="approx",
+        )
+
+        plan = backend.build_plan(
+            self.table,
+            RetrievalRequest(
+                query_vector=[1.0, 0.0, 0.0],
+                top_k=3,
+                metric="cosine",
+                ann={
+                    "probes": 2,
+                    "oversampling": 2.0,
+                    "filters": {
+                        "tenant_id": 7,
+                        "source_id": [10, 11],
+                        "lang_id": 1,
+                    },
+                    "stage1_payload_columns": [
+                        "doc_id",
+                        "chunk_id",
+                        "tenant_id",
+                        "doc_version",
+                    ],
+                    "text_join_column": "passage_id",
+                },
+            ),
+        )
+
+        self.assertIn("stage1_candidates AS", plan.sql)
+        self.assertIn("source_id = ANY", plan.sql)
+        self.assertIn("SELECT p.passage_id AS id, p.doc_id, p.chunk_id, p.tenant_id, p.doc_version", plan.sql)
+        self.assertIn("JOIN rag_docs AS text_source ON text_source.passage_id = stage1_candidates.id", plan.sql)
+        self.assertEqual(plan.session_statements[:2], [
+            ("SET LOCAL turboquant.probes = %s", (2,)),
+            ("SET LOCAL turboquant.oversample_factor = %s", (2.0,)),
+        ])
+
+        metadata = backend.serialize_run_metadata(plan)
+        self.assertEqual(metadata["filters"], {"tenant_id": 7, "source_id": [10, 11], "lang_id": 1})
+        self.assertEqual(
+            metadata["stage1_payload_columns"],
+            ["doc_id", "chunk_id", "tenant_id", "doc_version"],
+        )
+
+    def test_delta_union_plan_queries_base_and_delta_indexes(self):
+        backend = PgTurboquantBackend(
+            index_name="rag_docs_embedding_tq_idx",
+            metric="cosine",
+            normalized=True,
+            mode="approx",
+        )
+
+        table = PassageTable(
+            table_name="rag_docs",
+            id_column="passage_id",
+            text_column="passage_text",
+            embedding_column="embedding",
+        )
+
+        plan = backend.build_plan(
+            table,
+            RetrievalRequest(
+                query_vector=[1.0, 0.0, 0.0],
+                top_k=2,
+                metric="cosine",
+                ann={
+                    "delta_table_name": "rag_docs_delta",
+                    "delta_candidate_limit": 8,
+                },
+            ),
+        )
+
+        self.assertIn("FROM rag_docs AS p", plan.sql)
+        self.assertIn("FROM rag_docs_delta AS p", plan.sql)
+        self.assertIn("UNION ALL", plan.sql)
+        metadata = backend.serialize_run_metadata(plan)
+        self.assertEqual(metadata["delta_table_name"], "rag_docs_delta")
+        self.assertEqual(metadata["delta_candidate_limit"], 8)
+
     def test_inner_product_requires_normalized_vectors(self):
         backend = PgTurboquantBackend(
             index_name="rag_docs_embedding_tq_idx",

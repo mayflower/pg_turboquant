@@ -19,13 +19,13 @@ tq_init_amroutine(IndexAmRoutine *amroutine)
 	amroutine->amcanunique = false;
 	amroutine->amcanmulticol = true;
 	amroutine->amoptionalkey = true;
-	amroutine->amsearcharray = false;
+	amroutine->amsearcharray = true;
 	amroutine->amsearchnulls = false;
 	amroutine->amstorage = false;
 	amroutine->amclusterable = false;
 	amroutine->ampredlocks = false;
 	amroutine->amcanparallel = false;
-	amroutine->amcaninclude = false;
+	amroutine->amcaninclude = true;
 	amroutine->amusemaintenanceworkmem = false;
 	amroutine->amsummarizing = false;
 	amroutine->amparallelvacuumoptions = VACUUM_OPTION_NO_PARALLEL;

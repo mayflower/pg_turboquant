@@ -9,10 +9,21 @@
 #include "src/tq_page.h"
 #include "src/tq_simd_avx2.h"
 
+#define TQ_MAX_FILTER_VALUES_PER_CLAUSE 16
+
+typedef struct TqInt4FilterClause
+{
+	uint16_t	attribute_index;
+	uint16_t	value_count;
+	int32_t		values[TQ_MAX_FILTER_VALUES_PER_CLAUSE];
+} TqInt4FilterClause;
+
 typedef struct TqCandidateEntry
 {
 	float		score;
 	TqTid		tid;
+	uint16_t	int4_attribute_count;
+	int32_t		int4_attributes[TQ_MAX_STORED_INT4_ATTRIBUTES];
 } TqCandidateEntry;
 
 typedef struct TqCandidateHeap
@@ -167,7 +178,9 @@ extern void tq_candidate_heap_reset(TqCandidateHeap *heap);
 extern bool tq_candidate_heap_push(TqCandidateHeap *heap,
 								   float score,
 								   uint32_t block_number,
-								   uint16_t offset_number);
+								   uint16_t offset_number,
+								   const int32_t *int4_attributes,
+								   uint16_t int4_attribute_count);
 extern bool tq_candidate_heap_pop_best(TqCandidateHeap *heap,
 									   TqCandidateEntry *entry);
 extern bool tq_metric_distance_from_ip_score(TqDistanceKind distance,
@@ -290,6 +303,21 @@ extern bool tq_batch_page_scan_prod(const void *page,
 									TqCandidateHeap *shadow_decode_heap,
 									char *errmsg,
 									size_t errmsg_len);
+extern bool tq_batch_page_scan_prod_filtered(const void *page,
+											 size_t page_size,
+											 const TqProdCodecConfig *config,
+											 bool normalized,
+											 TqDistanceKind distance,
+											 const TqProdLut *lut,
+											 const float *query_values,
+											 size_t query_len,
+											 const TqInt4FilterClause *filter_clauses,
+											 uint16_t filter_clause_count,
+											 uint16_t int4_attribute_count,
+											 TqCandidateHeap *heap,
+											 TqCandidateHeap *shadow_decode_heap,
+											 char *errmsg,
+											 size_t errmsg_len);
 extern bool tq_batch_page_scan_prod_with_scratch(const void *page,
 												 size_t page_size,
 												 const TqProdCodecConfig *config,
@@ -305,6 +333,22 @@ extern bool tq_batch_page_scan_prod_with_scratch(const void *page,
 												 TqScanScratch *scratch,
 												 char *errmsg,
 												 size_t errmsg_len);
+extern bool tq_batch_page_scan_prod_with_scratch_filtered(const void *page,
+														  size_t page_size,
+														  const TqProdCodecConfig *config,
+														  bool normalized,
+														  TqDistanceKind distance,
+														  const TqProdLut *lut,
+														  const float *query_values,
+														  size_t query_len,
+														  const TqInt4FilterClause *filter_clauses,
+														  uint16_t filter_clause_count,
+														  uint16_t int4_attribute_count,
+														  TqCandidateHeap *heap,
+														  TqCandidateHeap *shadow_decode_heap,
+														  TqScanScratch *scratch,
+														  char *errmsg,
+														  size_t errmsg_len);
 extern bool tq_batch_page_rescore_prod_candidates(const void *page,
 												  size_t page_size,
 												  const TqProdCodecConfig *config,

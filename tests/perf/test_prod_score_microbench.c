@@ -722,7 +722,9 @@ run_page_scan_global_heap_only_bench(uint32_t dimension,
 					|| !tq_candidate_heap_push(&heap,
 											   distance_value,
 											   tid.block_number,
-											   tid.offset_number))
+											   tid.offset_number,
+											   NULL,
+											   0))
 					goto cleanup;
 
 				tq_scan_stats_set_score_kernel(used_kernel);

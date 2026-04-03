@@ -33,11 +33,27 @@
       "index_name": "rag_passages_tq_idx",
       "metric": "cosine",
       "mode": "approx",
+      "filter_columns": ["tenant_id", "source_id", "lang_id"],
+      "include_columns": ["doc_id_int", "chunk_id_int", "doc_version"],
       "ann": {
         "probes": 8,
         "oversampling": 4,
         "max_visited_codes": 4096,
-        "max_visited_pages": 0
+        "max_visited_pages": 0,
+        "filters": {
+          "tenant_id": 1,
+          "source_id": [1, 2, 3],
+          "lang_id": 1
+        },
+        "stage1_payload_columns": [
+          "doc_id_int",
+          "chunk_id_int",
+          "tenant_id",
+          "doc_version"
+        ],
+        "text_join_column": "passage_id",
+        "iterative_scan": "strict_order",
+        "min_rows_after_filter": 20
       },
       "options": {
         "lists": 64,

@@ -11,6 +11,7 @@ from benchmarks.rag.live_campaign import (
     _build_default_generator_runner,
     _isolated_relation_name,
     _prepare_dataset_source_layout,
+    _run_retrieval_scenario,
     _rewrite_indexdef_for_clone,
     build_live_campaign_runtime,
     run_live_campaign,
@@ -139,6 +140,10 @@ class RagLiveCampaignContractTest(unittest.TestCase):
         self.assertIn("kilt_nq", layout["passage_table"].table_name)
         self.assertIn("kilt_nq", layout["index_names"]["pg_turboquant"])
         self.assertEqual(layout["manifest"]["dataset_name"], "kilt_nq_small_live")
+        self.assertEqual(
+            layout["backend_ann_defaults"],
+            {"pg_turboquant": {}, "pgvector_hnsw": {}, "pgvector_ivfflat": {}},
+        )
         build_embedder_mock.assert_called_once_with("BAAI/bge-small-en-v1.5", False)
         self.assertEqual(run_hf_ingestion_mock.call_count, 1)
 
@@ -146,6 +151,96 @@ class RagLiveCampaignContractTest(unittest.TestCase):
         self.assertIn("CREATE EXTENSION IF NOT EXISTS vector", executed_sql)
         self.assertIn("CREATE EXTENSION IF NOT EXISTS pg_turboquant", executed_sql)
         self.assertIn("DROP TABLE IF EXISTS", executed_sql)
+
+    def test_retrieval_scenario_merges_backend_ann_defaults(self):
+        class RecordingBackend:
+            name = "pg_turboquant"
+
+            def __init__(self):
+                self.requests = []
+
+            def build_plan(self, table, request):
+                from benchmarks.rag.bergen_adapter import RetrievalPlan
+
+                self.requests.append(request)
+                return RetrievalPlan(
+                    sql="SELECT %s::text AS doc_id, %s::float8 AS score, %s::text AS passage_text",
+                    params=("wiki-1:0", 0.1, "Alpha"),
+                    session_statements=[],
+                )
+
+        recording_backend = RecordingBackend()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with mock.patch(
+                "benchmarks.rag.live_campaign._make_backend",
+                return_value=recording_backend,
+            ), mock.patch(
+                "benchmarks.rag.live_campaign._fetch_relation_size_bytes",
+                return_value=4096,
+            ), mock.patch(
+                "benchmarks.rag.live_campaign._fetch_turboquant_index_metadata",
+                return_value={"capabilities": {"index_only_scan": True}},
+            ):
+                _run_retrieval_scenario(
+                    dsn="postgresql://fake",
+                    connect_fn=lambda _dsn: FakeConnection(),
+                    passage_table=PassageTable(
+                        table_name="rag_passages",
+                        id_column="passage_id",
+                        text_column="passage_text",
+                        embedding_column="embedding",
+                        query_vector_cast="vector",
+                    ),
+                    dataset_config={
+                        "dataset_id": "kilt_nq",
+                        "retrieval_profile": {"top_k_default": 5, "rerank_top_k_default": 10},
+                    },
+                    dataset_samples=[
+                        QuerySample(
+                            query_id="q1",
+                            question="What is alpha?",
+                            answers=["Alpha"],
+                            relevant_ids=["wiki-1"],
+                            evidence_ids=["wiki-1"],
+                        )
+                    ],
+                    method_id="pg_turboquant_approx",
+                    metric="cosine",
+                    query_encoder=lambda texts: [[1.0, 0.0] for _ in texts],
+                    dataset_top_k=5,
+                    rerank_top_k=10,
+                    eval_ks=(1, 5),
+                    retrieval_root=Path(tmpdir),
+                    clock_fn=lambda: 0.0,
+                    turboquant_index_name="rag_passages_tq_idx",
+                    hnsw_index_name="rag_passages_hnsw_idx",
+                    ivfflat_index_name="rag_passages_ivf_idx",
+                    backend_ann_defaults={
+                        "pg_turboquant": {
+                            "filters": {"tenant_id": 1, "lang_id": 1},
+                            "stage1_payload_columns": ["doc_id_int", "chunk_id_int", "tenant_id"],
+                            "iterative_scan": "strict_order",
+                            "min_rows_after_filter": 12,
+                        }
+                    },
+                    turboquant_probes=8,
+                    turboquant_oversampling=4,
+                    turboquant_max_visited_codes=4096,
+                    turboquant_max_visited_pages=0,
+                    hnsw_ef_search=80,
+                    ivfflat_probes=8,
+                )
+
+        self.assertEqual(len(recording_backend.requests), 1)
+        self.assertEqual(recording_backend.requests[0].ann["probes"], 8)
+        self.assertEqual(recording_backend.requests[0].ann["filters"], {"tenant_id": 1, "lang_id": 1})
+        self.assertEqual(
+            recording_backend.requests[0].ann["stage1_payload_columns"],
+            ["doc_id_int", "chunk_id_int", "tenant_id"],
+        )
+        self.assertEqual(recording_backend.requests[0].ann["iterative_scan"], "strict_order")
+        self.assertEqual(recording_backend.requests[0].ann["min_rows_after_filter"], 12)
 
     def test_default_generator_runner_supports_oracle_answer_without_hitting_abstract_base(self):
         with tempfile.TemporaryDirectory() as tmpdir:

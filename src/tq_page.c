@@ -20,7 +20,9 @@
 
 #define TQ_FLAG_NORMALIZED UINT16_C(0x0001)
 #define TQ_BATCH_FLAG_SOA_NIBBLES UINT16_C(0x0002)
-#define TQ_BATCH_FLAG_FILTER_INT4 UINT16_C(0x0004)
+#define TQ_BATCH_FLAG_LAYOUT_MASK UINT16_C(0x00FF)
+#define TQ_BATCH_FLAG_INT4_ATTR_SHIFT 8
+#define TQ_BATCH_FLAG_INT4_ATTR_MASK UINT16_C(0xFF00)
 
 #define TQ_PAGE_MAGIC_OFFSET 0
 #define TQ_PAGE_KIND_OFFSET 4
@@ -169,6 +171,22 @@ tq_read_float32(const uint8_t *src, size_t offset)
 	return value;
 }
 
+static uint16_t
+tq_batch_flag_int4_attribute_count(uint16_t flags)
+{
+	return (uint16_t) ((flags & TQ_BATCH_FLAG_INT4_ATTR_MASK) >> TQ_BATCH_FLAG_INT4_ATTR_SHIFT);
+}
+
+static uint16_t
+tq_batch_make_flags(bool soa_nibbles, uint16_t int4_attribute_count)
+{
+	uint16_t flags = soa_nibbles ? TQ_BATCH_FLAG_SOA_NIBBLES : 0;
+
+	return (uint16_t) (flags
+					   | ((int4_attribute_count << TQ_BATCH_FLAG_INT4_ATTR_SHIFT)
+						  & TQ_BATCH_FLAG_INT4_ATTR_MASK));
+}
+
 static bool
 tq_validate_page_common(const uint8_t *page,
 						size_t page_size,
@@ -293,14 +311,20 @@ tq_list_dir_validate_index(const uint8_t *page,
 
 /* Forward declarations for SoA offset helpers (defined after tq_bitmap_bytes_for_lanes) */
 static size_t tq_batch_soa_tid_array_offset(uint16_t lane_count);
-static size_t tq_batch_soa_gamma_array_offset(uint16_t lane_count);
-static size_t tq_batch_soa_nibble_block_offset(uint16_t lane_count);
-static size_t tq_batch_soa_representative_offset(uint16_t lane_count, uint32_t dimension);
+static size_t tq_batch_soa_filter_array_offset(uint16_t lane_count);
+static size_t tq_batch_soa_gamma_array_offset(uint16_t lane_count, uint16_t int4_attribute_count);
+static size_t tq_batch_soa_nibble_block_offset(uint16_t lane_count, uint16_t int4_attribute_count);
+static size_t tq_batch_soa_representative_offset(uint16_t lane_count, uint32_t dimension,
+												 uint16_t int4_attribute_count);
 static bool tq_batch_is_soa_page(const uint8_t *page);
 static size_t tq_batch_entry_stride_from_layout(const uint8_t *page);
 static size_t tq_batch_required_bytes_internal(uint16_t lane_count,
 											   uint32_t code_bytes,
-											   bool has_int4_filter);
+											   uint16_t int4_attribute_count);
+static size_t tq_batch_soa_required_bytes_internal(uint16_t lane_count,
+												   uint32_t dimension,
+												   uint32_t representative_code_bytes,
+												   uint16_t int4_attribute_count);
 
 static bool
 tq_batch_validate_header(const uint8_t *page,
@@ -312,6 +336,7 @@ tq_batch_validate_header(const uint8_t *page,
 	uint32_t	code_bytes = 0;
 	uint16_t	total_bytes = 0;
 	uint16_t	flags = 0;
+	uint16_t	int4_attribute_count = 0;
 
 	if (!tq_validate_page_common(page, page_size, TQ_PAGE_KIND_BATCH,
 								 TQ_BATCH_PAGE_HEADER_BYTES, errmsg, errmsg_len))
@@ -321,6 +346,7 @@ tq_batch_validate_header(const uint8_t *page,
 	code_bytes = tq_read_u32(page, TQ_BATCH_CODE_BYTES_OFFSET);
 	total_bytes = tq_read_u16(page, TQ_BATCH_TOTAL_BYTES_OFFSET);
 	flags = tq_read_u16(page, TQ_BATCH_FLAGS_OFFSET);
+	int4_attribute_count = tq_batch_flag_int4_attribute_count(flags);
 
 	if (lane_count == 0 || code_bytes == 0)
 	{
@@ -329,10 +355,18 @@ tq_batch_validate_header(const uint8_t *page,
 		return false;
 	}
 
-	if ((flags & ~(TQ_BATCH_FLAG_SOA_NIBBLES | TQ_BATCH_FLAG_FILTER_INT4)) != 0)
+	if ((flags & TQ_BATCH_FLAG_LAYOUT_MASK) != 0
+		&& (flags & TQ_BATCH_FLAG_LAYOUT_MASK) != TQ_BATCH_FLAG_SOA_NIBBLES)
 	{
 		tq_set_error(errmsg, errmsg_len,
 					 "invalid turboquant batch page: unsupported flags");
+		return false;
+	}
+
+	if (int4_attribute_count > TQ_MAX_STORED_INT4_ATTRIBUTES)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant batch page: unsupported int4 attribute count");
 		return false;
 	}
 
@@ -353,14 +387,8 @@ tq_batch_validate_header(const uint8_t *page,
 			return false;
 		}
 
-		if ((flags & TQ_BATCH_FLAG_FILTER_INT4) != 0)
-		{
-			tq_set_error(errmsg, errmsg_len,
-						 "invalid turboquant batch page: SoA pages do not support int4 filter payloads");
-			return false;
-		}
-
-		expected_total = tq_batch_soa_representative_offset(lane_count, dimension)
+		expected_total = tq_batch_soa_representative_offset(lane_count, dimension,
+															int4_attribute_count)
 						 + (size_t) code_bytes;
 		if ((size_t) total_bytes != expected_total)
 		{
@@ -377,7 +405,7 @@ tq_batch_validate_header(const uint8_t *page,
 		if ((size_t) total_bytes != tq_batch_required_bytes_internal(
 				lane_count,
 				code_bytes,
-				(flags & TQ_BATCH_FLAG_FILTER_INT4) != 0))
+				int4_attribute_count))
 		{
 			tq_set_error(errmsg, errmsg_len,
 						 "invalid turboquant batch page: total bytes do not match layout");
@@ -388,9 +416,7 @@ tq_batch_validate_header(const uint8_t *page,
 										   + tq_bitmap_bytes_for_lanes(lane_count));
 		expected_code_offset = (uint16_t) (expected_tid_offset
 										   + TQ_TID_STORAGE_BYTES
-										   + (((flags & TQ_BATCH_FLAG_FILTER_INT4) != 0)
-											  ? sizeof(int32_t)
-											  : 0));
+										   + ((size_t) int4_attribute_count * sizeof(int32_t)));
 
 		if (tq_read_u16(page, TQ_BATCH_TID_OFFSET_OFFSET) != expected_tid_offset)
 		{
@@ -588,31 +614,58 @@ tq_batch_filter_int4_offset(const uint8_t *page, uint16_t lane_index)
 }
 
 static size_t
+tq_batch_int4_attribute_offset(const uint8_t *page,
+								   uint16_t lane_index,
+								   uint16_t attribute_index)
+{
+	return tq_batch_filter_int4_offset(page, lane_index)
+		+ ((size_t) attribute_index * sizeof(int32_t));
+}
+
+static size_t
 tq_batch_soa_tid_array_offset(uint16_t lane_count)
 {
 	return TQ_BATCH_PAGE_HEADER_BYTES + tq_bitmap_bytes_for_lanes(lane_count);
 }
 
 static size_t
-tq_batch_soa_gamma_array_offset(uint16_t lane_count)
+tq_batch_soa_filter_array_offset(uint16_t lane_count)
 {
 	return tq_batch_soa_tid_array_offset(lane_count)
 		+ (size_t) lane_count * TQ_TID_STORAGE_BYTES;
 }
 
 static size_t
-tq_batch_soa_nibble_block_offset(uint16_t lane_count)
+tq_batch_soa_int4_attribute_offset(uint16_t lane_count,
+								   uint16_t lane_index,
+								   uint16_t attribute_index)
 {
-	return tq_batch_soa_gamma_array_offset(lane_count)
+	return tq_batch_soa_filter_array_offset(lane_count)
+		+ ((((size_t) attribute_index * (size_t) lane_count) + (size_t) lane_index)
+		   * sizeof(int32_t));
+}
+
+static size_t
+tq_batch_soa_gamma_array_offset(uint16_t lane_count, uint16_t int4_attribute_count)
+{
+	return tq_batch_soa_filter_array_offset(lane_count)
+		+ ((size_t) lane_count * (size_t) int4_attribute_count * sizeof(int32_t));
+}
+
+static size_t
+tq_batch_soa_nibble_block_offset(uint16_t lane_count, uint16_t int4_attribute_count)
+{
+	return tq_batch_soa_gamma_array_offset(lane_count, int4_attribute_count)
 		+ (size_t) lane_count * sizeof(float);
 }
 
 static size_t
-tq_batch_soa_representative_offset(uint16_t lane_count, uint32_t dimension)
+tq_batch_soa_representative_offset(uint16_t lane_count, uint32_t dimension,
+								   uint16_t int4_attribute_count)
 {
 	size_t	nibble_pair_cols = ((size_t) lane_count + 1u) / 2u;
 
-	return tq_batch_soa_nibble_block_offset(lane_count)
+	return tq_batch_soa_nibble_block_offset(lane_count, int4_attribute_count)
 		+ (size_t) dimension * nibble_pair_cols;
 }
 
@@ -684,16 +737,26 @@ tq_batch_page_required_bytes(uint16_t lane_count, uint32_t code_bytes)
 
 static size_t
 tq_batch_required_bytes_internal(uint16_t lane_count,
-								   uint32_t code_bytes,
-								   bool has_int4_filter)
+								 uint32_t code_bytes,
+								 uint16_t int4_attribute_count)
 {
 	size_t per_lane_bytes = (size_t) TQ_TID_STORAGE_BYTES
-		+ (has_int4_filter ? sizeof(int32_t) : 0)
+		+ ((size_t) int4_attribute_count * sizeof(int32_t))
 		+ (size_t) code_bytes;
 
 	return (size_t) TQ_BATCH_PAGE_HEADER_BYTES
 		+ tq_bitmap_bytes_for_lanes(lane_count)
 		+ ((size_t) lane_count * per_lane_bytes);
+}
+
+static size_t
+tq_batch_soa_required_bytes_internal(uint16_t lane_count,
+									 uint32_t dimension,
+									 uint32_t representative_code_bytes,
+									 uint16_t int4_attribute_count)
+{
+	return tq_batch_soa_representative_offset(lane_count, dimension, int4_attribute_count)
+		+ (size_t) representative_code_bytes;
 }
 
 bool
@@ -1423,15 +1486,9 @@ tq_batch_page_init(void *page,
 	if (params->dimension > 0)
 	{
 		/* SoA nibble layout */
-		if (params->has_int4_filter)
-		{
-			tq_set_error(errmsg, errmsg_len,
-						 "invalid turboquant batch page: SoA layout does not support int4 filter payloads");
-			return false;
-		}
-
 		total_bytes = tq_batch_soa_representative_offset(params->lane_count,
-														 params->dimension)
+														 params->dimension,
+														 params->int4_attribute_count)
 					  + (size_t) params->code_bytes;
 
 		if (params->lane_count == 0 || params->code_bytes == 0
@@ -1442,7 +1499,14 @@ tq_batch_page_init(void *page,
 			return false;
 		}
 
-		flags = TQ_BATCH_FLAG_SOA_NIBBLES;
+		if (params->int4_attribute_count > TQ_MAX_STORED_INT4_ATTRIBUTES)
+		{
+			tq_set_error(errmsg, errmsg_len,
+						 "invalid turboquant batch page: too many int4 attributes");
+			return false;
+		}
+
+		flags = tq_batch_make_flags(true, params->int4_attribute_count);
 
 		memset(page, 0, page_size);
 		tq_write_page_common(bytes, TQ_PAGE_KIND_BATCH, TQ_BATCH_PAGE_HEADER_BYTES);
@@ -1469,20 +1533,27 @@ tq_batch_page_init(void *page,
 
 		if (tq_batch_required_bytes_internal(params->lane_count,
 											 params->code_bytes,
-											 params->has_int4_filter) > page_size)
+											 params->int4_attribute_count) > page_size)
 		{
 			tq_set_error(errmsg, errmsg_len,
 						 "invalid turboquant batch page: requested layout does not fit on the page");
 			return false;
 		}
 
+		if (params->int4_attribute_count > TQ_MAX_STORED_INT4_ATTRIBUTES)
+		{
+			tq_set_error(errmsg, errmsg_len,
+						 "invalid turboquant batch page: too many int4 attributes");
+			return false;
+		}
+
 		tid_offset = bitmap_offset + tq_bitmap_bytes_for_lanes(params->lane_count);
 		code_offset = tid_offset + (size_t) TQ_TID_STORAGE_BYTES
-			+ (params->has_int4_filter ? sizeof(int32_t) : 0);
+			+ ((size_t) params->int4_attribute_count * sizeof(int32_t));
 		total_bytes = tq_batch_required_bytes_internal(params->lane_count,
 													   params->code_bytes,
-													   params->has_int4_filter);
-		flags = params->has_int4_filter ? TQ_BATCH_FLAG_FILTER_INT4 : 0;
+													   params->int4_attribute_count);
+		flags = tq_batch_make_flags(false, params->int4_attribute_count);
 
 		memset(page, 0, page_size);
 		tq_write_page_common(bytes, TQ_PAGE_KIND_BATCH, TQ_BATCH_PAGE_HEADER_BYTES);
@@ -1814,14 +1885,40 @@ tq_batch_page_get_tid(const void *page,
 }
 
 bool
-tq_batch_page_set_filter_int4(void *page,
-							  size_t page_size,
-							  uint16_t lane_index,
-							  int32_t filter_value,
-							  char *errmsg,
-							  size_t errmsg_len)
+tq_batch_page_get_int4_attribute_count(const void *page,
+									   size_t page_size,
+									   uint16_t *attribute_count,
+									   char *errmsg,
+									   size_t errmsg_len)
+{
+	const uint8_t *bytes = (const uint8_t *) page;
+
+	if (page == NULL || attribute_count == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant batch page: page and attribute count output must be non-null");
+		return false;
+	}
+
+	if (!tq_batch_validate_header(bytes, page_size, errmsg, errmsg_len))
+		return false;
+
+	*attribute_count = tq_batch_flag_int4_attribute_count(
+		tq_read_u16(bytes, TQ_BATCH_FLAGS_OFFSET));
+	return true;
+}
+
+bool
+tq_batch_page_set_int4_attribute(void *page,
+								 size_t page_size,
+								 uint16_t lane_index,
+								 uint16_t attribute_index,
+								 int32_t value,
+								 char *errmsg,
+								 size_t errmsg_len)
 {
 	uint8_t *bytes = (uint8_t *) page;
+	uint16_t attribute_count = 0;
 	size_t offset = 0;
 
 	if (page == NULL)
@@ -1831,14 +1928,14 @@ tq_batch_page_set_filter_int4(void *page,
 		return false;
 	}
 
-	if (!tq_batch_validate_header(bytes, page_size, errmsg, errmsg_len))
+	if (!tq_batch_page_get_int4_attribute_count(page, page_size, &attribute_count,
+												errmsg, errmsg_len))
 		return false;
 
-	if (tq_batch_is_soa_page(bytes)
-		|| (tq_read_u16(bytes, TQ_BATCH_FLAGS_OFFSET) & TQ_BATCH_FLAG_FILTER_INT4) == 0)
+	if (attribute_count == 0 || attribute_index >= attribute_count)
 	{
 		tq_set_error(errmsg, errmsg_len,
-					 "invalid turboquant batch page: int4 filter payload is not available on this page");
+					 "invalid turboquant batch page: requested int4 attribute is not available on this page");
 		return false;
 	}
 
@@ -1849,37 +1946,47 @@ tq_batch_page_set_filter_int4(void *page,
 		return false;
 	}
 
-	offset = tq_batch_filter_int4_offset(bytes, lane_index);
-	tq_write_u32(bytes, offset, (uint32_t) filter_value);
+	if (tq_batch_is_soa_page(bytes))
+	{
+		uint16_t lane_count = tq_read_u16(bytes, TQ_BATCH_LANE_COUNT_OFFSET);
+
+		offset = tq_batch_soa_int4_attribute_offset(lane_count, lane_index, attribute_index);
+	}
+	else
+		offset = tq_batch_int4_attribute_offset(bytes, lane_index, attribute_index);
+
+	tq_write_u32(bytes, offset, (uint32_t) value);
 	return true;
 }
 
 bool
-tq_batch_page_get_filter_int4(const void *page,
-							  size_t page_size,
-							  uint16_t lane_index,
-							  int32_t *filter_value,
-							  char *errmsg,
-							  size_t errmsg_len)
+tq_batch_page_get_int4_attribute(const void *page,
+								 size_t page_size,
+								 uint16_t lane_index,
+								 uint16_t attribute_index,
+								 int32_t *value,
+								 char *errmsg,
+								 size_t errmsg_len)
 {
 	const uint8_t *bytes = (const uint8_t *) page;
+	uint16_t attribute_count = 0;
 	size_t offset = 0;
 
-	if (page == NULL || filter_value == NULL)
+	if (page == NULL || value == NULL)
 	{
 		tq_set_error(errmsg, errmsg_len,
-					 "invalid turboquant batch page: page and filter output must be non-null");
+					 "invalid turboquant batch page: page and attribute output must be non-null");
 		return false;
 	}
 
-	if (!tq_batch_validate_header(bytes, page_size, errmsg, errmsg_len))
+	if (!tq_batch_page_get_int4_attribute_count(page, page_size, &attribute_count,
+												errmsg, errmsg_len))
 		return false;
 
-	if (tq_batch_is_soa_page(bytes)
-		|| (tq_read_u16(bytes, TQ_BATCH_FLAGS_OFFSET) & TQ_BATCH_FLAG_FILTER_INT4) == 0)
+	if (attribute_count == 0 || attribute_index >= attribute_count)
 	{
 		tq_set_error(errmsg, errmsg_len,
-					 "invalid turboquant batch page: int4 filter payload is not available on this page");
+					 "invalid turboquant batch page: requested int4 attribute is not available on this page");
 		return false;
 	}
 
@@ -1890,8 +1997,16 @@ tq_batch_page_get_filter_int4(const void *page,
 		return false;
 	}
 
-	offset = tq_batch_filter_int4_offset(bytes, lane_index);
-	*filter_value = (int32_t) tq_read_u32(bytes, offset);
+	if (tq_batch_is_soa_page(bytes))
+	{
+		uint16_t lane_count = tq_read_u16(bytes, TQ_BATCH_LANE_COUNT_OFFSET);
+
+		offset = tq_batch_soa_int4_attribute_offset(lane_count, lane_index, attribute_index);
+	}
+	else
+		offset = tq_batch_int4_attribute_offset(bytes, lane_index, attribute_index);
+
+	*value = (int32_t) tq_read_u32(bytes, offset);
 	return true;
 }
 
@@ -1914,9 +2029,33 @@ tq_batch_page_has_filter_int4(const void *page,
 	if (!tq_batch_validate_header(bytes, page_size, errmsg, errmsg_len))
 		return false;
 
-	*has_filter = !tq_batch_is_soa_page(bytes)
-		&& (tq_read_u16(bytes, TQ_BATCH_FLAGS_OFFSET) & TQ_BATCH_FLAG_FILTER_INT4) != 0;
+	*has_filter = tq_batch_flag_int4_attribute_count(
+		tq_read_u16(bytes, TQ_BATCH_FLAGS_OFFSET)) > 0;
 	return true;
+}
+
+bool
+tq_batch_page_set_filter_int4(void *page,
+							  size_t page_size,
+							  uint16_t lane_index,
+							  int32_t filter_value,
+							  char *errmsg,
+							  size_t errmsg_len)
+{
+	return tq_batch_page_set_int4_attribute(page, page_size, lane_index, 0,
+												filter_value, errmsg, errmsg_len);
+}
+
+bool
+tq_batch_page_get_filter_int4(const void *page,
+							  size_t page_size,
+							  uint16_t lane_index,
+							  int32_t *filter_value,
+							  char *errmsg,
+							  size_t errmsg_len)
+{
+	return tq_batch_page_get_int4_attribute(page, page_size, lane_index, 0,
+												filter_value, errmsg, errmsg_len);
 }
 
 bool
@@ -2126,9 +2265,12 @@ tq_batch_page_compact(void *page,
 	{
 		uint16_t	lane_count = tq_read_u16(bytes, TQ_BATCH_LANE_COUNT_OFFSET);
 		uint16_t	dimension = tq_read_u16(bytes, TQ_BATCH_TID_OFFSET_OFFSET);
+		uint16_t	int4_attribute_count = tq_batch_flag_int4_attribute_count(
+			tq_read_u16(bytes, TQ_BATCH_FLAGS_OFFSET));
 		size_t		tid_base = tq_batch_soa_tid_array_offset(lane_count);
-		size_t		gamma_base = tq_batch_soa_gamma_array_offset(lane_count);
-		size_t		nibble_base = tq_batch_soa_nibble_block_offset(lane_count);
+		size_t		filter_base = tq_batch_soa_filter_array_offset(lane_count);
+		size_t		gamma_base = tq_batch_soa_gamma_array_offset(lane_count, int4_attribute_count);
+		size_t		nibble_base = tq_batch_soa_nibble_block_offset(lane_count, int4_attribute_count);
 		uint32_t	d;
 
 		for (read_lane = 0; read_lane < occupied_count; read_lane++)
@@ -2141,6 +2283,20 @@ tq_batch_page_compact(void *page,
 					memcpy(bytes + tid_base + (size_t) write_lane * TQ_TID_STORAGE_BYTES,
 						   bytes + tid_base + (size_t) read_lane * TQ_TID_STORAGE_BYTES,
 						   TQ_TID_STORAGE_BYTES);
+
+					if (int4_attribute_count > 0)
+					{
+						uint16_t attribute_index = 0;
+
+						for (attribute_index = 0; attribute_index < int4_attribute_count; attribute_index++)
+							memcpy(bytes + filter_base
+								   + ((((size_t) attribute_index * (size_t) lane_count)
+									   + (size_t) write_lane) * sizeof(int32_t)),
+								   bytes + filter_base
+								   + ((((size_t) attribute_index * (size_t) lane_count)
+									   + (size_t) read_lane) * sizeof(int32_t)),
+								   sizeof(int32_t));
+					}
 
 					/* Move gamma */
 					memcpy(bytes + gamma_base + (size_t) write_lane * sizeof(float),
@@ -2202,15 +2358,25 @@ tq_batch_page_compact(void *page,
 				if (write_lane != read_lane)
 				{
 					TqTid tid;
+					uint16_t attribute_count = tq_batch_flag_int4_attribute_count(
+						tq_read_u16(bytes, TQ_BATCH_FLAGS_OFFSET));
+					uint16_t attribute_index = 0;
 
 					memset(&tid, 0, sizeof(tid));
 					tq_read_tid(bytes, read_lane, &tid);
 					tq_write_tid(bytes, write_lane, &tid);
-					if ((tq_read_u16(bytes, TQ_BATCH_FLAGS_OFFSET) & TQ_BATCH_FLAG_FILTER_INT4) != 0)
+					for (attribute_index = 0; attribute_index < attribute_count; attribute_index++)
 					{
-						uint32_t filter_value = tq_read_u32(bytes, tq_batch_filter_int4_offset(bytes, read_lane));
+						uint32_t value = tq_read_u32(bytes,
+													 tq_batch_int4_attribute_offset(bytes,
+																				 read_lane,
+																				 attribute_index));
 
-						tq_write_u32(bytes, tq_batch_filter_int4_offset(bytes, write_lane), filter_value);
+						tq_write_u32(bytes,
+									 tq_batch_int4_attribute_offset(bytes,
+																	write_lane,
+																	attribute_index),
+									 value);
 					}
 					if (code_bytes > 0)
 					{
@@ -2339,19 +2505,70 @@ size_t
 tq_batch_page_soa_required_bytes(uint16_t lane_count, uint32_t dimension,
 								 uint32_t representative_code_bytes)
 {
-	return tq_batch_soa_representative_offset(lane_count, dimension)
-		   + (size_t) representative_code_bytes;
+	return tq_batch_page_soa_required_bytes_with_filter(lane_count, dimension,
+														representative_code_bytes,
+														false);
+}
+
+size_t
+tq_batch_page_soa_required_bytes_with_filter(uint16_t lane_count, uint32_t dimension,
+											 uint32_t representative_code_bytes,
+											 bool has_int4_filter)
+{
+	return tq_batch_page_soa_required_bytes_with_int4_attributes(
+		lane_count,
+		dimension,
+		representative_code_bytes,
+		has_int4_filter ? 1 : 0);
+}
+
+size_t
+tq_batch_page_soa_required_bytes_with_int4_attributes(uint16_t lane_count,
+														 uint32_t dimension,
+														 uint32_t representative_code_bytes,
+														 uint16_t int4_attribute_count)
+{
+	return tq_batch_soa_required_bytes_internal(lane_count, dimension,
+												representative_code_bytes,
+												int4_attribute_count);
 }
 
 bool
 tq_batch_page_can_fit_soa(size_t page_size, uint16_t lane_count,
 						  uint32_t dimension, uint32_t representative_code_bytes)
 {
+	return tq_batch_page_can_fit_soa_with_filter(page_size, lane_count, dimension,
+												 representative_code_bytes, false);
+}
+
+bool
+tq_batch_page_can_fit_soa_with_filter(size_t page_size, uint16_t lane_count,
+									  uint32_t dimension,
+									  uint32_t representative_code_bytes,
+									  bool has_int4_filter)
+{
+	return tq_batch_page_can_fit_soa_with_int4_attributes(
+		page_size,
+		lane_count,
+		dimension,
+		representative_code_bytes,
+		has_int4_filter ? 1 : 0);
+}
+
+bool
+tq_batch_page_can_fit_soa_with_int4_attributes(size_t page_size,
+												   uint16_t lane_count,
+												   uint32_t dimension,
+												   uint32_t representative_code_bytes,
+												   uint16_t int4_attribute_count)
+{
 	if (lane_count == 0 || dimension == 0 || representative_code_bytes == 0)
 		return false;
 
-	return tq_batch_page_soa_required_bytes(lane_count, dimension,
-											representative_code_bytes) <= page_size;
+	return tq_batch_page_soa_required_bytes_with_int4_attributes(lane_count,
+																dimension,
+																representative_code_bytes,
+																int4_attribute_count) <= page_size;
 }
 
 bool
@@ -2401,7 +2618,9 @@ tq_batch_page_set_nibble_and_gamma(void *page, size_t page_size,
 		return false;
 	}
 
-	nibble_base = tq_batch_soa_nibble_block_offset(lane_count);
+	nibble_base = tq_batch_soa_nibble_block_offset(lane_count,
+												   tq_batch_flag_int4_attribute_count(
+													   tq_read_u16(bytes, TQ_BATCH_FLAGS_OFFSET)));
 	{
 		size_t	pair_cols = ((size_t) lane_count + 1u) / 2u;
 		size_t	byte_col = (size_t) lane_index / 2u;
@@ -2419,7 +2638,9 @@ tq_batch_page_set_nibble_and_gamma(void *page, size_t page_size,
 		}
 	}
 
-	gamma_base = tq_batch_soa_gamma_array_offset(lane_count);
+	gamma_base = tq_batch_soa_gamma_array_offset(lane_count,
+												 tq_batch_flag_int4_attribute_count(
+													 tq_read_u16(bytes, TQ_BATCH_FLAGS_OFFSET)));
 	tq_write_float32(bytes, gamma_base + (size_t) lane_index * sizeof(float), gamma);
 
 	return true;
@@ -2453,7 +2674,9 @@ tq_batch_page_get_nibble_ptr(const void *page, size_t page_size,
 	lc = tq_read_u16(bytes, TQ_BATCH_LANE_COUNT_OFFSET);
 	*dimension = (uint32_t) tq_read_u16(bytes, TQ_BATCH_TID_OFFSET_OFFSET);
 	*lane_count = lc;
-	*nibbles = bytes + tq_batch_soa_nibble_block_offset(lc);
+	*nibbles = bytes + tq_batch_soa_nibble_block_offset(lc,
+													 tq_batch_flag_int4_attribute_count(
+														 tq_read_u16(bytes, TQ_BATCH_FLAGS_OFFSET)));
 
 	return true;
 }
@@ -2483,7 +2706,9 @@ tq_batch_page_get_gamma_ptr(const void *page, size_t page_size,
 	}
 
 	lane_count = tq_read_u16(bytes, TQ_BATCH_LANE_COUNT_OFFSET);
-	*gammas = (const float *) (bytes + tq_batch_soa_gamma_array_offset(lane_count));
+	*gammas = (const float *) (bytes + tq_batch_soa_gamma_array_offset(lane_count,
+														tq_batch_flag_int4_attribute_count(
+															tq_read_u16(bytes, TQ_BATCH_FLAGS_OFFSET))));
 
 	return true;
 }
@@ -2527,7 +2752,9 @@ tq_batch_page_set_representative_code(void *page, size_t page_size,
 		return false;
 	}
 
-	rep_offset = tq_batch_soa_representative_offset(lane_count, (uint32_t) dimension);
+	rep_offset = tq_batch_soa_representative_offset(lane_count, (uint32_t) dimension,
+													tq_batch_flag_int4_attribute_count(
+														tq_read_u16(bytes, TQ_BATCH_FLAGS_OFFSET)));
 	memcpy(bytes + rep_offset, code, code_len);
 	return true;
 }
@@ -2564,7 +2791,9 @@ tq_batch_page_get_representative_code_view(const void *page, size_t page_size,
 	dimension = tq_read_u16(bytes, TQ_BATCH_TID_OFFSET_OFFSET);
 	stored_code_bytes = tq_read_u32(bytes, TQ_BATCH_CODE_BYTES_OFFSET);
 
-	rep_offset = tq_batch_soa_representative_offset(lane_count, (uint32_t) dimension);
+	rep_offset = tq_batch_soa_representative_offset(lane_count, (uint32_t) dimension,
+													tq_batch_flag_int4_attribute_count(
+														tq_read_u16(bytes, TQ_BATCH_FLAGS_OFFSET)));
 	*code = bytes + rep_offset;
 	*code_len = (size_t) stored_code_bytes;
 	return true;

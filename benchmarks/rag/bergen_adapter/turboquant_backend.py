@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 from .adapter import PassageTable, RetrievalPlan, RetrievalRequest, validate_metric, vector_literal
 
@@ -27,6 +28,8 @@ class PgTurboquantBackend:
     oversample_guc: str = "turboquant.oversample_factor"
     max_visited_codes_guc: str = "turboquant.max_visited_codes"
     max_visited_pages_guc: str = "turboquant.max_visited_pages"
+    iterative_scan_guc: str = "turboquant.iterative_scan"
+    min_rows_after_filter_guc: str = "turboquant.min_rows_after_filter"
     helper_schema: str = "public"
 
     @property
@@ -59,21 +62,62 @@ class PgTurboquantBackend:
         max_visited_pages = request.ann.get("max_visited_pages")
         if max_visited_pages is not None:
             session_statements.append((f"SET LOCAL {self.max_visited_pages_guc} = %s", (max_visited_pages,)))
+        iterative_scan = request.ann.get("iterative_scan")
+        if iterative_scan is not None:
+            session_statements.append((f"SET LOCAL {self.iterative_scan_guc} = %s", (iterative_scan,)))
+        min_rows_after_filter = request.ann.get("min_rows_after_filter")
+        if min_rows_after_filter is not None:
+            session_statements.append(
+                (f"SET LOCAL {self.min_rows_after_filter_guc} = %s", (min_rows_after_filter,))
+            )
 
         query_literal = vector_literal(request.query_vector)
         operator = METRIC_OPERATORS[request_metric]
+        filters = _normalize_filters(request.ann.get("filters"))
+        stage1_payload_columns = _normalize_identifier_list(request.ann.get("stage1_payload_columns"))
+        text_join_column = str(request.ann.get("text_join_column") or table.id_column)
+        delta_table_name = request.ann.get("delta_table_name")
+        delta_candidate_limit = int(request.ann.get("delta_candidate_limit") or max(request.top_k, 1))
+        stage1_limit = int(request.ann.get("stage1_candidate_limit") or request.top_k)
         if self.mode == MODE_APPROX:
-            sql = (
-                f"WITH query_vector AS (SELECT %s::{table.query_vector_cast} AS embedding) "
-                f"SELECT p.{table.id_column} AS id, "
-                f"p.{table.embedding_column} {operator} query_vector.embedding AS score, "
-                f"p.{table.text_column} AS text "
-                f"FROM {table.table_name} AS p "
-                f"CROSS JOIN query_vector "
-                f"ORDER BY p.{table.embedding_column} {operator} query_vector.embedding ASC "
-                f"LIMIT %s"
+            if filters or stage1_payload_columns or delta_table_name:
+                sql, params = self._build_filtered_stage1_plan(
+                    table=table,
+                    query_literal=query_literal,
+                    operator=operator,
+                    request_top_k=request.top_k,
+                    filters=filters,
+                    stage1_payload_columns=stage1_payload_columns,
+                    text_join_column=text_join_column,
+                    delta_table_name=str(delta_table_name) if delta_table_name else None,
+                    delta_candidate_limit=delta_candidate_limit,
+                    stage1_limit=stage1_limit,
+                )
+            else:
+                sql = (
+                    f"WITH query_vector AS (SELECT %s::{table.query_vector_cast} AS embedding) "
+                    f"SELECT p.{table.id_column} AS id, "
+                    f"p.{table.embedding_column} {operator} query_vector.embedding AS score, "
+                    f"p.{table.text_column} AS text "
+                    f"FROM {table.table_name} AS p "
+                    f"CROSS JOIN query_vector "
+                    f"ORDER BY p.{table.embedding_column} {operator} query_vector.embedding ASC "
+                    f"LIMIT %s"
+                )
+                params = (query_literal, request.top_k)
+        elif filters or stage1_payload_columns or delta_table_name:
+            sql, params = self._build_filtered_stage1_plan(
+                table=table,
+                query_literal=query_literal,
+                operator=operator,
+                request_top_k=request.top_k,
+                filters=filters,
+                stage1_payload_columns=stage1_payload_columns,
+                text_join_column=text_join_column,
+                delta_table_name=str(delta_table_name) if delta_table_name else None,
+                delta_candidate_limit=delta_candidate_limit,
+                stage1_limit=self.rerank_k or stage1_limit,
             )
-            params = (query_literal, request.top_k)
         else:
             sql = (
                 f"WITH query_vector AS (SELECT %s::{table.query_vector_cast} AS embedding), "
@@ -99,6 +143,85 @@ class PgTurboquantBackend:
             session_statements=session_statements,
         )
 
+    def _build_filtered_stage1_plan(
+        self,
+        *,
+        table: PassageTable,
+        query_literal: str,
+        operator: str,
+        request_top_k: int,
+        filters: Mapping[str, int | Sequence[int]],
+        stage1_payload_columns: Sequence[str],
+        text_join_column: str,
+        delta_table_name: str | None,
+        delta_candidate_limit: int,
+        stage1_limit: int,
+    ) -> tuple[str, tuple[Any, ...]]:
+        params: list[Any] = [query_literal]
+        where_sql, where_params = _render_filter_clause("p", filters)
+        params.extend(where_params)
+
+        stage1_projection = [f"p.{text_join_column} AS id"]
+        for column in stage1_payload_columns:
+            stage1_projection.append(f"p.{column}")
+        projection_sql = ", ".join(stage1_projection)
+
+        stage1_ctes = [
+            "query_vector AS (SELECT %s::%s AS embedding)" % ( "%s", table.query_vector_cast),
+            (
+                "base_stage1 AS ("
+                f"SELECT {projection_sql} "
+                f"FROM {table.table_name} AS p "
+                "CROSS JOIN query_vector "
+                f"{where_sql} "
+                f"ORDER BY p.{table.embedding_column} {operator} query_vector.embedding ASC "
+                "LIMIT %s)"
+            ),
+        ]
+        params.append(stage1_limit)
+
+        union_source = "SELECT * FROM base_stage1"
+        if delta_table_name:
+            delta_where_sql, delta_where_params = _render_filter_clause("p", filters)
+            stage1_ctes.append(
+                "delta_stage1 AS ("
+                f"SELECT {projection_sql} "
+                f"FROM {delta_table_name} AS p "
+                "CROSS JOIN query_vector "
+                f"{delta_where_sql} "
+                f"ORDER BY p.{table.embedding_column} {operator} query_vector.embedding ASC "
+                "LIMIT %s)"
+            )
+            params.extend(delta_where_params)
+            params.append(delta_candidate_limit)
+            union_source = "SELECT * FROM base_stage1 UNION ALL SELECT * FROM delta_stage1"
+
+        stage1_ctes.append(
+            "stage1_candidates AS ("
+            f"{union_source}"
+            ")"
+        )
+
+        sql = (
+            f"/* tq_filters: {json.dumps(filters, sort_keys=True)} */ "
+            f"/* tq_stage1_payload_columns: {json.dumps(list(stage1_payload_columns))} */ "
+            f"/* tq_delta_table_name: {json.dumps(delta_table_name)} */ "
+            f"/* tq_delta_candidate_limit: {json.dumps(delta_candidate_limit if delta_table_name else None)} */ "
+            "WITH "
+            + ", ".join(stage1_ctes)
+            + " "
+            + "SELECT stage1_candidates.id, "
+            + f"text_source.{table.embedding_column} {operator} query_vector.embedding AS score, "
+            + f"text_source.{table.text_column} AS text "
+            + "FROM stage1_candidates "
+            + f"JOIN {table.table_name} AS text_source ON text_source.{text_join_column} = stage1_candidates.id "
+            + "CROSS JOIN query_vector "
+            + f"ORDER BY text_source.{table.embedding_column} {operator} query_vector.embedding ASC "
+            + "LIMIT %s"
+        )
+        params.append(request_top_k)
+        return sql, tuple(params)
+
     def metric_name_for_helper(self) -> str:
         if self.metric == "inner_product":
             return "ip"
@@ -109,6 +232,8 @@ class PgTurboquantBackend:
         oversample_factor = None
         max_visited_codes = None
         max_visited_pages = None
+        iterative_scan = None
+        min_rows_after_filter = None
         for sql, params in plan.session_statements:
             if self.probes_guc in sql:
                 probes = params[0]
@@ -118,8 +243,16 @@ class PgTurboquantBackend:
                 max_visited_codes = params[0]
             elif self.max_visited_pages_guc in sql:
                 max_visited_pages = params[0]
+            elif self.iterative_scan_guc in sql:
+                iterative_scan = params[0]
+            elif self.min_rows_after_filter_guc in sql:
+                min_rows_after_filter = params[0]
 
         sql_template_hash = hashlib.sha256(plan.sql.encode("utf-8")).hexdigest()
+        filters = _extract_json_comment(plan.sql, "tq_filters")
+        stage1_payload_columns = _extract_json_comment(plan.sql, "tq_stage1_payload_columns")
+        delta_table_name = _extract_json_comment(plan.sql, "tq_delta_table_name")
+        delta_candidate_limit = _extract_json_comment(plan.sql, "tq_delta_candidate_limit")
         return {
             "index_kind": "pg_turboquant",
             "index_name": self.index_name,
@@ -130,6 +263,64 @@ class PgTurboquantBackend:
             "oversample_factor": oversample_factor,
             "max_visited_codes": max_visited_codes,
             "max_visited_pages": max_visited_pages,
+            "iterative_scan": iterative_scan,
+            "min_rows_after_filter": min_rows_after_filter,
             "rerank_k": self.rerank_k if self.mode == MODE_APPROX_RERANK else None,
+            "filters": filters,
+            "stage1_payload_columns": stage1_payload_columns,
+            "delta_table_name": delta_table_name,
+            "delta_candidate_limit": delta_candidate_limit,
             "sql_template_hash": sql_template_hash,
         }
+
+
+def _normalize_identifier_list(value: Any) -> list[str]:
+    if not value:
+        return []
+    return [str(item) for item in value]
+
+
+def _normalize_filters(value: Any) -> dict[str, int | list[int]]:
+    if not isinstance(value, Mapping):
+        return {}
+    normalized: dict[str, int | list[int]] = {}
+    for key, raw in value.items():
+        if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes, bytearray)):
+            normalized[str(key)] = [int(item) for item in raw]
+        else:
+            normalized[str(key)] = int(raw)
+    return normalized
+
+
+def _render_filter_clause(
+    table_alias: str, filters: Mapping[str, int | Sequence[int]]
+) -> tuple[str, list[Any]]:
+    if not filters:
+        return "", []
+
+    clauses: list[str] = []
+    params: list[Any] = []
+    for column, value in filters.items():
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+            clauses.append(f"{table_alias}.{column} = ANY (%s::int4[])")
+            params.append(list(int(item) for item in value))
+        else:
+            clauses.append(f"{table_alias}.{column} = %s")
+            params.append(int(value))
+
+    return "WHERE " + " AND ".join(clauses), params
+
+
+def _extract_json_comment(sql: str, key: str) -> Any:
+    marker = f"/* {key}:"
+    start = sql.find(marker)
+    if start < 0:
+        return None
+    payload_start = start + len(marker)
+    payload_end = sql.find("*/", payload_start)
+    if payload_end < 0:
+        return None
+    raw = sql[payload_start:payload_end].strip()
+    if not raw:
+        return None
+    return json.loads(raw)

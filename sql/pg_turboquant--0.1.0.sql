@@ -97,9 +97,9 @@ BEGIN
 		'capabilities', jsonb_build_object(
 			'ordered_scan', true,
 			'bitmap_scan', true,
-			'index_only_scan', false,
+			'index_only_scan', true,
 			'multicolumn', true,
-			'include_columns', false
+			'include_columns', true
 		)
 	);
 END;

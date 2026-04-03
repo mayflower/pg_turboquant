@@ -19,6 +19,35 @@
 #include "third_party/pgvector/src/vector.h"
 
 static void
+normalize(float *values, size_t len)
+{
+	float norm = 0.0f;
+	size_t i = 0;
+
+	for (i = 0; i < len; i++)
+		norm += values[i] * values[i];
+
+	norm = sqrtf(norm);
+	assert(norm > 0.0f);
+
+	for (i = 0; i < len; i++)
+		values[i] /= norm;
+}
+
+static void
+seeded_unit_vector(uint32_t seed, float *values, size_t len)
+{
+	size_t i = 0;
+
+	for (i = 0; i < len; i++)
+	{
+		uint32_t mixed = seed * 1664525u + 1013904223u + (uint32_t) i * 2654435761u;
+		values[i] = ((float) (mixed % 2001u) / 1000.0f) - 1.0f;
+	}
+	normalize(values, len);
+}
+
+static void
 test_tq_init_amroutine_flags(void)
 {
 	IndexAmRoutine amroutine;
@@ -32,10 +61,10 @@ test_tq_init_amroutine_flags(void)
 	assert(amroutine.amcanunique == false);
 	assert(amroutine.amcanmulticol == true);
 	assert(amroutine.amoptionalkey == true);
-	assert(amroutine.amsearcharray == false);
+	assert(amroutine.amsearcharray == true);
 	assert(amroutine.amsearchnulls == false);
 	assert(amroutine.amclusterable == false);
-	assert(amroutine.amcaninclude == false);
+	assert(amroutine.amcaninclude == true);
 	assert(amroutine.amsummarizing == false);
 	assert(amroutine.amcanreturn == NULL);
 	assert(amroutine.amstrategies == 1);
@@ -1656,11 +1685,11 @@ test_tq_candidate_heap_behavior(void)
 	memset(&entry, 0, sizeof(entry));
 
 	assert(tq_candidate_heap_init(&heap, 3));
-	assert(tq_candidate_heap_push(&heap, 0.40f, 10, 1));
-	assert(tq_candidate_heap_push(&heap, 0.20f, 10, 2));
-	assert(tq_candidate_heap_push(&heap, 0.30f, 10, 3));
-	assert(tq_candidate_heap_push(&heap, 0.90f, 10, 4));
-	assert(tq_candidate_heap_push(&heap, 0.10f, 10, 5));
+	assert(tq_candidate_heap_push(&heap, 0.40f, 10, 1, NULL, 0));
+	assert(tq_candidate_heap_push(&heap, 0.20f, 10, 2, NULL, 0));
+	assert(tq_candidate_heap_push(&heap, 0.30f, 10, 3, NULL, 0));
+	assert(tq_candidate_heap_push(&heap, 0.90f, 10, 4, NULL, 0));
+	assert(tq_candidate_heap_push(&heap, 0.10f, 10, 5, NULL, 0));
 
 	assert(heap.count == 3);
 	assert(tq_candidate_heap_pop_best(&heap, &entry));
@@ -2715,6 +2744,145 @@ test_tq_batch_page_compaction_reuses_dead_lanes(void)
 	assert(!tq_batch_page_next_live_lane(page, sizeof(page), 1, &lane_index, errmsg, sizeof(errmsg)));
 }
 
+static void
+test_tq_batch_page_soa_filter_int4_roundtrip(void)
+{
+	TqProdCodecConfig config = default_prod_config(32, 4);
+	TqProdPackedLayout layout;
+	TqBatchPageParams params = {
+		.lane_count = 16,
+		.list_id = 0,
+		.next_block = TQ_INVALID_BLOCK_NUMBER,
+		.dimension = 32,
+		.int4_attribute_count = 1
+	};
+	uint8_t		page[TQ_DEFAULT_BLOCK_SIZE];
+	TqTid		tid = {.block_number = 42, .offset_number = 7};
+	uint8_t		nibbles[32];
+	uint16_t	lane_index = 0;
+	int32_t		filter_value = 0;
+	bool		has_filter = false;
+	const float   *gammas = NULL;
+	const uint8_t *page_nibbles = NULL;
+	uint32_t	dimension = 0;
+	uint16_t	lane_count = 0;
+	char		errmsg[256];
+	uint32_t	d;
+
+	memset(&layout, 0, sizeof(layout));
+	memset(page, 0, sizeof(page));
+	memset(nibbles, 0, sizeof(nibbles));
+
+	assert(tq_prod_packed_layout(&config, &layout, errmsg, sizeof(errmsg)));
+	params.code_bytes = (uint32_t) layout.total_bytes;
+
+	for (d = 0; d < 32; d++)
+		nibbles[d] = (uint8_t) (d & 0x0Fu);
+
+	assert(tq_batch_page_init(page, sizeof(page), &params, errmsg, sizeof(errmsg)));
+	assert(tq_batch_page_is_soa(page, sizeof(page)));
+	assert(tq_batch_page_append_lane(page, sizeof(page), &tid, &lane_index, errmsg, sizeof(errmsg)));
+	assert(lane_index == 0);
+	assert(tq_batch_page_set_filter_int4(page, sizeof(page), lane_index, 77, errmsg, sizeof(errmsg)));
+	assert(tq_batch_page_set_nibble_and_gamma(page, sizeof(page), lane_index, nibbles, 32, 0.25f,
+											  errmsg, sizeof(errmsg)));
+
+	assert(tq_batch_page_has_filter_int4(page, sizeof(page), &has_filter, errmsg, sizeof(errmsg)));
+	assert(has_filter);
+	assert(tq_batch_page_get_filter_int4(page, sizeof(page), lane_index, &filter_value, errmsg, sizeof(errmsg)));
+	assert(filter_value == 77);
+	assert(tq_batch_page_get_nibble_ptr(page, sizeof(page), &page_nibbles, &dimension, &lane_count,
+										errmsg, sizeof(errmsg)));
+	assert(tq_batch_page_get_gamma_ptr(page, sizeof(page), &gammas, errmsg, sizeof(errmsg)));
+	assert(dimension == 32);
+	assert(lane_count == 16);
+	for (d = 0; d < 32; d++)
+		assert((page_nibbles[(size_t) d * (lane_count / 2u)] & 0x0Fu) == (uint8_t) (d & 0x0Fu));
+	assert(fabsf(gammas[0] - 0.25f) < 1e-6f);
+}
+
+static void
+test_tq_batch_page_scan_filtered_soa_stays_code_domain(void)
+{
+	TqProdCodecConfig config = default_prod_config(32, 4);
+	TqProdPackedLayout layout;
+	TqProdLut lut;
+	TqBatchPageParams params = {
+		.lane_count = 16,
+		.list_id = 0,
+		.next_block = TQ_INVALID_BLOCK_NUMBER,
+		.dimension = 32,
+		.int4_attribute_count = 1
+	};
+	uint8_t		page[TQ_DEFAULT_BLOCK_SIZE];
+	uint8_t		packed[256];
+	float		query[32];
+	TqCandidateHeap heap;
+	TqCandidateEntry entry;
+	TqScanStats stats;
+	uint16_t	lane = 0;
+	size_t		i = 0;
+	char		errmsg[256];
+
+	memset(&layout, 0, sizeof(layout));
+	memset(&lut, 0, sizeof(lut));
+	memset(page, 0, sizeof(page));
+	memset(packed, 0, sizeof(packed));
+	memset(query, 0, sizeof(query));
+	memset(&heap, 0, sizeof(heap));
+	memset(&entry, 0, sizeof(entry));
+	memset(&stats, 0, sizeof(stats));
+
+	seeded_unit_vector(77u, query, 32);
+	assert(tq_prod_packed_layout(&config, &layout, errmsg, sizeof(errmsg)));
+	assert(tq_prod_lut_build(&config, query, &lut, errmsg, sizeof(errmsg)));
+	assert(tq_candidate_heap_init(&heap, 16));
+	params.code_bytes = (uint32_t) layout.total_bytes;
+
+	assert(tq_batch_page_init(page, sizeof(page), &params, errmsg, sizeof(errmsg)));
+	assert(tq_batch_page_is_soa(page, sizeof(page)));
+
+	for (i = 0; i < 16; i++)
+	{
+		float		input[32];
+		float		gamma = 0.0f;
+		uint8_t		nibbles[32];
+
+		seeded_unit_vector((uint32_t) (1200 + i), input, 32);
+		memset(packed, 0, sizeof(packed));
+		memset(nibbles, 0, sizeof(nibbles));
+
+		assert(tq_prod_encode(&config, input, packed, layout.total_bytes, errmsg, sizeof(errmsg)));
+		assert(tq_prod_extract_nibbles(&config, packed, layout.total_bytes, nibbles, 32, errmsg, sizeof(errmsg)));
+		assert(tq_prod_read_gamma(&config, packed, layout.total_bytes, &gamma, errmsg, sizeof(errmsg)));
+		assert(tq_batch_page_append_lane(page, sizeof(page),
+										 &(TqTid){.block_number = 1, .offset_number = (uint16_t) (i + 1)},
+										 &lane, errmsg, sizeof(errmsg)));
+		assert(tq_batch_page_set_filter_int4(page, sizeof(page), lane, (i < 8) ? 1 : 2,
+											 errmsg, sizeof(errmsg)));
+		assert(tq_batch_page_set_nibble_and_gamma(page, sizeof(page), lane, nibbles, 32, gamma,
+											  errmsg, sizeof(errmsg)));
+	}
+
+	tq_scan_stats_begin(TQ_SCAN_MODE_FLAT, 1);
+	assert(tq_batch_page_scan_prod(page, sizeof(page), &config, true, TQ_DISTANCE_COSINE, &lut,
+								   query, 32, true, 1, &heap, NULL, errmsg, sizeof(errmsg)));
+	tq_scan_stats_snapshot(&stats);
+
+	assert(stats.score_mode == TQ_SCAN_SCORE_MODE_CODE_DOMAIN);
+	assert(stats.faithful_fast_path);
+	assert(!stats.compatibility_fallback);
+	assert(stats.decoded_vector_count == 0);
+	assert(stats.visited_code_count == 8u);
+	assert(heap.count == 8u);
+
+	while (tq_candidate_heap_pop_best(&heap, &entry))
+		assert(entry.tid.offset_number >= 1 && entry.tid.offset_number <= 8);
+
+	tq_candidate_heap_reset(&heap);
+	tq_prod_lut_reset(&lut);
+}
+
 int
 main(void)
 {
@@ -2790,5 +2958,7 @@ main(void)
 	test_tq_batch_page_tail_append_decisions();
 	test_tq_batch_page_reclaim_decisions();
 	test_tq_batch_page_compaction_reuses_dead_lanes();
+	test_tq_batch_page_soa_filter_int4_roundtrip();
+	test_tq_batch_page_scan_filtered_soa_stays_code_domain();
 	return 0;
 }

@@ -139,10 +139,10 @@ The docs hub lives at [docs/README.md](docs/README.md).
 - pgvector: required for `vector` and `halfvec`
 - Tested pgvector contract: pinned development and CI reference `v0.8.1`
 - Current support boundary:
-  - single-column indexes only
-  - no index-only scans
-  - no multicolumn support
-  - no `INCLUDE` columns
+  - one `vector`/`halfvec` ANN key plus up to eight stored `int4` metadata attributes
+  - exact `int4` filter keys support equality and `ANY(int4[])` predicates inside the ordered scan
+  - `INCLUDE`-style `int4` payload columns are returned through index tuples for stage-1/index-only-style retrieval
+  - the production fast lane still assumes normalized cosine/IP, `transform = 'hadamard'`, and `lanes = auto`
   - exact reranking stays outside the access method
 
 ## Development

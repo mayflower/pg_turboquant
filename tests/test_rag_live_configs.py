@@ -49,10 +49,19 @@ class RagLiveConfigContractTest(unittest.TestCase):
         self.assertEqual(config.backends[0]["kind"], "pg_turboquant")
         self.assertEqual(config.backends[0]["options"]["lists"], 64)
         self.assertEqual(config.backends[0]["options"]["router_restarts"], 3)
+        self.assertEqual(config.backends[0]["filter_columns"], ["tenant_id", "source_id", "lang_id"])
+        self.assertEqual(config.backends[0]["include_columns"], ["doc_id_int", "chunk_id_int", "doc_version"])
         self.assertEqual(config.backends[0]["ann"]["probes"], 8)
         self.assertEqual(config.backends[0]["ann"]["oversampling"], 4)
         self.assertEqual(config.backends[0]["ann"]["max_visited_codes"], 4096)
         self.assertEqual(config.backends[0]["ann"]["max_visited_pages"], 0)
+        self.assertEqual(config.backends[0]["ann"]["filters"], {"tenant_id": 1, "source_id": [1, 2, 3], "lang_id": 1})
+        self.assertEqual(
+            config.backends[0]["ann"]["stage1_payload_columns"],
+            ["doc_id_int", "chunk_id_int", "tenant_id", "doc_version"],
+        )
+        self.assertEqual(config.backends[0]["ann"]["iterative_scan"], "strict_order")
+        self.assertEqual(config.backends[0]["ann"]["min_rows_after_filter"], 20)
         self.assertEqual(config.regression_gate["dataset_id"], "kilt_hotpotqa")
         self.assertEqual(config.regression_gate["method_id"], "pg_turboquant_approx")
         self.assertEqual(config.regression_gate["recall_at_10_floor"], 0.90)

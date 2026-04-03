@@ -1,0 +1,77 @@
+SET client_min_messages = warning;
+DROP EXTENSION IF EXISTS pg_turboquant CASCADE;
+DROP EXTENSION IF EXISTS vector CASCADE;
+CREATE EXTENSION vector;
+CREATE EXTENSION pg_turboquant;
+
+CREATE TABLE tq_rag_surface_docs (
+	passage_id int4 PRIMARY KEY,
+	doc_id int4 NOT NULL,
+	chunk_id int4 NOT NULL,
+	tenant_id int4 NOT NULL,
+	source_id int4 NOT NULL,
+	lang_id int4 NOT NULL,
+	doc_version int4 NOT NULL,
+	payload text NOT NULL,
+	embedding vector(4)
+);
+
+INSERT INTO tq_rag_surface_docs (
+	passage_id, doc_id, chunk_id, tenant_id, source_id, lang_id, doc_version, payload, embedding
+) VALUES
+	(1, 101, 1, 1, 10, 1, 7, 't1-s10-en-a', '[1,0,0,0]'),
+	(2, 101, 2, 1, 11, 1, 7, 't1-s11-en-b', '[0.99,0.01,0,0]'),
+	(3, 102, 3, 1, 12, 2, 7, 't1-s12-de-c', '[0.98,0.02,0,0]'),
+	(4, 201, 4, 2, 10, 1, 5, 't2-s10-en-d', '[1,0,0,0]'),
+	(5, 202, 5, 2, 11, 1, 5, 't2-s11-en-e', '[0.97,0.03,0,0]'),
+	(6, 203, 6, 2, 12, 2, 5, 't2-s12-de-f', '[0,1,0,0]');
+
+CREATE INDEX tq_rag_surface_docs_idx
+	ON tq_rag_surface_docs
+	USING turboquant (
+		embedding tq_cosine_ops,
+		tenant_id tq_int4_filter_ops,
+		source_id tq_int4_filter_ops,
+		lang_id tq_int4_filter_ops
+	)
+	INCLUDE (doc_id, chunk_id, doc_version)
+	WITH (
+		bits = 4,
+		lists = 2,
+		lanes = auto,
+		transform = 'hadamard',
+		normalized = true
+	);
+
+VACUUM (FREEZE, ANALYZE) tq_rag_surface_docs;
+
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET turboquant.probes = 1;
+SET turboquant.iterative_scan = 'strict_order';
+SET turboquant.min_rows_after_filter = 2;
+
+EXPLAIN (COSTS OFF)
+SELECT doc_id, chunk_id, tenant_id, doc_version
+FROM tq_rag_surface_docs
+WHERE tenant_id = 1
+	AND source_id = 10
+	AND lang_id = 1
+ORDER BY embedding <=> '[1,0,0,0]'::vector(4)
+LIMIT 1;
+
+SELECT doc_id, chunk_id, tenant_id, doc_version
+FROM tq_rag_surface_docs
+WHERE tenant_id = 1
+	AND source_id = ANY (ARRAY[10, 11]::int4[])
+	AND lang_id = 1
+ORDER BY embedding <=> '[1,0,0,0]'::vector(4)
+LIMIT 2;
+
+WITH stats AS (
+	SELECT tq_last_scan_stats() AS stats
+)
+SELECT
+	stats->>'scan_orchestration' = 'ivf_near_exhaustive' AS iterative_scan_enabled,
+	(stats->>'candidate_heap_count')::int >= 2 AS iterative_min_rows_satisfied
+FROM stats;

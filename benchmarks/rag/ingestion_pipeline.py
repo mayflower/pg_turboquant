@@ -279,6 +279,12 @@ def ensure_schema(connection: Any, config: CampaignConfig) -> None:
             "passage_id text PRIMARY KEY, "
             "document_id text NOT NULL, "
             "chunk_index integer NOT NULL, "
+            "tenant_id integer NOT NULL, "
+            "source_id integer NOT NULL, "
+            "lang_id integer NOT NULL, "
+            "doc_version integer NOT NULL, "
+            "doc_id_int integer NOT NULL, "
+            "chunk_id_int integer NOT NULL, "
             "passage_text text NOT NULL, "
             "embedding vector NOT NULL)"
         )
@@ -329,8 +335,14 @@ def ingest_corpus(
     passages_table = config.schema["passages_table"]
 
     passage_records: list[tuple[str, str, int, str]] = []
+    passage_metadata: list[dict[str, int]] = []
     document_records: list[tuple[str, str]] = []
-    for item in corpus:
+    for document_ordinal, item in enumerate(corpus, start=1):
+        item_doc_id_int = int(item.get("doc_id_int") or document_ordinal)
+        item_tenant_id = int(item.get("tenant_id") or ((document_ordinal - 1) % 4) + 1)
+        item_source_id = int(item.get("source_id") or ((document_ordinal - 1) % 8) + 1)
+        item_lang_id = int(item.get("lang_id") or 1)
+        item_doc_version = int(item.get("doc_version") or 1)
         document_records.append((item["document_id"], item.get("title", item["document_id"])))
         for chunk_index, passage in enumerate(item["passages"]):
             passage_records.append(
@@ -340,6 +352,16 @@ def ingest_corpus(
                     chunk_index,
                     passage["text"],
                 )
+            )
+            passage_metadata.append(
+                {
+                    "tenant_id": int(passage.get("tenant_id", item_tenant_id)),
+                    "source_id": int(passage.get("source_id", item_source_id)),
+                    "lang_id": int(passage.get("lang_id", item_lang_id)),
+                    "doc_version": int(passage.get("doc_version", item_doc_version)),
+                    "doc_id_int": int(passage.get("doc_id_int", item_doc_id_int)),
+                    "chunk_id_int": int(passage.get("chunk_id_int", chunk_index + 1)),
+                }
             )
 
     vectors = embedder([record[3] for record in passage_records])
@@ -354,19 +376,33 @@ def ingest_corpus(
                 (document_id, title),
             )
 
-        for record, vector in zip(passage_records, vectors):
+        for record, metadata, vector in zip(passage_records, passage_metadata, vectors):
             cursor.execute(
-                f"INSERT INTO {passages_table} (passage_id, document_id, chunk_index, passage_text, embedding) "
-                "VALUES (%s, %s, %s, %s, %s) "
+                f"INSERT INTO {passages_table} ("
+                "passage_id, document_id, chunk_index, tenant_id, source_id, lang_id, "
+                "doc_version, doc_id_int, chunk_id_int, passage_text, embedding"
+                ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
                 "ON CONFLICT (passage_id) DO UPDATE SET "
                 "document_id = EXCLUDED.document_id, "
                 "chunk_index = EXCLUDED.chunk_index, "
+                "tenant_id = EXCLUDED.tenant_id, "
+                "source_id = EXCLUDED.source_id, "
+                "lang_id = EXCLUDED.lang_id, "
+                "doc_version = EXCLUDED.doc_version, "
+                "doc_id_int = EXCLUDED.doc_id_int, "
+                "chunk_id_int = EXCLUDED.chunk_id_int, "
                 "passage_text = EXCLUDED.passage_text, "
                 "embedding = EXCLUDED.embedding",
                 (
                     record[0],
                     record[1],
                     record[2],
+                    metadata["tenant_id"],
+                    metadata["source_id"],
+                    metadata["lang_id"],
+                    metadata["doc_version"],
+                    metadata["doc_id_int"],
+                    metadata["chunk_id_int"],
                     record[3],
                     vector_literal(vector),
                 ),
@@ -407,9 +443,16 @@ def build_index_sql(
             "l2": "tq_l2_ops",
         }[metric]
         options = render_with_options(backend.get("options", {}))
+        filter_columns = [str(column) for column in backend.get("filter_columns", [])]
+        include_columns = [str(column) for column in backend.get("include_columns", [])]
+        index_columns = ", ".join(
+            ["embedding %s" % opclass]
+            + [f"{column} tq_int4_filter_ops" for column in filter_columns]
+        )
+        include_clause = f" INCLUDE ({', '.join(include_columns)})" if include_columns else ""
         return (
             f"CREATE INDEX IF NOT EXISTS {index_name} "
-            f"ON {passages_table} USING turboquant (embedding {opclass}){options}"
+            f"ON {passages_table} USING turboquant ({index_columns}){include_clause}{options}"
         )
     if index_kind == "pgvector_hnsw":
         opclass = {

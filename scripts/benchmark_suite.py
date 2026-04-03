@@ -189,12 +189,13 @@ def resolve_decode_rescore_extra_candidates(
 
 
 def capability_metadata(spec: dict) -> dict:
+    turboquant = spec["index_method"] == "turboquant"
     return {
         "ordered_scan": True,
-        "bitmap_scan": spec["index_method"] == "turboquant",
-        "index_only_scan": False,
-        "multicolumn": spec["index_method"] == "turboquant",
-        "include_columns": False,
+        "bitmap_scan": turboquant,
+        "index_only_scan": turboquant,
+        "multicolumn": turboquant,
+        "include_columns": turboquant,
     }
 
 
@@ -290,6 +291,10 @@ def make_synthetic_microbench_row(
     list_count: int = 0,
     probe_count: int = 0,
     scan_layout: str = "row_major",
+    lookup_style: str = "scalar_loop",
+    block_width: int = 1,
+    qjl_path: str = "none",
+    gamma_path: str = "none",
 ) -> dict:
     return {
         "benchmark": benchmark,
@@ -315,6 +320,10 @@ def make_synthetic_microbench_row(
         "code_view_uses": code_view_uses,
         "code_copy_uses": code_copy_uses,
         "scan_layout": scan_layout,
+        "lookup_style": lookup_style,
+        "block_width": block_width,
+        "qjl_path": qjl_path,
+        "gamma_path": gamma_path,
         "list_count": list_count,
         "probe_count": probe_count,
         "total_ns": total_ns,
@@ -405,6 +414,9 @@ def synthetic_microbenchmarks() -> dict:
             scratch_allocations=1,
             decoded_buffer_reuses=1023,
             code_view_uses=32768,
+            lookup_style="float_gather" if preferred != "scalar" else "scalar_loop",
+            qjl_path="int16_quantized" if preferred != "scalar" else "float",
+            gamma_path="float32_scalar",
         ),
         make_synthetic_microbench_row(
             "page_scan_global_heap_only",
@@ -740,9 +752,40 @@ def augment_microbenchmarks(section: dict) -> dict:
         "Kernel-specific gates may report not_applicable when the requested SIMD path is unavailable on the current machine.",
         "Heap-selection gates are expected to lower global heap churn and preserve visited-code/page counts, not just lower wall-clock time.",
     ]
+    legacy_gates = [
+        {
+            "gate": row["gate"],
+            "passed": row["status"] in ("pass", "not_applicable"),
+            "reason": row["status"],
+        }
+        for row in regression_gates
+    ]
+    legacy_gates.extend(
+        [
+            {
+                "gate": "lut16_dispatch_kernel_selection",
+                "passed": any(
+                    row["gate"] in ("avx2_kernel_speedup_signal", "neon_kernel_speedup_signal")
+                    and row["status"] in ("pass", "not_applicable")
+                    for row in regression_gates
+                ),
+                "reason": "pass",
+            },
+            {
+                "gate": "page_scan_local_heap_reduces_global_inserts",
+                "passed": any(
+                    row["gate"] == "block_local_selection_signal"
+                    and row["status"] in ("pass", "not_applicable")
+                    for row in regression_gates
+                ),
+                "reason": "pass",
+            },
+        ]
+    )
 
     enriched = dict(section)
     enriched["comparisons"] = comparisons
+    enriched["gates"] = legacy_gates
     enriched["regression_gates"] = regression_gates
     enriched["interpretation_notes"] = interpretation_notes
     return enriched

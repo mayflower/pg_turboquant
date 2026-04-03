@@ -267,6 +267,7 @@ def run_live_campaign(
                 turboquant_index_name=scenario_index_names["pg_turboquant"],
                 hnsw_index_name=scenario_index_names["pgvector_hnsw"],
                 ivfflat_index_name=scenario_index_names["pgvector_ivfflat"],
+                backend_ann_defaults=dict(dataset_layout.get("backend_ann_defaults", {})),
                 turboquant_probes=turboquant_probes,
                 turboquant_oversampling=turboquant_oversampling,
                 turboquant_max_visited_codes=turboquant_max_visited_codes,
@@ -405,6 +406,10 @@ def _prepare_dataset_source_layout(
             "pgvector_ivfflat": backend_index_names["pgvector_ivfflat"],
         },
         "manifest": manifest,
+        "backend_ann_defaults": {
+            str(backend["kind"]): dict(backend.get("ann", {}))
+            for backend in source_config.backends
+        },
     }
 
 
@@ -510,6 +515,7 @@ def _run_retrieval_scenario(
     turboquant_index_name: str,
     hnsw_index_name: str,
     ivfflat_index_name: str,
+    backend_ann_defaults: dict[str, dict[str, Any]],
     turboquant_probes: int,
     turboquant_oversampling: int,
     turboquant_max_visited_codes: int,
@@ -540,14 +546,17 @@ def _run_retrieval_scenario(
         else None
     )
 
-    ann = _ann_settings_for_method(
-        method_id=method_id,
-        turboquant_probes=turboquant_probes,
-        turboquant_oversampling=turboquant_oversampling,
-        turboquant_max_visited_codes=turboquant_max_visited_codes,
-        turboquant_max_visited_pages=turboquant_max_visited_pages,
-        hnsw_ef_search=hnsw_ef_search,
-        ivfflat_probes=ivfflat_probes,
+    ann = _merge_ann_settings(
+        _ann_settings_for_method(
+            method_id=method_id,
+            turboquant_probes=turboquant_probes,
+            turboquant_oversampling=turboquant_oversampling,
+            turboquant_max_visited_codes=turboquant_max_visited_codes,
+            turboquant_max_visited_pages=turboquant_max_visited_pages,
+            hnsw_ef_search=hnsw_ef_search,
+            ivfflat_probes=ivfflat_probes,
+        ),
+        backend_ann_defaults.get(method_id.rsplit("_", 1)[0], {}),
     )
 
     adapter = PostgresRetrieverAdapter(
@@ -862,6 +871,12 @@ def _ann_settings_for_method(
     if method_id.startswith("pgvector_hnsw_"):
         return {"ef_search": hnsw_ef_search}
     return {"probes": ivfflat_probes}
+
+
+def _merge_ann_settings(base: dict[str, Any], extras: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    merged.update(extras)
+    return merged
 
 
 def _make_backend(

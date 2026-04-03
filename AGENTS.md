@@ -145,6 +145,21 @@ Current agreed post-v1 execution order after the snapshot audit:
 - `18`
 - `14` only after a new ADR explicitly supersedes `ADR-0003` and hard rule `6`, because dense persistent transforms are currently outside the accepted repo contract
 
+## Production RAG follow-on lane
+
+As of `2026-04-03`, the prompt-pack sequence is no longer the only useful prioritization lens. The next production-RAG work should follow this narrower lane:
+
+1. Keep the release fast lane explicit:
+   normalized dense retrieval on the faithful `Qprod`/QJL path for cosine / inner product, with structured Hadamard transform and `lanes = auto`.
+2. Finish filtered retrieval as a real fast path:
+   richer metadata filtering must not force filtered pages off the SoA/block-16 path, and filtered top-k behavior needs an explicit completion/work-budget contract.
+3. Add covering stage-1 payloads:
+   return small retrieval payloads (`chunk_id`, `doc_id`, tenant/version-ish metadata, offsets) without treating passage text as ANN-page payload.
+4. Turn current write/delete primitives into a steady-state ingestion model:
+   delta + merge + compaction policy should follow after filtering/payload work, and any policy that changes the accepted `ADR-0006` rebuild boundary must land through a new accepted ADR first.
+
+This lane is intentionally narrower than “support every embedding setup.” Do not dilute it with dense persisted transforms, broad metric generalization, or another SIMD-only pass before the filtering/payload/lifecycle gaps are closed.
+
 ## Implementation tracker
 
 | ID | Prompt file | Scope | Tests to add first | Status | Last update | Evidence / commands | Notes |
@@ -260,6 +275,8 @@ Current agreed post-v1 execution order after the snapshot audit:
 | ID | Prompt file | Scope | Tests to add first | Status | Last update | Evidence / commands | Notes |
 |---|---|---|---|---|---|---|---|
 | H00 | `manual maintainer-credibility hardening plan` | Release/install hygiene, pgvector boundary tightening, public SQL surface reduction, corruption guardrails, CI sanitizer/compatibility coverage | packaging contract tests, public-API SQL regressions, corruption negative tests, restart-stress TAP coverage | DONE | 2026-04-02 | `python3 -m unittest tests.test_packaging_contract`; `make`; `make tests/unit/test_page_fuzz && ./tests/unit/test_page_fuzz`; `make unitcheck`; `make install`; `PGXS=$(/opt/homebrew/opt/postgresql@16/bin/pg_config --pgxs) && ./scripts/run_installcheck.sh "/opt/homebrew/opt/postgresql@16/bin/pg_config" "$PGXS" "/opt/homebrew/Cellar/postgresql@16/16.13/bin" reloptions ivf_training transform_contract admin_introspection public_api_surface corruption_guardrails`; `make installcheck`; `PERL5LIB="$PWD/third_party/postgresql-source/src/test/perl:$PWD/third_party/perl5/lib/perl5" prove -I"$PWD/third_party/postgresql-source/src/test/perl" -I"$PWD/third_party/perl5/lib/perl5" -v t/025_prod_score_microbench_smoke.pl`; `make tapcheck` | Collapsed the public version contract back to `0.1.0`, removed pgvector provisioning from `make install`, introduced a regression-only `pg_turboquant_test_support` extension, replaced direct opclass bindings with `tq_*` wrapper support functions, made `tq_index_metadata` cheap with a separate exact heap-stats helper, added corruption regression coverage plus deterministic page fuzzing, and extended CI with compatibility/sanitizer lanes. Follow-up debt: the large C modules still need the planned post-hardening split, and the “latest supported pgvector” CI lane currently resolves to the same `v0.8.1` tag as the pinned lane because the documented support matrix still exposes exactly one pgvector revision. This pass also closed two latent test gaps: public wrapper permissions for non-superusers and the block16 microbenchmark’s single-candidate nibble-layout bug, which had been masking a real perf-fixture contract mismatch under full TAP. |
+| H01 | `manual production RAG filtering fast-lane plan` | Keep filtered ordered scans on the SoA/block-16 path by adding a compact filter sidecar to SoA pages for the existing `int4` equality contract | unit tests for SoA filter payload round-trip and filtered block-16 scan stats, SQL regression proving filtered ordered scans still use the narrow multicolumn path and report code-domain scoring | DONE | 2026-04-03 | `make tests/unit/test_smoke`; `./tests/unit/test_smoke`; `python3 -m unittest tests.test_benchmark_suite.BenchmarkSuiteContractTest.test_turboquant_capability_metadata_marks_multicolumn_support`; `make unitcheck`; `make install`; `make installcheck` | Filtered ordered scans now keep the faithful code-domain path on SoA pages by storing the existing single `int4` equality filter in a compact SoA sidecar, and regression coverage asserts `score_mode = code_domain` with zero decoded vectors on the filtered path. Follow-up debt: this bumps the turboquant page format to `13`, so existing indexes must be rebuilt, and the contract is still intentionally narrow: one persisted `int4` equality filter only, no `INCLUDE` payloads/index-only scan, no broader filter conjunctions, and no delta+merge ingestion policy yet. |
+| H02 | `manual production RAG retrieval surface expansion` | Broaden the supported RAG fast lane with multiple compact int4 filter keys, compact int4 INCLUDE payloads, iterative filtered top-k completion controls, delta-aware query/benchmark plumbing, and a filtered live benchmark slice | unit tests for stored metadata attrs and iterative scan controls, SQL regressions for multikey/filter/payload behavior, Python benchmark/live-config/backend contract tests | DONE | 2026-04-03 | `make unitcheck`; `make installcheck REGRESS='filtered_topk capability_boundaries rag_surface'`; `python3 -m unittest tests.test_benchmark_suite`; `python3 -m unittest discover -s tests -p 'test_rag_*.py'` | Expanded the narrow single-filter contract to up to eight stored `int4` metadata attributes after the embedding key, allowed compact `int4` INCLUDE payloads for stage-1 retrieval, added `turboquant.iterative_scan` and `turboquant.min_rows_after_filter`, threaded filtered/payload/delta-aware plans through the BERGEN/live benchmark adapters, and added a filtered live RAG config slice. The turboquant page format is now `14`, so older indexes must be rebuilt. Follow-up debt: planner-native `ANY(int4[])` pushdown is still partial, ordered covering queries still appear as `Index Scan` rather than planner-visible `Index Only Scan`, and the current delta path is a SQL/benchmark union contract rather than a physical on-disk mutable segment with merge policy. |
 
 ## ADR index
 
@@ -276,6 +293,8 @@ Current agreed post-v1 execution order after the snapshot audit:
 - `docs/adrs/ADR-0011-use-generic-wal-in-v1.md`
 - `docs/adrs/ADR-0012-faithful-turboquant-v2-primary-contract.md`
 - `docs/adrs/ADR-0013-paper-faithful-qprod-qjl-contract.md`
+- `docs/adrs/ADR-0014-production-rag-fast-lane.md`
+- `docs/adrs/ADR-0015-rag-production-surface-roadmap.md`
 
 ## Notes for Codex CLI
 
