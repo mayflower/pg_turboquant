@@ -103,6 +103,7 @@ typedef struct TqBatchPageParams
 	uint32_t	list_id;
 	uint32_t	next_block;
 	uint32_t	dimension;		/* >0 selects SoA nibble layout; 0 uses legacy AoS */
+	bool		has_int4_filter;
 } TqBatchPageParams;
 
 typedef struct TqBatchPageHeaderView
@@ -302,6 +303,23 @@ extern bool tq_batch_page_get_tid(const void *page,
 								  TqTid *tid,
 								  char *errmsg,
 								  size_t errmsg_len);
+extern bool tq_batch_page_set_filter_int4(void *page,
+										  size_t page_size,
+										  uint16_t lane_index,
+										  int32_t filter_value,
+										  char *errmsg,
+										  size_t errmsg_len);
+extern bool tq_batch_page_get_filter_int4(const void *page,
+										  size_t page_size,
+										  uint16_t lane_index,
+										  int32_t *filter_value,
+										  char *errmsg,
+										  size_t errmsg_len);
+extern bool tq_batch_page_has_filter_int4(const void *page,
+										  size_t page_size,
+										  bool *has_filter,
+										  char *errmsg,
+										  size_t errmsg_len);
 extern bool tq_batch_page_set_code(void *page,
 								   size_t page_size,
 								   uint16_t lane_index,

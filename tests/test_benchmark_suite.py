@@ -744,6 +744,20 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
         self.assertEqual(scenario["scan_stats"]["score_kernel"], "none")
         self.assertEqual(scenario["simd"]["code_domain_kernel"], "none")
 
+    def test_turboquant_capability_metadata_marks_multicolumn_support(self):
+        payload = self.run_suite(
+            "--profile",
+            "tiny",
+            "--corpus",
+            "normalized_dense",
+            "--methods",
+            "turboquant_flat",
+        )
+
+        scenario = payload["scenarios"][0]
+        self.assertTrue(scenario["index_metadata"]["capabilities"]["multicolumn"])
+        self.assertFalse(scenario["index_metadata"]["capabilities"]["include_columns"])
+
     def test_hotpot_skewed_profile_surfaces_scan_stats(self):
         payload = self.run_suite(
             "--profile",

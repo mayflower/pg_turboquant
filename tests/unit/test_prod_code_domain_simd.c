@@ -530,6 +530,8 @@ test_code_domain_and_decode_fallback_match_ordering_on_seeded_fixture(void)
 								   &lut,
 								   query,
 								   8,
+								   false,
+								   0,
 								   &primary_heap,
 								   &shadow_decode_heap,
 								   errmsg,

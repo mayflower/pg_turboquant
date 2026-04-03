@@ -32,7 +32,7 @@ SELECT
 FROM (SELECT tq_index_metadata('tq_capability_embedding_idx'::regclass) AS meta) AS s;
  index_only_scan | multicolumn | include_columns | bitmap_scan 
 -----------------+-------------+-----------------+-------------
- false           | false       | false           | true
+ false           | true        | false           | true
 (1 row)
 
 SET enable_seqscan = off;
@@ -51,8 +51,47 @@ LIMIT 2;
 
 CREATE INDEX tq_capability_multicol_idx
 	ON tq_capability_docs
-	USING turboquant (embedding tq_cosine_ops, category);
-ERROR:  access method "turboquant" does not support multicolumn indexes
+	USING turboquant (embedding tq_cosine_ops, category tq_int4_filter_ops)
+	WITH (
+		bits = 4,
+		lists = 0,
+		lanes = auto,
+		transform = 'hadamard',
+		normalized = true
+	);
+EXPLAIN (COSTS OFF)
+SELECT id
+FROM tq_capability_docs
+WHERE category = 1
+ORDER BY embedding <=> '[1,0,0,0]'::vector(4)
+LIMIT 2;
+                               QUERY PLAN                                
+-------------------------------------------------------------------------
+ Limit
+   ->  Index Scan using tq_capability_multicol_idx on tq_capability_docs
+         Index Cond: (category = 1)
+         Order By: (embedding <=> '[1,0,0,0]'::vector(4))
+(4 rows)
+
+SELECT id
+FROM tq_capability_docs
+WHERE category = 1
+ORDER BY embedding <=> '[1,0,0,0]'::vector(4)
+LIMIT 2;
+ id 
+----
+  1
+  2
+(2 rows)
+
+CREATE INDEX tq_capability_too_wide_idx
+	ON tq_capability_docs
+	USING turboquant (
+		embedding tq_cosine_ops,
+		category tq_int4_filter_ops,
+		id tq_int4_filter_ops
+	);
+ERROR:  turboquant supports one embedding key column plus an optional second int4 equality filter key
 CREATE INDEX tq_capability_include_idx
 	ON tq_capability_docs
 	USING turboquant (embedding tq_cosine_ops)

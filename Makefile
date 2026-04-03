@@ -3,7 +3,7 @@ EXTVERSION = 0.1.0
 MODULE_big = pg_turboquant
 OBJS = src/tq_extension.o src/tq_test_support.o src/tq_am.o src/tq_am_routine.o src/tq_reloptions.o src/tq_options.o src/tq_page.o src/tq_transform.o src/tq_codec_mse.o src/tq_codec_prod.o src/tq_pgvector_compat.o src/tq_scan.o src/tq_query_tuning.o src/tq_guc.o src/tq_simd_avx2.o src/tq_router.o src/tq_wal.o src/tq_bitmap_filter.o src/tq_probe_input.o
 DATA = $(wildcard sql/*.sql) pg_turboquant_test_support.control
-REGRESS = smoke am_catalog reloptions flat_scan flat_streaming planner_costs gucs ivf_scan maintenance maintenance_reuse opclasses metric_fidelity ivf_training transform_contract admin_introspection public_api_surface corruption_guardrails query_helpers bitmap_scan capability_boundaries simd_dispatch scan_stats page_pruning adaptive_probing ivf_page_counts
+REGRESS = smoke am_catalog reloptions flat_scan flat_streaming planner_costs gucs ivf_scan maintenance maintenance_reuse opclasses metric_fidelity ivf_training transform_contract admin_introspection public_api_surface corruption_guardrails query_helpers bitmap_scan filtered_topk capability_boundaries simd_dispatch scan_stats page_pruning adaptive_probing ivf_page_counts
 NO_INSTALLCHECK = 1
 .DEFAULT_GOAL := all
 

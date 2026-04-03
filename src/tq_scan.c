@@ -1764,6 +1764,8 @@ tq_batch_page_scan_prod(const void *page,
 						const TqProdLut *lut,
 						const float *query_values,
 						size_t query_len,
+						bool filter_enabled,
+						int32_t filter_value,
 						TqCandidateHeap *heap,
 						TqCandidateHeap *shadow_decode_heap,
 						char *errmsg,
@@ -1781,6 +1783,8 @@ tq_batch_page_scan_prod(const void *page,
 											  lut,
 											  query_values,
 											  query_len,
+											  filter_enabled,
+											  filter_value,
 											  heap,
 											  shadow_decode_heap,
 											  &scratch,
@@ -1799,6 +1803,8 @@ tq_batch_page_scan_prod_with_scratch(const void *page,
 									 const TqProdLut *lut,
 									 const float *query_values,
 									 size_t query_len,
+									 bool filter_enabled,
+									 int32_t filter_value,
 									 TqCandidateHeap *heap,
 									 TqCandidateHeap *shadow_decode_heap,
 									 TqScanScratch *scratch,
@@ -1815,6 +1821,7 @@ tq_batch_page_scan_prod_with_scratch(const void *page,
 	bool		use_block16 = false;
 	float		query_norm_squared = 0.0f;
 	uint16_t	lane = 0;
+	bool		page_has_filter = false;
 	bool		ok = false;
 
 	if (page == NULL || config == NULL || lut == NULL || heap == NULL || scratch == NULL)
@@ -1844,6 +1851,19 @@ tq_batch_page_scan_prod_with_scratch(const void *page,
 	if (!tq_batch_page_read_header(page, page_size, &header, errmsg, errmsg_len))
 		return false;
 
+	if (filter_enabled)
+	{
+		if (!tq_batch_page_has_filter_int4(page, page_size, &page_has_filter,
+										   errmsg, errmsg_len))
+			return false;
+		if (!page_has_filter)
+		{
+			tq_set_error(errmsg, errmsg_len,
+						 "invalid turboquant scan: filtered ordered scans require int4 filter payloads on batch pages");
+			return false;
+		}
+	}
+
 	if (header.live_count > 0
 		&& !tq_candidate_heap_init(&local_heap,
 								   header.live_count < heap->capacity ? header.live_count : heap->capacity))
@@ -1861,6 +1881,7 @@ tq_batch_page_scan_prod_with_scratch(const void *page,
 		&& shadow_decode_heap->capacity > 0;
 	use_block16 = use_code_domain
 		&& !use_shadow_decode
+		&& !filter_enabled
 		&& scratch->lut16 != NULL
 		&& scratch->lut16->quantized_ready
 		&& tq_prod_lut16_is_supported(config, NULL, 0);
@@ -2090,12 +2111,26 @@ tq_batch_page_scan_prod_with_scratch(const void *page,
 			TqTid		tid;
 			float		distance_value = 0.0f;
 			float		ip_score = 0.0f;
+			int32_t		lane_filter_value = 0;
 
 			memset(&tid, 0, sizeof(tid));
 			if (!tq_batch_page_get_tid(page, page_size, lane, &tid, errmsg, errmsg_len))
 			{
 				free(reconstructed_code);
 				return false;
+			}
+
+			if (filter_enabled)
+			{
+				if (!tq_batch_page_get_filter_int4(page, page_size, lane,
+												   &lane_filter_value,
+												   errmsg, errmsg_len))
+				{
+					free(reconstructed_code);
+					return false;
+				}
+				if (lane_filter_value != filter_value)
+					continue;
 			}
 
 			if (page_is_soa)
@@ -2499,12 +2534,16 @@ tq_batch_page_scan_prod_cosine(const void *page,
 							   const TqProdLut *lut,
 							   const float *query_values,
 							   size_t query_len,
+							   bool filter_enabled,
+							   int32_t filter_value,
 							   TqCandidateHeap *heap,
 							   TqCandidateHeap *shadow_decode_heap,
 							   char *errmsg,
 							   size_t errmsg_len)
 {
 	return tq_batch_page_scan_prod(page, page_size, config, normalized, TQ_DISTANCE_COSINE,
-								   lut, query_values, query_len, heap, shadow_decode_heap,
+								   lut, query_values, query_len,
+								   filter_enabled, filter_value,
+								   heap, shadow_decode_heap,
 								   errmsg, errmsg_len);
 }

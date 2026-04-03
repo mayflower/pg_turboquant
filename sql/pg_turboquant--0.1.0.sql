@@ -98,7 +98,7 @@ BEGIN
 			'ordered_scan', true,
 			'bitmap_scan', true,
 			'index_only_scan', false,
-			'multicolumn', false,
+			'multicolumn', true,
 			'include_columns', false
 		)
 	);
@@ -646,6 +646,7 @@ CREATE OPERATOR FAMILY tq_vector_l2_turboquant_ops USING turboquant;
 CREATE OPERATOR FAMILY tq_halfvec_cosine_turboquant_ops USING turboquant;
 CREATE OPERATOR FAMILY tq_halfvec_ip_turboquant_ops USING turboquant;
 CREATE OPERATOR FAMILY tq_halfvec_l2_turboquant_ops USING turboquant;
+CREATE OPERATOR FAMILY tq_int4_filter_turboquant_ops USING turboquant;
 
 CREATE OPERATOR CLASS tq_cosine_ops
 DEFAULT FOR TYPE vector USING turboquant FAMILY tq_vector_cosine_turboquant_ops AS
@@ -680,3 +681,8 @@ CREATE OPERATOR CLASS tq_halfvec_l2_ops
 FOR TYPE halfvec USING turboquant FAMILY tq_halfvec_l2_turboquant_ops AS
 	OPERATOR 1 <-> (halfvec, halfvec) FOR ORDER BY float_ops,
 	FUNCTION 1 tq_halfvec_l2_squared_distance(halfvec, halfvec);
+
+CREATE OPERATOR CLASS tq_int4_filter_ops
+FOR TYPE int4 USING turboquant FAMILY tq_int4_filter_turboquant_ops AS
+	OPERATOR 1 = (int4, int4),
+	FUNCTION 1 btint4cmp(int4, int4);

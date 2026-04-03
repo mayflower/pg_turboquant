@@ -8,11 +8,13 @@
 #include "access/amapi.h"
 #include "access/genam.h"
 #include "access/reloptions.h"
+#include "access/stratnum.h"
 #include "access/tableam.h"
 #include "nodes/tidbitmap.h"
 #include "catalog/index.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_opfamily.h"
+#include "catalog/pg_type_d.h"
 #include "catalog/storage.h"
 #include "commands/vacuum.h"
 #include "nodes/pathnodes.h"
@@ -41,6 +43,9 @@
 
 PG_FUNCTION_INFO_V1(turboquanthandler);
 
+#define TQ_MAX_SUPPORTED_KEY_ATTRIBUTES 2
+#define TQ_FILTER_EQ_STRATEGY 1
+
 typedef struct TqBuildState
 {
 	Relation	index_relation;
@@ -60,10 +65,12 @@ typedef struct TqBuildState
 	float	   *transformed_values;
 	float	   *collected_vectors;
 	TqTid	   *collected_tids;
+	int32	   *collected_filter_values;
 	uint8_t	   *packed_code;
 	size_t		vector_count;
 	size_t		vector_capacity;
 	double		index_tuples;
+	bool		filter_enabled;
 } TqBuildState;
 
 typedef struct TqScanOpaque
@@ -82,6 +89,8 @@ typedef struct TqScanOpaque
 	TqVectorInputKind input_kind;
 	bool		normalized;
 	bool		shadow_decode_diagnostics;
+	bool		filter_enabled;
+	int32		filter_value;
 	bool		prepared;
 } TqScanOpaque;
 
@@ -109,7 +118,88 @@ tq_prod_qjl_seed(uint64_t transform_seed)
 	return transform_seed ^ UINT64_C(0x9e3779b97f4a7c15);
 }
 
+static bool
+tq_relation_uses_int4_filter(Relation index_relation,
+							 char *errmsg,
+							 size_t errmsg_len)
+{
+	int key_attribute_count = 0;
+
+	if (index_relation == NULL)
+	{
+		snprintf(errmsg, errmsg_len,
+				 "invalid turboquant index definition: index relation must be non-null");
+		return false;
+	}
+
+	key_attribute_count = IndexRelationGetNumberOfKeyAttributes(index_relation);
+	if (key_attribute_count <= 1)
+		return false;
+
+	if (key_attribute_count != TQ_MAX_SUPPORTED_KEY_ATTRIBUTES)
+	{
+		snprintf(errmsg, errmsg_len,
+				 "turboquant supports at most two key columns: one embedding key plus one int4 equality filter key");
+		return false;
+	}
+
+	if (TupleDescAttr(index_relation->rd_att, 1)->atttypid != INT4OID)
+	{
+		snprintf(errmsg, errmsg_len,
+				 "turboquant multicolumn indexes require the second key column to be int4");
+		return false;
+	}
+
+	return true;
+}
+
+static void
+tq_validate_index_schema(Relation index_relation)
+{
+	int attribute_count = 0;
+	int key_attribute_count = 0;
+	char error_buf[256];
+
+	if (index_relation == NULL)
+		elog(ERROR, "turboquant index relation must be non-null");
+
+	attribute_count = IndexRelationGetNumberOfAttributes(index_relation);
+	key_attribute_count = IndexRelationGetNumberOfKeyAttributes(index_relation);
+
+	if (attribute_count != key_attribute_count)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("turboquant does not support included columns")));
+
+	if (key_attribute_count < 1 || key_attribute_count > TQ_MAX_SUPPORTED_KEY_ATTRIBUTES)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("turboquant supports one embedding key column plus an optional second int4 equality filter key")));
+
+	if (key_attribute_count >= 1)
+	{
+		Oid vector_type = TupleDescAttr(index_relation->rd_att, 0)->atttypid;
+		TqVectorInputKind input_kind;
+
+		if (!tq_vector_input_kind_from_typid(vector_type, &input_kind,
+											 error_buf, sizeof(error_buf)))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("turboquant indexes require the first key column to be vector or halfvec")));
+	}
+
+	if (key_attribute_count == 2
+		&& !tq_relation_uses_int4_filter(index_relation, error_buf, sizeof(error_buf)))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("%s", error_buf)));
+}
+
 static void tq_load_option_config(Relation index_relation, TqOptionConfig *config);
+static bool tq_relation_uses_int4_filter(Relation index_relation,
+										 char *errmsg,
+										 size_t errmsg_len);
+static void tq_validate_index_schema(Relation index_relation);
 static void tq_reset_scan_opaque(TqScanOpaque *opaque);
 static void tq_buildstate_reset(TqBuildState *state);
 static bool tq_read_meta_page(Relation index_relation,
@@ -129,7 +219,8 @@ static void tq_build_callback(Relation index, ItemPointer tid, Datum *values,
 							  bool *isnull, bool tupleIsAlive, void *stateptr);
 static void tq_buildstate_initialize(TqBuildState *state, uint32_t dimension);
 static void tq_buildstate_collect_vector(TqBuildState *state, const float *values,
-										 ItemPointer tid);
+										 ItemPointer tid,
+										 int32 filter_value);
 static void tq_buildstate_flush(TqBuildState *state);
 static void tq_write_centroid_pages(Relation index_relation,
 									const TqRouterModel *model,
@@ -202,6 +293,7 @@ static void tq_append_packed_tuple(Relation index_relation,
 								   const TqProdCodecConfig *prod_config,
 								   uint32_t list_id,
 								   const TqTid *heap_tid,
+								   const int32 *filter_value,
 								   const uint8_t *packed_code,
 								   size_t packed_code_len);
 static void tq_summarize_index(Relation index_relation,
@@ -389,6 +481,8 @@ tq_reset_scan_opaque(TqScanOpaque *opaque)
 	opaque->query_values = NULL;
 	opaque->query_dimension = 0;
 	opaque->shadow_decode_diagnostics = false;
+	opaque->filter_enabled = false;
+	opaque->filter_value = 0;
 	opaque->prepared = false;
 }
 
@@ -408,6 +502,8 @@ tq_buildstate_reset(TqBuildState *state)
 		pfree(state->collected_vectors);
 	if (state->collected_tids != NULL)
 		pfree(state->collected_tids);
+	if (state->collected_filter_values != NULL)
+		pfree(state->collected_filter_values);
 	if (state->packed_code != NULL)
 		pfree(state->packed_code);
 	memset(state, 0, sizeof(*state));
@@ -527,7 +623,7 @@ tq_buildstate_initialize(TqBuildState *state, uint32_t dimension)
 	lane_config.page_header_bytes = TQ_PAGE_HEADER_BYTES;
 	lane_config.special_space_bytes = TQ_PAGE_SPECIAL_BYTES;
 	lane_config.reserve_bytes = TQ_PAGE_RESERVED_BYTES;
-	lane_config.tid_bytes = TQ_TID_BYTES;
+	lane_config.tid_bytes = TQ_TID_BYTES + (state->filter_enabled ? (int) sizeof(int32) : 0);
 
 	if (!tq_resolve_lane_count(&lane_config, &resolved_lane_count,
 							   error_buf, sizeof(error_buf)))
@@ -579,7 +675,10 @@ tq_buildstate_initialize(TqBuildState *state, uint32_t dimension)
 }
 
 static void
-tq_buildstate_collect_vector(TqBuildState *state, const float *values, ItemPointer tid)
+tq_buildstate_collect_vector(TqBuildState *state,
+							 const float *values,
+							 ItemPointer tid,
+							 int32 filter_value)
 {
 	size_t		required_count = state->vector_count + 1;
 	size_t		new_capacity = 0;
@@ -607,6 +706,15 @@ tq_buildstate_collect_vector(TqBuildState *state, const float *values, ItemPoint
 			state->collected_tids = (TqTid *) repalloc(state->collected_tids,
 													   sizeof(TqTid) * new_capacity);
 
+		if (state->filter_enabled)
+		{
+			if (state->collected_filter_values == NULL)
+				state->collected_filter_values = (int32 *) palloc(sizeof(int32) * new_capacity);
+			else
+				state->collected_filter_values = (int32 *) repalloc(state->collected_filter_values,
+																	 sizeof(int32) * new_capacity);
+		}
+
 		state->vector_capacity = new_capacity;
 	}
 
@@ -617,6 +725,8 @@ tq_buildstate_collect_vector(TqBuildState *state, const float *values, ItemPoint
 		   state->transformed_values,
 		   sizeof(float) * (size_t) state->dimension);
 	state->collected_tids[state->vector_count] = page_tid;
+	if (state->filter_enabled)
+		state->collected_filter_values[state->vector_count] = filter_value;
 	state->vector_count = required_count;
 	state->index_tuples += 1.0;
 }
@@ -1359,7 +1469,9 @@ tq_write_batch_pages(TqBuildState *state,
 				params.code_bytes = (uint32_t) state->prod_layout.total_bytes;
 				params.list_id = list_id;
 				params.next_block = TQ_INVALID_BLOCK_NUMBER;
-				if (tq_prod_lut16_is_supported(&state->prod_config, NULL, 0)
+				params.has_int4_filter = state->filter_enabled;
+				if (!state->filter_enabled
+					&& tq_prod_lut16_is_supported(&state->prod_config, NULL, 0)
 					&& tq_batch_page_can_fit_soa(tq_relation_payload_size(),
 												 params.lane_count,
 												 state->prod_config.dimension,
@@ -1432,7 +1544,11 @@ tq_write_batch_pages(TqBuildState *state,
 			else
 			{
 				if (!tq_wal_append_batch_code(state->index_relation, current_buffer,
-											  tid, state->packed_code,
+											  tid,
+											  state->filter_enabled
+												? &state->collected_filter_values[vector_index]
+												: NULL,
+											  state->packed_code,
 											  state->prod_layout.total_bytes,
 											  &lanes_used, error_buf, sizeof(error_buf))
 					|| !tq_refresh_batch_page_summary(state->index_relation,
@@ -1551,6 +1667,7 @@ tq_build_callback(Relation index, ItemPointer tid, Datum *values,
 {
 	TqBuildState *state = (TqBuildState *) stateptr;
 	uint32_t	dimension = 0;
+	int32		filter_value = 0;
 	char		error_buf[256];
 
 	(void) index;
@@ -1577,7 +1694,14 @@ tq_build_callback(Relation index, ItemPointer tid, Datum *values,
 				(errcode(ERRCODE_DATA_EXCEPTION),
 				 errmsg("turboquant build requires consistent vector dimensions")));
 
-	tq_buildstate_collect_vector(state, state->source_values, tid);
+	if (state->filter_enabled)
+	{
+		if (isnull[1])
+			return;
+		filter_value = DatumGetInt32(values[1]);
+	}
+
+	tq_buildstate_collect_vector(state, state->source_values, tid, filter_value);
 }
 
 static IndexBuildResult *
@@ -1586,11 +1710,16 @@ tq_ambuild(Relation heap_relation, Relation index_relation, IndexInfo *index_inf
 	IndexBuildResult *result;
 	TqBuildState build_state;
 	double		heap_tuples = 0.0;
+	char		error_buf[256];
 
 	memset(&build_state, 0, sizeof(build_state));
+	tq_validate_index_schema(index_relation);
 	build_state.index_relation = index_relation;
 	build_state.distance_kind = tq_distance_kind_from_index(index_relation);
 	build_state.input_kind = tq_input_kind_from_index(index_relation);
+	build_state.filter_enabled = tq_relation_uses_int4_filter(index_relation,
+															  error_buf,
+															  sizeof(error_buf));
 	tq_load_option_config(index_relation, &build_state.option_config);
 	tq_write_meta_page(index_relation, &build_state.meta_fields);
 
@@ -1614,6 +1743,7 @@ tq_ambuildempty(Relation index_relation)
 {
 	TqMetaPageFields meta_fields;
 
+	tq_validate_index_schema(index_relation);
 	memset(&meta_fields, 0, sizeof(meta_fields));
 	meta_fields.codec = TQ_CODEC_PROD;
 	meta_fields.distance = tq_distance_kind_from_index(index_relation);
@@ -1670,6 +1800,8 @@ tq_aminsert(Relation index_relation, Datum *values, bool *isnull,
 	TqDistanceKind distance_kind;
 	TqVectorInputKind input_kind;
 	bool		needs_meta_write = false;
+	bool		filter_enabled = false;
+	int32		filter_value = 0;
 	char		error_buf[256];
 
 	(void) heap_relation;
@@ -1677,6 +1809,7 @@ tq_aminsert(Relation index_relation, Datum *values, bool *isnull,
 	(void) index_unchanged;
 	(void) index_info;
 
+	tq_validate_index_schema(index_relation);
 	if (isnull[0])
 		return false;
 
@@ -1695,6 +1828,15 @@ tq_aminsert(Relation index_relation, Datum *values, bool *isnull,
 
 	distance_kind = tq_distance_kind_from_index(index_relation);
 	input_kind = tq_input_kind_from_index(index_relation);
+	filter_enabled = tq_relation_uses_int4_filter(index_relation,
+												  error_buf,
+												  sizeof(error_buf));
+	if (filter_enabled)
+	{
+		if (isnull[1])
+			return false;
+		filter_value = DatumGetInt32(values[1]);
+	}
 
 	meta_buffer = tq_lock_meta_page_buffer(index_relation);
 	if (!tq_read_meta_page_buffer(meta_buffer, &meta_fields, error_buf, sizeof(error_buf)))
@@ -1733,7 +1875,7 @@ tq_aminsert(Relation index_relation, Datum *values, bool *isnull,
 		lane_config.page_header_bytes = TQ_PAGE_HEADER_BYTES;
 		lane_config.special_space_bytes = TQ_PAGE_SPECIAL_BYTES;
 		lane_config.reserve_bytes = TQ_PAGE_RESERVED_BYTES;
-		lane_config.tid_bytes = TQ_TID_BYTES;
+		lane_config.tid_bytes = TQ_TID_BYTES + (filter_enabled ? (int) sizeof(int32) : 0);
 		if (!tq_resolve_lane_count(&lane_config, &resolved_lane_count,
 								   error_buf, sizeof(error_buf)))
 			elog(ERROR, "%s", error_buf);
@@ -1878,7 +2020,9 @@ tq_aminsert(Relation index_relation, Datum *values, bool *isnull,
 		tq_write_meta_page_buffer(index_relation, meta_buffer, &meta_fields);
 
 	tq_append_packed_tuple(index_relation, &meta_fields, &prod_config, list_id,
-						   &page_tid, packed_code, prod_layout.total_bytes);
+						   &page_tid,
+						   filter_enabled ? &filter_value : NULL,
+						   packed_code, prod_layout.total_bytes);
 	LockBuffer(meta_buffer, BUFFER_LOCK_UNLOCK);
 	ReleaseBuffer(meta_buffer);
 
@@ -2433,6 +2577,7 @@ tq_append_packed_tuple(Relation index_relation,
 					   const TqProdCodecConfig *prod_config,
 					   uint32_t list_id,
 					   const TqTid *heap_tid,
+					   const int32 *filter_value,
 					   const uint8_t *packed_code,
 					   size_t packed_code_len)
 {
@@ -2492,7 +2637,9 @@ tq_append_packed_tuple(Relation index_relation,
 			params.code_bytes = (uint32_t) packed_code_len;
 			params.list_id = list_id;
 			params.next_block = TQ_INVALID_BLOCK_NUMBER;
-			if (tq_prod_lut16_is_supported(prod_config, NULL, 0)
+			params.has_int4_filter = filter_value != NULL;
+			if (filter_value == NULL
+				&& tq_prod_lut16_is_supported(prod_config, NULL, 0)
 				&& tq_batch_page_can_fit_soa(tq_relation_payload_size(),
 											 params.lane_count,
 											 prod_config->dimension,
@@ -2529,7 +2676,9 @@ tq_append_packed_tuple(Relation index_relation,
 		params.code_bytes = (uint32_t) packed_code_len;
 		params.list_id = list_id;
 		params.next_block = TQ_INVALID_BLOCK_NUMBER;
-		if (tq_prod_lut16_is_supported(prod_config, NULL, 0)
+		params.has_int4_filter = filter_value != NULL;
+		if (filter_value == NULL
+			&& tq_prod_lut16_is_supported(prod_config, NULL, 0)
 			&& tq_batch_page_can_fit_soa(tq_relation_payload_size(),
 										 params.lane_count,
 										 prod_config->dimension,
@@ -2612,6 +2761,7 @@ tq_append_packed_tuple(Relation index_relation,
 		else
 		{
 			if (!tq_wal_append_batch_code(index_relation, buffer, heap_tid,
+										  filter_value,
 										  packed_code, packed_code_len, &lane_index,
 										  error_buf, sizeof(error_buf))
 				|| !tq_refresh_batch_page_summary(index_relation,
@@ -2952,6 +3102,8 @@ tq_scan_batch_block(Relation index_relation,
 											  &opaque->lut,
 											  opaque->query_values,
 											  opaque->query_dimension,
+											  opaque->filter_enabled,
+											  opaque->filter_value,
 											  heap,
 											  shadow_decode_heap,
 											  &opaque->scan_scratch,
@@ -3350,12 +3502,40 @@ tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque)
 	TqTid	   *pre_candidate_tids = NULL;
 	size_t		pre_candidate_tid_count = 0;
 	bool		decode_rescore_enabled = false;
+	bool		index_filter_enabled = false;
 	char		error_buf[256];
 
+	tq_validate_index_schema(scan->indexRelation);
 	if (scan->numberOfOrderBys != 1)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("turboquant scans require exactly one ORDER BY expression")));
+
+	index_filter_enabled = tq_relation_uses_int4_filter(scan->indexRelation,
+														 error_buf,
+														 sizeof(error_buf));
+	if (scan->numberOfKeys > 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("turboquant ordered scans support at most one equality filter on the second key column")));
+
+	opaque->filter_enabled = false;
+	opaque->filter_value = 0;
+	if (scan->numberOfKeys == 1)
+	{
+		ScanKey filter_key = &scan->keyData[0];
+
+		if (!index_filter_enabled
+			|| filter_key->sk_attno != 2
+			|| filter_key->sk_strategy != TQ_FILTER_EQ_STRATEGY
+			|| (filter_key->sk_flags & SK_ISNULL) != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("turboquant ordered scans only support a non-null equality filter on the second int4 key column")));
+
+		opaque->filter_enabled = true;
+		opaque->filter_value = DatumGetInt32(filter_key->sk_argument);
+	}
 
 	buffer = ReadBufferExtended(scan->indexRelation, MAIN_FORKNUM, 0, RBM_NORMAL, NULL);
 	memset(&meta_fields, 0, sizeof(meta_fields));
@@ -3658,6 +3838,7 @@ tq_scan_prepare(IndexScanDesc scan, TqScanOpaque *opaque)
 						&opaque->prod_config, opaque->normalized,
 						opaque->distance_kind, &opaque->lut,
 						opaque->query_values, opaque->query_dimension,
+						opaque->filter_enabled, opaque->filter_value,
 						active_heap, shadow_heap, &opaque->scan_scratch,
 						error_buf, sizeof(error_buf)))
 					elog(ERROR, "%s", error_buf);

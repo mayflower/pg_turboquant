@@ -82,6 +82,7 @@ typedef struct TqWalBatchSummaryArgs
 typedef struct TqWalBatchAppendArgs
 {
 	const TqTid *tid;
+	const int32_t *filter_value;
 	const uint8_t *packed_code;
 	size_t		packed_code_len;
 	uint16_t   *lane_index;
@@ -364,6 +365,10 @@ tq_wal_mutate_batch_append(Page page, void *arg, char *errmsg, size_t errmsg_len
 
 	if (!tq_batch_page_append_lane(tq_wal_payload(page), tq_wal_payload_size(page),
 								   args->tid, &lane_index, errmsg, errmsg_len)
+		|| (args->filter_value != NULL
+			&& !tq_batch_page_set_filter_int4(tq_wal_payload(page), tq_wal_payload_size(page),
+											  lane_index, *args->filter_value,
+											  errmsg, errmsg_len))
 		|| !tq_batch_page_set_code(tq_wal_payload(page), tq_wal_payload_size(page),
 								   lane_index, args->packed_code, args->packed_code_len,
 								   errmsg, errmsg_len))
@@ -626,6 +631,7 @@ bool
 tq_wal_append_batch_code(Relation relation,
 						 Buffer buffer,
 						 const TqTid *tid,
+						 const int32_t *filter_value,
 						 const uint8_t *packed_code,
 						 size_t packed_code_len,
 						 uint16_t *lane_index,
@@ -636,6 +642,7 @@ tq_wal_append_batch_code(Relation relation,
 
 	memset(&args, 0, sizeof(args));
 	args.tid = tid;
+	args.filter_value = filter_value;
 	args.packed_code = packed_code;
 	args.packed_code_len = packed_code_len;
 	args.lane_index = lane_index;

@@ -555,7 +555,7 @@ test_ranking_matches_decode_baseline_for_normalized_cosine_and_ip(void)
 	tq_prod_decode_counter_reset();
 	tq_scan_stats_begin(TQ_SCAN_MODE_FLAT, 1);
 	assert(tq_batch_page_scan_prod(page, sizeof(page), &config, true, TQ_DISTANCE_COSINE, &lut,
-								   query, 8, &cosine_heap, NULL, errmsg, sizeof(errmsg)));
+								   query, 8, false, 0, &cosine_heap, NULL, errmsg, sizeof(errmsg)));
 	assert(tq_prod_decode_counter_get() == 0);
 	tq_scan_stats_snapshot(&stats);
 	assert(stats.score_mode == TQ_SCAN_SCORE_MODE_CODE_DOMAIN);
@@ -564,7 +564,7 @@ test_ranking_matches_decode_baseline_for_normalized_cosine_and_ip(void)
 	tq_prod_decode_counter_reset();
 	tq_scan_stats_begin(TQ_SCAN_MODE_FLAT, 1);
 	assert(tq_batch_page_scan_prod(page, sizeof(page), &config, true, TQ_DISTANCE_IP, &lut,
-								   query, 8, &ip_heap, NULL, errmsg, sizeof(errmsg)));
+								   query, 8, false, 0, &ip_heap, NULL, errmsg, sizeof(errmsg)));
 	assert(tq_prod_decode_counter_get() == 0);
 	tq_scan_stats_snapshot(&stats);
 	assert(stats.score_mode == TQ_SCAN_SCORE_MODE_CODE_DOMAIN);
@@ -650,7 +650,7 @@ test_force_decode_diagnostics_switches_active_scoring_path(void)
 	tq_prod_decode_counter_reset();
 	tq_scan_stats_begin(TQ_SCAN_MODE_FLAT, 1);
 	assert(tq_batch_page_scan_prod(page, sizeof(page), &config, true, TQ_DISTANCE_COSINE, &lut,
-								   query, 8, &heap, NULL, errmsg, sizeof(errmsg)));
+								   query, 8, false, 0, &heap, NULL, errmsg, sizeof(errmsg)));
 	tq_scan_stats_snapshot(&stats);
 
 	assert(stats.score_mode == TQ_SCAN_SCORE_MODE_DECODE);
@@ -792,6 +792,8 @@ test_scan_scratch_reuse_across_repeated_page_scans(void)
 													&lut,
 													query,
 													8,
+													false,
+													0,
 													&primary_heap,
 													&shadow_heap,
 													&scratch,
@@ -899,6 +901,8 @@ test_page_local_selection_preserves_single_page_top_k(void)
 												&lut,
 												query,
 												32u,
+												false,
+												0,
 												&heap,
 												NULL,
 												&scratch,
@@ -1032,6 +1036,8 @@ test_page_local_selection_retains_overlap_fixture_across_pages(void)
 												&lut,
 												query,
 												32u,
+												false,
+												0,
 												&heap,
 												NULL,
 												&scratch,

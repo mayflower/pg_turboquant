@@ -47,7 +47,35 @@ LIMIT 2;
 
 CREATE INDEX tq_capability_multicol_idx
 	ON tq_capability_docs
-	USING turboquant (embedding tq_cosine_ops, category);
+	USING turboquant (embedding tq_cosine_ops, category tq_int4_filter_ops)
+	WITH (
+		bits = 4,
+		lists = 0,
+		lanes = auto,
+		transform = 'hadamard',
+		normalized = true
+	);
+
+EXPLAIN (COSTS OFF)
+SELECT id
+FROM tq_capability_docs
+WHERE category = 1
+ORDER BY embedding <=> '[1,0,0,0]'::vector(4)
+LIMIT 2;
+
+SELECT id
+FROM tq_capability_docs
+WHERE category = 1
+ORDER BY embedding <=> '[1,0,0,0]'::vector(4)
+LIMIT 2;
+
+CREATE INDEX tq_capability_too_wide_idx
+	ON tq_capability_docs
+	USING turboquant (
+		embedding tq_cosine_ops,
+		category tq_int4_filter_ops,
+		id tq_int4_filter_ops
+	);
 
 CREATE INDEX tq_capability_include_idx
 	ON tq_capability_docs
