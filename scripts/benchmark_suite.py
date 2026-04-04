@@ -193,7 +193,7 @@ def capability_metadata(spec: dict) -> dict:
     return {
         "ordered_scan": True,
         "bitmap_scan": turboquant,
-        "index_only_scan": turboquant,
+        "index_only_scan": False,
         "multicolumn": turboquant,
         "include_columns": turboquant,
     }

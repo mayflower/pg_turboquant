@@ -41,7 +41,7 @@ SELECT
 FROM (SELECT tq_index_metadata('tq_capability_embedding_idx'::regclass) AS meta) AS s;
  index_only_scan | multicolumn | include_columns | bitmap_scan 
 -----------------+-------------+-----------------+-------------
- true            | true        | true            | true
+ false           | true        | true            | true
 (1 row)
 
 SET enable_seqscan = off;
@@ -57,6 +57,16 @@ LIMIT 2;
    ->  Index Scan using tq_capability_embedding_idx on tq_capability_docs
          Order By: (embedding <=> '[1,0,0,0]'::vector(4))
 (3 rows)
+
+SELECT id, embedding
+FROM tq_capability_docs
+ORDER BY embedding <=> '[1,0,0,0]'::vector(4)
+LIMIT 2;
+ id |    embedding    
+----+-----------------
+  1 | [1,0,0,0]
+  2 | [0.98,0.02,0,0]
+(2 rows)
 
 CREATE INDEX tq_capability_multicol_idx
 	ON tq_capability_docs
@@ -107,9 +117,9 @@ CREATE INDEX tq_capability_too_wide_idx
 		f6 tq_int4_filter_ops,
 		f7 tq_int4_filter_ops
 	);
-ERROR:  turboquant supports one embedding key column plus compact int4 filter keys
+ERROR:  turboquant supports one embedding key column plus compact fixed-width filter keys
 CREATE INDEX tq_capability_include_idx
 	ON tq_capability_docs
 	USING turboquant (embedding tq_cosine_ops)
 	INCLUDE (payload);
-ERROR:  turboquant metadata columns after the embedding key must all be int4
+ERROR:  turboquant metadata columns after the embedding key must all be fixed-width bool/int2/int4/int8/date/timestamptz/uuid

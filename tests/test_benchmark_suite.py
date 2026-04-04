@@ -739,7 +739,7 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
         self.assertIn("exact_match_fraction", scenario["metrics"])
         self.assertIn("avg_result_count", scenario["metrics"])
         self.assertTrue(scenario["index_metadata"]["capabilities"]["bitmap_scan"])
-        self.assertTrue(scenario["index_metadata"]["capabilities"]["index_only_scan"])
+        self.assertFalse(scenario["index_metadata"]["capabilities"]["index_only_scan"])
         self.assertEqual(scenario["simd"]["selected_kernel"], scenario["simd"]["preferred_kernel"])
         self.assertEqual(scenario["scan_stats"]["score_kernel"], "none")
         self.assertEqual(scenario["simd"]["code_domain_kernel"], "none")

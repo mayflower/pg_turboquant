@@ -61,6 +61,22 @@ LIMIT 1;
          Order By: (embedding <=> '[1,0,0,0]'::vector(4))
 (4 rows)
 
+EXPLAIN (COSTS OFF)
+SELECT doc_id, chunk_id, tenant_id, doc_version
+FROM tq_rag_surface_docs
+WHERE tenant_id = 1
+	AND source_id = 10
+	AND lang_id = 1
+ORDER BY embedding <=> '[1,0,0,0]'::vector(4)
+LIMIT 1;
+                                  QUERY PLAN                                  
+------------------------------------------------------------------------------
+ Limit
+   ->  Index Scan using tq_rag_surface_docs_idx on tq_rag_surface_docs
+         Index Cond: ((tenant_id = 1) AND (source_id = 10) AND (lang_id = 1))
+         Order By: (embedding <=> '[1,0,0,0]'::vector(4))
+(4 rows)
+
 SELECT doc_id, chunk_id, tenant_id, doc_version
 FROM tq_rag_surface_docs
 WHERE tenant_id = 1

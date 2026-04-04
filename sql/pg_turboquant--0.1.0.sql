@@ -26,6 +26,11 @@ RETURNS text
 LANGUAGE C STRICT
 AS 'MODULE_PATHNAME', 'tq_runtime_simd_features_core';
 
+CREATE FUNCTION tq_maintain_index_core(regclass)
+RETURNS text
+LANGUAGE C STRICT
+AS 'MODULE_PATHNAME', 'tq_maintain_index_core';
+
 CREATE FUNCTION tq_last_scan_stats()
 RETURNS jsonb
 LANGUAGE C
@@ -54,6 +59,7 @@ REVOKE EXECUTE ON FUNCTION tq_index_metadata_core(regclass) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION tq_last_scan_stats_core() FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION tq_last_shadow_decode_candidate_tids_core() FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION tq_runtime_simd_features_core() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION tq_maintain_index_core(regclass) FROM PUBLIC;
 
 CREATE FUNCTION tq_index_metadata(indexed_index regclass)
 RETURNS jsonb
@@ -97,7 +103,7 @@ BEGIN
 		'capabilities', jsonb_build_object(
 			'ordered_scan', true,
 			'bitmap_scan', true,
-			'index_only_scan', true,
+			'index_only_scan', false,
 			'multicolumn', true,
 			'include_columns', true
 		)
@@ -106,6 +112,14 @@ END;
 $$;
 
 COMMENT ON FUNCTION tq_index_metadata(regclass) IS 'Returns stable JSON metadata, capability flags, and cheap estimated heap stats for a turboquant index.';
+
+CREATE FUNCTION tq_maintain_index(indexed_index regclass)
+RETURNS jsonb
+LANGUAGE C
+VOLATILE
+AS 'MODULE_PATHNAME', 'tq_maintain_index';
+
+COMMENT ON FUNCTION tq_maintain_index(regclass) IS 'Performs lightweight turboquant maintenance and returns delta/maintenance counters.';
 
 CREATE FUNCTION tq_index_heap_stats(indexed_index regclass)
 RETURNS jsonb
@@ -646,7 +660,13 @@ CREATE OPERATOR FAMILY tq_vector_l2_turboquant_ops USING turboquant;
 CREATE OPERATOR FAMILY tq_halfvec_cosine_turboquant_ops USING turboquant;
 CREATE OPERATOR FAMILY tq_halfvec_ip_turboquant_ops USING turboquant;
 CREATE OPERATOR FAMILY tq_halfvec_l2_turboquant_ops USING turboquant;
+CREATE OPERATOR FAMILY tq_bool_filter_turboquant_ops USING turboquant;
+CREATE OPERATOR FAMILY tq_int2_filter_turboquant_ops USING turboquant;
 CREATE OPERATOR FAMILY tq_int4_filter_turboquant_ops USING turboquant;
+CREATE OPERATOR FAMILY tq_int8_filter_turboquant_ops USING turboquant;
+CREATE OPERATOR FAMILY tq_date_filter_turboquant_ops USING turboquant;
+CREATE OPERATOR FAMILY tq_timestamptz_filter_turboquant_ops USING turboquant;
+CREATE OPERATOR FAMILY tq_uuid_filter_turboquant_ops USING turboquant;
 
 CREATE OPERATOR CLASS tq_cosine_ops
 DEFAULT FOR TYPE vector USING turboquant FAMILY tq_vector_cosine_turboquant_ops AS
@@ -686,3 +706,33 @@ CREATE OPERATOR CLASS tq_int4_filter_ops
 FOR TYPE int4 USING turboquant FAMILY tq_int4_filter_turboquant_ops AS
 	OPERATOR 1 = (int4, int4),
 	FUNCTION 1 btint4cmp(int4, int4);
+
+CREATE OPERATOR CLASS tq_bool_filter_ops
+FOR TYPE bool USING turboquant FAMILY tq_bool_filter_turboquant_ops AS
+	OPERATOR 1 = (bool, bool),
+	FUNCTION 1 btboolcmp(bool, bool);
+
+CREATE OPERATOR CLASS tq_int2_filter_ops
+FOR TYPE int2 USING turboquant FAMILY tq_int2_filter_turboquant_ops AS
+	OPERATOR 1 = (int2, int2),
+	FUNCTION 1 btint2cmp(int2, int2);
+
+CREATE OPERATOR CLASS tq_int8_filter_ops
+FOR TYPE int8 USING turboquant FAMILY tq_int8_filter_turboquant_ops AS
+	OPERATOR 1 = (int8, int8),
+	FUNCTION 1 btint8cmp(int8, int8);
+
+CREATE OPERATOR CLASS tq_date_filter_ops
+FOR TYPE date USING turboquant FAMILY tq_date_filter_turboquant_ops AS
+	OPERATOR 1 = (date, date),
+	FUNCTION 1 date_cmp(date, date);
+
+CREATE OPERATOR CLASS tq_timestamptz_filter_ops
+FOR TYPE timestamptz USING turboquant FAMILY tq_timestamptz_filter_turboquant_ops AS
+	OPERATOR 1 = (timestamptz, timestamptz),
+	FUNCTION 1 timestamptz_cmp(timestamptz, timestamptz);
+
+CREATE OPERATOR CLASS tq_uuid_filter_ops
+FOR TYPE uuid USING turboquant FAMILY tq_uuid_filter_turboquant_ops AS
+	OPERATOR 1 = (uuid, uuid),
+	FUNCTION 1 uuid_cmp(uuid, uuid);
