@@ -40,9 +40,14 @@ VACUUM (ANALYZE) tq_capability_docs;
 
 SELECT
 	meta #>> '{capabilities,index_only_scan}' AS index_only_scan,
+	meta #>> '{capabilities,vector_key_returnable}' AS vector_key_returnable,
+	meta #>> '{capabilities,ordered_vector_key_index_only_scan}' AS ordered_vector_key_index_only_scan,
 	meta #>> '{capabilities,multicolumn}' AS multicolumn,
 	meta #>> '{capabilities,include_columns}' AS include_columns,
-	meta #>> '{capabilities,bitmap_scan}' AS bitmap_scan
+	meta #>> '{capabilities,bitmap_scan}' AS bitmap_scan,
+	meta #>> '{operability,parallel_scan}' AS parallel_scan,
+	meta #>> '{operability,parallel_vacuum}' AS parallel_vacuum,
+	meta #>> '{operability,maintenance_work_mem_aware}' AS maintenance_work_mem_aware
 FROM (SELECT tq_index_metadata('tq_capability_embedding_idx'::regclass) AS meta) AS s;
 
 SET enable_seqscan = off;
@@ -50,6 +55,11 @@ SET enable_bitmapscan = off;
 
 EXPLAIN (COSTS OFF)
 SELECT embedding
+FROM tq_capability_docs
+ORDER BY embedding <=> '[1,0,0,0]'::vector(4)
+LIMIT 2;
+
+SELECT id, embedding
 FROM tq_capability_docs
 ORDER BY embedding <=> '[1,0,0,0]'::vector(4)
 LIMIT 2;

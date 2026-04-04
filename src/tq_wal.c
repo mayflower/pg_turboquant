@@ -4,11 +4,12 @@
 
 #include "src/tq_wal.h"
 
-#define TQ_WAL_META_PAGE_HEADER_BYTES 122
+#define TQ_WAL_META_PAGE_HEADER_BYTES 150
 #define TQ_WAL_LIST_DIR_PAGE_HEADER_BYTES 16
 #define TQ_WAL_LIST_DIR_ENTRY_BYTES 32
 #define TQ_WAL_CENTROID_PAGE_HEADER_BYTES 20
 #define TQ_WAL_BATCH_SUMMARY_PAGE_HEADER_BYTES 20
+#define TQ_WAL_EXACT_KEY_PAGE_HEADER_BYTES 20
 
 typedef bool (*TqWalMutator) (Page page, void *arg, char *errmsg, size_t errmsg_len);
 
@@ -69,6 +70,25 @@ typedef struct TqWalBatchSummaryPageEntryArgs
 	size_t		code_len;
 } TqWalBatchSummaryPageEntryArgs;
 
+typedef struct TqWalExactKeyPageInitArgs
+{
+	uint32_t	key_bytes;
+	uint16_t	entry_capacity;
+	uint32_t	next_block;
+} TqWalExactKeyPageInitArgs;
+
+typedef struct TqWalExactKeyPageNextBlockArgs
+{
+	uint32_t	next_block;
+} TqWalExactKeyPageNextBlockArgs;
+
+typedef struct TqWalExactKeyAppendArgs
+{
+	const uint8_t *key_bytes;
+	size_t		key_len;
+	uint16_t   *entry_index;
+} TqWalExactKeyAppendArgs;
+
 typedef struct TqWalBatchNextBlockArgs
 {
 	uint32_t	next_block;
@@ -82,8 +102,10 @@ typedef struct TqWalBatchSummaryArgs
 typedef struct TqWalBatchAppendArgs
 {
 	const TqTid *tid;
-	const int32_t *int4_values;
-	uint16_t	int4_value_count;
+	const TqExactKeyRef *exact_key_ref;
+	const uint8_t *metadata_values;
+	uint16_t	metadata_value_count;
+	uint16_t	metadata_nullmask;
 	const uint8_t *packed_code;
 	size_t		packed_code_len;
 	uint16_t   *lane_index;
@@ -92,8 +114,10 @@ typedef struct TqWalBatchAppendArgs
 typedef struct TqWalBatchSoaAppendArgs
 {
 	const TqTid *tid;
-	const int32_t *int4_values;
-	uint16_t	int4_value_count;
+	const TqExactKeyRef *exact_key_ref;
+	const uint8_t *metadata_values;
+	uint16_t	metadata_value_count;
+	uint16_t	metadata_nullmask;
 	const uint8_t *nibbles;
 	uint32_t	dimension;
 	float		gamma;
@@ -188,6 +212,18 @@ tq_wal_sync_page_bounds(Page page, char *errmsg, size_t errmsg_len)
 															 summary_header.code_bytes);
 			break;
 		}
+		case TQ_PAGE_KIND_EXACT_KEY:
+		{
+			TqExactKeyPageHeaderView exact_key_header;
+
+			memset(&exact_key_header, 0, sizeof(exact_key_header));
+			if (!tq_exact_key_page_read_header(payload, payload_size,
+											   &exact_key_header, errmsg, errmsg_len))
+				return false;
+			used_bytes = tq_exact_key_page_required_bytes(exact_key_header.entry_count,
+														  exact_key_header.key_bytes);
+			break;
+		}
 		default:
 			snprintf(errmsg, errmsg_len,
 					 "invalid turboquant page: unsupported kind %u for wal bounds",
@@ -226,6 +262,56 @@ tq_wal_apply(Relation relation,
 
 	GenericXLogFinish(state);
 	return true;
+}
+
+static bool
+tq_wal_mutate_exact_key_page_init(Page page, void *arg, char *errmsg, size_t errmsg_len)
+{
+	const TqWalExactKeyPageInitArgs *args = (const TqWalExactKeyPageInitArgs *) arg;
+
+	PageInit(page, BLCKSZ, 0);
+	if (!tq_exact_key_page_init(tq_wal_payload(page),
+								tq_wal_payload_size(page),
+								args->key_bytes,
+								args->entry_capacity,
+								args->next_block,
+								errmsg,
+								errmsg_len))
+		return false;
+
+	return tq_wal_sync_page_bounds(page, errmsg, errmsg_len);
+}
+
+static bool
+tq_wal_mutate_exact_key_page_next_block(Page page, void *arg, char *errmsg, size_t errmsg_len)
+{
+	const TqWalExactKeyPageNextBlockArgs *args = (const TqWalExactKeyPageNextBlockArgs *) arg;
+
+	if (!tq_exact_key_page_set_next_block(tq_wal_payload(page),
+										  tq_wal_payload_size(page),
+										  args->next_block,
+										  errmsg,
+										  errmsg_len))
+		return false;
+
+	return tq_wal_sync_page_bounds(page, errmsg, errmsg_len);
+}
+
+static bool
+tq_wal_mutate_exact_key_append(Page page, void *arg, char *errmsg, size_t errmsg_len)
+{
+	const TqWalExactKeyAppendArgs *args = (const TqWalExactKeyAppendArgs *) arg;
+
+	if (!tq_exact_key_page_append_entry(tq_wal_payload(page),
+										tq_wal_payload_size(page),
+										args->key_bytes,
+										args->key_len,
+										args->entry_index,
+										errmsg,
+										errmsg_len))
+		return false;
+
+	return tq_wal_sync_page_bounds(page, errmsg, errmsg_len);
 }
 
 static bool
@@ -365,26 +451,30 @@ tq_wal_mutate_batch_append(Page page, void *arg, char *errmsg, size_t errmsg_len
 {
 	const TqWalBatchAppendArgs *args = (const TqWalBatchAppendArgs *) arg;
 	uint16_t	lane_index = 0;
-	uint16_t	attribute_index = 0;
 
 	if (!tq_batch_page_append_lane(tq_wal_payload(page), tq_wal_payload_size(page),
 								   args->tid, &lane_index, errmsg, errmsg_len)
+		|| !tq_batch_page_set_exact_key_ref(tq_wal_payload(page),
+											tq_wal_payload_size(page),
+											lane_index,
+											args->exact_key_ref,
+											errmsg,
+											errmsg_len)
 		|| !tq_batch_page_set_code(tq_wal_payload(page), tq_wal_payload_size(page),
 								   lane_index, args->packed_code, args->packed_code_len,
 								   errmsg, errmsg_len))
 		return false;
 
-	for (attribute_index = 0; attribute_index < args->int4_value_count; attribute_index++)
-	{
-		if (!tq_batch_page_set_int4_attribute(tq_wal_payload(page),
-											  tq_wal_payload_size(page),
-											  lane_index,
-											  attribute_index,
-											  args->int4_values[attribute_index],
-											  errmsg,
-											  errmsg_len))
-			return false;
-	}
+	if (args->metadata_value_count > 0
+		&& !tq_batch_page_set_metadata_block(tq_wal_payload(page),
+											 tq_wal_payload_size(page),
+											 lane_index,
+											 args->metadata_values,
+											 args->metadata_value_count,
+											 args->metadata_nullmask,
+											 errmsg,
+											 errmsg_len))
+		return false;
 
 	if (args->lane_index != NULL)
 		*args->lane_index = lane_index;
@@ -397,26 +487,30 @@ tq_wal_mutate_batch_soa_append(Page page, void *arg, char *errmsg, size_t errmsg
 {
 	const TqWalBatchSoaAppendArgs *args = (const TqWalBatchSoaAppendArgs *) arg;
 	uint16_t	lane_index = 0;
-	uint16_t	attribute_index = 0;
 
 	if (!tq_batch_page_append_lane(tq_wal_payload(page), tq_wal_payload_size(page),
 								   args->tid, &lane_index, errmsg, errmsg_len)
+		|| !tq_batch_page_set_exact_key_ref(tq_wal_payload(page),
+											tq_wal_payload_size(page),
+											lane_index,
+											args->exact_key_ref,
+											errmsg,
+											errmsg_len)
 		|| !tq_batch_page_set_nibble_and_gamma(tq_wal_payload(page), tq_wal_payload_size(page),
 											   lane_index, args->nibbles, args->dimension,
 											   args->gamma, errmsg, errmsg_len))
 		return false;
 
-	for (attribute_index = 0; attribute_index < args->int4_value_count; attribute_index++)
-	{
-		if (!tq_batch_page_set_int4_attribute(tq_wal_payload(page),
-											  tq_wal_payload_size(page),
-											  lane_index,
-											  attribute_index,
-											  args->int4_values[attribute_index],
-											  errmsg,
-											  errmsg_len))
-			return false;
-	}
+	if (args->metadata_value_count > 0
+		&& !tq_batch_page_set_metadata_block(tq_wal_payload(page),
+											 tq_wal_payload_size(page),
+											 lane_index,
+											 args->metadata_values,
+											 args->metadata_value_count,
+											 args->metadata_nullmask,
+											 errmsg,
+											 errmsg_len))
+		return false;
 
 	if (args->lane_index != NULL)
 		*args->lane_index = lane_index;
@@ -611,6 +705,57 @@ tq_wal_set_batch_summary_entry(Relation relation,
 }
 
 bool
+tq_wal_init_exact_key_page(Relation relation,
+						   Buffer buffer,
+						   uint32_t key_bytes,
+						   uint16_t entry_capacity,
+						   uint32_t next_block,
+						   char *errmsg,
+						   size_t errmsg_len)
+{
+	TqWalExactKeyPageInitArgs args;
+
+	args.key_bytes = key_bytes;
+	args.entry_capacity = entry_capacity;
+	args.next_block = next_block;
+	return tq_wal_apply(relation, buffer, GENERIC_XLOG_FULL_IMAGE,
+						tq_wal_mutate_exact_key_page_init, &args, errmsg, errmsg_len);
+}
+
+bool
+tq_wal_set_exact_key_next_block(Relation relation,
+								Buffer buffer,
+								uint32_t next_block,
+								char *errmsg,
+								size_t errmsg_len)
+{
+	TqWalExactKeyPageNextBlockArgs args;
+
+	args.next_block = next_block;
+	return tq_wal_apply(relation, buffer, 0,
+						tq_wal_mutate_exact_key_page_next_block, &args, errmsg, errmsg_len);
+}
+
+bool
+tq_wal_append_exact_key(Relation relation,
+						Buffer buffer,
+						const uint8_t *key_bytes,
+						size_t key_len,
+						uint16_t *entry_index,
+						char *errmsg,
+						size_t errmsg_len)
+{
+	TqWalExactKeyAppendArgs args;
+
+	memset(&args, 0, sizeof(args));
+	args.key_bytes = key_bytes;
+	args.key_len = key_len;
+	args.entry_index = entry_index;
+	return tq_wal_apply(relation, buffer, 0,
+						tq_wal_mutate_exact_key_append, &args, errmsg, errmsg_len);
+}
+
+bool
 tq_wal_init_batch_page(Relation relation,
 					   Buffer buffer,
 					   const TqBatchPageParams *params,
@@ -656,8 +801,10 @@ bool
 tq_wal_append_batch_code(Relation relation,
 						 Buffer buffer,
 						 const TqTid *tid,
-						 const int32_t *int4_values,
-						 uint16_t int4_value_count,
+						 const TqExactKeyRef *exact_key_ref,
+						 const uint8_t *metadata_values,
+						 uint16_t metadata_value_count,
+						 uint16_t metadata_nullmask,
 						 const uint8_t *packed_code,
 						 size_t packed_code_len,
 						 uint16_t *lane_index,
@@ -668,8 +815,10 @@ tq_wal_append_batch_code(Relation relation,
 
 	memset(&args, 0, sizeof(args));
 	args.tid = tid;
-	args.int4_values = int4_values;
-	args.int4_value_count = int4_value_count;
+	args.exact_key_ref = exact_key_ref;
+	args.metadata_values = metadata_values;
+	args.metadata_value_count = metadata_value_count;
+	args.metadata_nullmask = metadata_nullmask;
 	args.packed_code = packed_code;
 	args.packed_code_len = packed_code_len;
 	args.lane_index = lane_index;
@@ -681,8 +830,10 @@ bool
 tq_wal_append_batch_soa(Relation relation,
 						 Buffer buffer,
 						 const TqTid *tid,
-						 const int32_t *int4_values,
-						 uint16_t int4_value_count,
+						 const TqExactKeyRef *exact_key_ref,
+						 const uint8_t *metadata_values,
+						 uint16_t metadata_value_count,
+						 uint16_t metadata_nullmask,
 						 const uint8_t *nibbles,
 						 uint32_t dimension,
 						 float gamma,
@@ -694,8 +845,10 @@ tq_wal_append_batch_soa(Relation relation,
 
 	memset(&args, 0, sizeof(args));
 	args.tid = tid;
-	args.int4_values = int4_values;
-	args.int4_value_count = int4_value_count;
+	args.exact_key_ref = exact_key_ref;
+	args.metadata_values = metadata_values;
+	args.metadata_value_count = metadata_value_count;
+	args.metadata_nullmask = metadata_nullmask;
 	args.nibbles = nibbles;
 	args.dimension = dimension;
 	args.gamma = gamma;

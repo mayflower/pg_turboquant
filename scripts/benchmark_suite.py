@@ -190,12 +190,24 @@ def resolve_decode_rescore_extra_candidates(
 
 def capability_metadata(spec: dict) -> dict:
     turboquant = spec["index_method"] == "turboquant"
+    ordered_vector_key_ios = turboquant and spec.get("query_mode") != "bitmap_filter"
     return {
         "ordered_scan": True,
         "bitmap_scan": turboquant,
-        "index_only_scan": False,
+        "index_only_scan": ordered_vector_key_ios,
+        "vector_key_returnable": ordered_vector_key_ios,
+        "ordered_vector_key_index_only_scan": ordered_vector_key_ios,
         "multicolumn": turboquant,
         "include_columns": turboquant,
+    }
+
+
+def operability_metadata(spec: dict) -> dict:
+    turboquant = spec["index_method"] == "turboquant"
+    return {
+        "parallel_scan": False if turboquant else True,
+        "parallel_vacuum": False if turboquant else True,
+        "maintenance_work_mem_aware": False if turboquant else True,
     }
 
 
@@ -830,9 +842,10 @@ def synthetic_index_metadata(method: str, spec: dict, corpus: Corpus, benchmark_
     metadata = {
         "access_method": spec["index_method"],
         "capabilities": capability_metadata(spec),
+        "operability": operability_metadata(spec),
         "metric": benchmark_metric,
         "opclass": spec["opclass"],
-        "format_version": 12 if spec["index_method"] == "turboquant" else 0,
+        "format_version": 16 if spec["index_method"] == "turboquant" else 0,
         "list_count": int(spec["with"].get("lists", 0)) if "lists" in spec["with"] else 0,
         "page_summary": {
             "mode": "disabled",
@@ -1645,6 +1658,7 @@ def fetch_index_metadata(
     raw = query_psql(base_cmd, f"SELECT tq_index_metadata('{index_name}'::regclass)::text;")
     metadata = json.loads(raw)
     metadata.setdefault("capabilities", capability_metadata(spec))
+    metadata.setdefault("operability", operability_metadata(spec))
     return metadata
 
 

@@ -20,11 +20,14 @@
 #include "utils/builtins.h"
 #include "utils/syscache.h"
 
+#include "src/tq_guc.h"
 #include "src/tq_page.h"
+#include "src/tq_maintenance.h"
 #include "src/tq_reloptions.h"
 #include "src/tq_router.h"
 #include "src/tq_scan.h"
 #include "src/tq_simd_avx2.h"
+#include "src/tq_wal.h"
 
 PG_MODULE_MAGIC;
 
@@ -39,6 +42,8 @@ PG_FUNCTION_INFO_V1(tq_last_shadow_decode_candidate_tids);
 PG_FUNCTION_INFO_V1(tq_last_shadow_decode_candidate_tids_core);
 PG_FUNCTION_INFO_V1(tq_runtime_simd_features);
 PG_FUNCTION_INFO_V1(tq_runtime_simd_features_core);
+PG_FUNCTION_INFO_V1(tq_maintain_index);
+PG_FUNCTION_INFO_V1(tq_maintain_index_core);
 
 typedef struct TqListAggregate
 {
@@ -57,6 +62,10 @@ static const char *tq_quantizer_family_name(uint16_t version);
 static const char *tq_residual_sketch_kind_name(uint16_t version);
 static const char *tq_estimator_mode_name(uint16_t version);
 static const char *tq_page_summary_mode_name(const TqMetaPageFields *meta_fields);
+static double tq_safe_fraction_u64(uint64_t numerator, uint64_t denominator);
+static const char *tq_recommended_maintenance_action(bool delta_merge_recommended,
+													 bool compaction_recommended,
+													 bool maintenance_attention_required);
 static void tq_json_append_string(StringInfo buf, const char *value);
 static int tq_u64_compare(const void *left, const void *right);
 static bool tq_read_meta_fields(Relation index_relation,
@@ -79,6 +88,14 @@ static uint32_t tq_count_centroid_pages(Relation index_relation,
 										 BlockNumber root_block,
 										 char *errmsg,
 										 size_t errmsg_len);
+static bool tq_collect_index_totals(Relation index_relation,
+									const TqMetaPageFields *meta_fields,
+									uint64_t *total_live_count,
+									uint64_t *total_dead_count,
+									uint32_t *batch_page_count,
+									uint32_t *reclaimable_pages,
+									char *errmsg,
+									size_t errmsg_len);
 static bool tq_append_list_metadata_json(StringInfo buf,
 										 Relation index_relation,
 										 const TqMetaPageFields *meta_fields,
@@ -187,6 +204,30 @@ tq_page_summary_mode_name(const TqMetaPageFields *meta_fields)
 	if (meta_fields->list_count > 0)
 		return "ordering_only";
 	return "disabled";
+}
+
+static double
+tq_safe_fraction_u64(uint64_t numerator, uint64_t denominator)
+{
+	if (denominator == 0)
+		return 0.0;
+	return (double) numerator / (double) denominator;
+}
+
+static const char *
+tq_recommended_maintenance_action(bool delta_merge_recommended,
+									 bool compaction_recommended,
+									 bool maintenance_attention_required)
+{
+	if (delta_merge_recommended && compaction_recommended)
+		return "merge_delta_and_compact";
+	if (delta_merge_recommended)
+		return "merge_delta";
+	if (compaction_recommended)
+		return "compact";
+	if (maintenance_attention_required)
+		return "observe";
+	return "healthy";
 }
 
 static void
@@ -402,6 +443,51 @@ tq_count_centroid_pages(Relation index_relation,
 }
 
 static bool
+tq_collect_index_totals(Relation index_relation,
+						 const TqMetaPageFields *meta_fields,
+						 uint64_t *total_live_count,
+						 uint64_t *total_dead_count,
+						 uint32_t *batch_page_count,
+						 uint32_t *reclaimable_pages,
+						 char *errmsg,
+						 size_t errmsg_len)
+{
+	StringInfoData scratch;
+	TqListAggregate delta_aggregate;
+	bool ok = false;
+
+	initStringInfo(&scratch);
+	ok = tq_append_list_metadata_json(&scratch,
+									  index_relation,
+									  meta_fields,
+									  total_live_count,
+									  total_dead_count,
+									  batch_page_count,
+									  reclaimable_pages,
+									  errmsg,
+									  errmsg_len);
+	if (ok && meta_fields->delta_head_block != TQ_INVALID_BLOCK_NUMBER)
+	{
+		memset(&delta_aggregate, 0, sizeof(delta_aggregate));
+		ok = tq_collect_batch_chain_stats(index_relation,
+										 meta_fields->delta_head_block,
+										 &delta_aggregate,
+										 reclaimable_pages,
+										 errmsg,
+										 errmsg_len);
+		if (ok)
+		{
+			*total_live_count += delta_aggregate.live_count;
+			*total_dead_count += delta_aggregate.dead_count;
+			*batch_page_count += delta_aggregate.batch_page_count;
+		}
+	}
+	if (scratch.data != NULL)
+		pfree(scratch.data);
+	return ok;
+}
+
+static bool
 tq_append_list_metadata_json(StringInfo buf,
 								Relation index_relation,
 								const TqMetaPageFields *meta_fields,
@@ -432,11 +518,27 @@ tq_append_list_metadata_json(StringInfo buf,
 		{
 			Buffer		buffer;
 			Page		page;
+			TqPageKind page_kind;
 			TqBatchPageHeaderView header;
 			bool		should_reclaim = false;
 
 			buffer = ReadBufferExtended(index_relation, MAIN_FORKNUM, block_number, RBM_NORMAL, NULL);
 			page = BufferGetPage(buffer);
+			memset(&page_kind, 0, sizeof(page_kind));
+			if (!tq_page_read_kind(PageGetContents(page),
+								   (size_t) (PageGetPageSize(page) - SizeOfPageHeaderData),
+								   &page_kind,
+								   errmsg,
+								   errmsg_len))
+			{
+				ReleaseBuffer(buffer);
+				return false;
+			}
+			if (page_kind != TQ_PAGE_KIND_BATCH)
+			{
+				ReleaseBuffer(buffer);
+				continue;
+			}
 			memset(&header, 0, sizeof(header));
 			if (!tq_batch_page_read_header(PageGetContents(page),
 									   (size_t) (PageGetPageSize(page) - SizeOfPageHeaderData),
@@ -681,6 +783,14 @@ tq_index_metadata_core(PG_FUNCTION_ARGS)
 	uint32_t	reclaimable_pages = 0;
 	uint32_t	batch_page_count = 0;
 	uint32_t	centroid_page_count = 0;
+	TqListAggregate delta_aggregate;
+	bool		delta_enabled = false;
+	bool		maintenance_required = false;
+	bool		delta_merge_recommended = false;
+	bool		compaction_recommended = false;
+	double		delta_live_fraction = 0.0;
+	double		dead_fraction = 0.0;
+	const char *maintenance_action_recommended = NULL;
 	char		error_buf[256];
 	StringInfoData buf;
 
@@ -830,14 +940,290 @@ tq_index_metadata_core(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_DATA_EXCEPTION),
 				 errmsg("%s", error_buf)));
 	}
+	delta_enabled = meta_fields.list_count > 0;
+	memset(&delta_aggregate, 0, sizeof(delta_aggregate));
+	if (meta_fields.delta_head_block != TQ_INVALID_BLOCK_NUMBER
+		&& !tq_collect_batch_chain_stats(index_relation,
+										 meta_fields.delta_head_block,
+										 &delta_aggregate,
+										 &reclaimable_pages,
+										 error_buf,
+										 sizeof(error_buf)))
+	{
+		RelationClose(index_relation);
+		pfree(buf.data);
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_EXCEPTION),
+				 errmsg("%s", error_buf)));
+	}
+	total_live_count += delta_aggregate.live_count;
+	total_dead_count += delta_aggregate.dead_count;
+	batch_page_count += delta_aggregate.batch_page_count;
+	maintenance_required = delta_aggregate.live_count > 0
+		|| total_dead_count > 0
+		|| reclaimable_pages > 0;
+	delta_live_fraction = tq_safe_fraction_u64(delta_aggregate.live_count,
+											   total_live_count);
+	dead_fraction = tq_safe_fraction_u64(total_dead_count,
+										 total_live_count + total_dead_count);
+	delta_merge_recommended = delta_aggregate.live_count > 0
+		&& (delta_aggregate.live_count
+			>= (uint64_t) tq_guc_delta_merge_live_count_threshold
+			|| delta_aggregate.batch_page_count
+			>= (uint32_t) tq_guc_delta_merge_page_count_threshold
+			|| delta_live_fraction
+			>= ((double) tq_guc_delta_merge_live_percent_threshold / 100.0));
+	compaction_recommended = (total_dead_count > 0
+							  && dead_fraction
+							  >= ((double) tq_guc_maintenance_dead_tuple_percent_threshold / 100.0))
+		|| (reclaimable_pages >= (uint32_t) tq_guc_maintenance_reclaimable_page_threshold);
+	maintenance_action_recommended = tq_recommended_maintenance_action(delta_merge_recommended,
+																		 compaction_recommended,
+																		 maintenance_required);
 	appendStringInfo(&buf,
-					 ",\"live_count\":%llu,\"dead_count\":%llu,\"reclaimable_pages\":%u,\"batch_page_count\":%u,\"centroid_page_count\":%u}",
+					 ",\"delta_enabled\":%s,\"delta_live_count\":%llu,\"delta_batch_page_count\":%u,"
+					 "\"delta_head_block\":%s,\"delta_tail_block\":%s,\"maintenance_required\":%s",
+					 delta_enabled ? "true" : "false",
+					 (unsigned long long) delta_aggregate.live_count,
+					 delta_aggregate.batch_page_count,
+					 meta_fields.delta_head_block == TQ_INVALID_BLOCK_NUMBER
+						? "null"
+						: psprintf("%u", meta_fields.delta_head_block),
+					 meta_fields.delta_tail_block == TQ_INVALID_BLOCK_NUMBER
+						? "null"
+						: psprintf("%u", meta_fields.delta_tail_block),
+					 maintenance_required ? "true" : "false");
+	appendStringInfo(&buf,
+					 ",\"delta_health\":{\"page_depth\":%u,\"live_fraction\":%.6f,"
+					 "\"merge_recommended\":%s,\"merge_thresholds\":{\"live_count\":%d,"
+					 "\"page_depth\":%d,\"live_percent\":%d}}",
+					 delta_aggregate.batch_page_count,
+					 delta_live_fraction,
+					 delta_merge_recommended ? "true" : "false",
+					 tq_guc_delta_merge_live_count_threshold,
+					 tq_guc_delta_merge_page_count_threshold,
+					 tq_guc_delta_merge_live_percent_threshold);
+	appendStringInfo(&buf,
+					 ",\"maintenance\":{\"dead_fraction\":%.6f,\"compaction_recommended\":%s,"
+					 "\"compaction_thresholds\":{\"dead_tuple_percent\":%d,"
+					 "\"reclaimable_pages\":%d},\"attention_required\":%s}",
+					 dead_fraction,
+					 compaction_recommended ? "true" : "false",
+					 tq_guc_maintenance_dead_tuple_percent_threshold,
+					 tq_guc_maintenance_reclaimable_page_threshold,
+					 maintenance_required ? "true" : "false");
+	appendStringInfoString(&buf, ",\"maintenance_action_recommended\":");
+	tq_json_append_string(&buf, maintenance_action_recommended);
+	appendStringInfoString(&buf, ",\"fast_lane\":{");
+	appendStringInfoString(&buf, "\"metric\":");
+	tq_json_append_string(&buf, tq_distance_kind_name(meta_fields.distance));
+	appendStringInfo(&buf,
+					 ",\"strict_normalization\":%s,\"fallback_reason\":",
+					 meta_fields.normalized ? "true" : "false");
+	tq_json_append_string(&buf,
+						  (meta_fields.normalized
+						   && (meta_fields.distance == TQ_DISTANCE_COSINE
+							   || meta_fields.distance == TQ_DISTANCE_IP))
+						  ? "none"
+						  : "compatibility_path");
+	appendStringInfo(&buf,
+					 "},\"live_count\":%llu,\"dead_count\":%llu,\"reclaimable_pages\":%u,\"batch_page_count\":%u,\"centroid_page_count\":%u}",
 					 (unsigned long long) total_live_count,
 					 (unsigned long long) total_dead_count,
 					 reclaimable_pages,
 					 batch_page_count,
 					 centroid_page_count);
 
+	RelationClose(index_relation);
+	PG_RETURN_TEXT_P(cstring_to_text(buf.data));
+}
+
+Datum
+tq_maintain_index(PG_FUNCTION_ARGS)
+{
+	text *json_text;
+
+	(void) fcinfo;
+
+	json_text = DatumGetTextPP(DirectFunctionCall1(tq_maintain_index_core,
+												   PG_GETARG_DATUM(0)));
+	return DirectFunctionCall1(jsonb_in, CStringGetDatum(text_to_cstring(json_text)));
+}
+
+Datum
+tq_maintain_index_core(PG_FUNCTION_ARGS)
+{
+	Oid index_oid = PG_GETARG_OID(0);
+	Relation index_relation;
+	TqMetaPageFields meta_fields;
+	uint64_t total_live_count = 0;
+	uint64_t total_dead_count = 0;
+	uint32_t batch_page_count = 0;
+	uint32_t reclaimable_pages = 0;
+	uint64_t merged_delta_count = 0;
+	uint32_t rewritten_list_count = 0;
+	uint32_t recycled_delta_page_count = 0;
+	bool delta_merge_performed = false;
+	bool compaction_pass_performed = false;
+	bool pre_maintenance_required = false;
+	bool post_maintenance_required = false;
+	const char *action = NULL;
+	const char *pre_maintenance_action_recommended = NULL;
+	const char *post_maintenance_action_recommended = NULL;
+	double pre_dead_fraction = 0.0;
+	double post_dead_fraction = 0.0;
+	StringInfoData buf;
+	char error_buf[256];
+
+	(void) fcinfo;
+
+	index_relation = RelationIdGetRelation(index_oid);
+	if (index_relation == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("relation with OID %u could not be opened", index_oid)));
+
+	memset(&meta_fields, 0, sizeof(meta_fields));
+	if (!tq_read_meta_fields(index_relation, &meta_fields, error_buf, sizeof(error_buf)))
+	{
+		RelationClose(index_relation);
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_EXCEPTION),
+				 errmsg("%s", error_buf)));
+	}
+	if (!tq_collect_index_totals(index_relation,
+								 &meta_fields,
+								 &total_live_count,
+								 &total_dead_count,
+								 &batch_page_count,
+								 &reclaimable_pages,
+								 error_buf,
+								 sizeof(error_buf)))
+	{
+		RelationClose(index_relation);
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_EXCEPTION),
+				 errmsg("%s", error_buf)));
+	}
+	pre_maintenance_required = total_dead_count > 0
+		|| reclaimable_pages > 0
+		|| meta_fields.delta_live_count > 0;
+	pre_dead_fraction = tq_safe_fraction_u64(total_dead_count,
+											 total_live_count + total_dead_count);
+	pre_maintenance_action_recommended = tq_recommended_maintenance_action(
+		meta_fields.delta_live_count > 0
+		&& (meta_fields.delta_live_count
+			>= (uint32_t) tq_guc_delta_merge_live_count_threshold
+			|| meta_fields.delta_batch_page_count
+			>= (uint32_t) tq_guc_delta_merge_page_count_threshold
+			|| tq_safe_fraction_u64(meta_fields.delta_live_count, total_live_count)
+			>= ((double) tq_guc_delta_merge_live_percent_threshold / 100.0)),
+		((total_dead_count > 0)
+		 && pre_dead_fraction
+		 >= ((double) tq_guc_maintenance_dead_tuple_percent_threshold / 100.0))
+		|| (reclaimable_pages >= (uint32_t) tq_guc_maintenance_reclaimable_page_threshold),
+		pre_maintenance_required);
+
+	if (!tq_merge_delta_relation(index_relation,
+								 &merged_delta_count,
+								 &rewritten_list_count,
+								 &recycled_delta_page_count,
+								 error_buf,
+								 sizeof(error_buf)))
+	{
+		RelationClose(index_relation);
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_EXCEPTION),
+				 errmsg("%s", error_buf)));
+	}
+	delta_merge_performed = merged_delta_count > 0;
+
+	if (total_dead_count > 0 || reclaimable_pages > 0)
+	{
+		if (!tq_compact_index_relation(index_relation, error_buf, sizeof(error_buf)))
+		{
+			RelationClose(index_relation);
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_EXCEPTION),
+					 errmsg("%s", error_buf)));
+		}
+		compaction_pass_performed = true;
+	}
+
+	memset(&meta_fields, 0, sizeof(meta_fields));
+	total_live_count = 0;
+	total_dead_count = 0;
+	batch_page_count = 0;
+	reclaimable_pages = 0;
+	if (!tq_read_meta_fields(index_relation, &meta_fields, error_buf, sizeof(error_buf))
+		|| !tq_collect_index_totals(index_relation,
+									&meta_fields,
+									&total_live_count,
+									&total_dead_count,
+									&batch_page_count,
+									&reclaimable_pages,
+									error_buf,
+									sizeof(error_buf)))
+	{
+		RelationClose(index_relation);
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_EXCEPTION),
+				 errmsg("%s", error_buf)));
+	}
+	post_maintenance_required = total_dead_count > 0
+		|| reclaimable_pages > 0
+		|| meta_fields.delta_live_count > 0;
+	post_dead_fraction = tq_safe_fraction_u64(total_dead_count,
+											  total_live_count + total_dead_count);
+	post_maintenance_action_recommended = tq_recommended_maintenance_action(
+		meta_fields.delta_live_count > 0
+		&& (meta_fields.delta_live_count
+			>= (uint32_t) tq_guc_delta_merge_live_count_threshold
+			|| meta_fields.delta_batch_page_count
+			>= (uint32_t) tq_guc_delta_merge_page_count_threshold
+			|| tq_safe_fraction_u64(meta_fields.delta_live_count, total_live_count)
+			>= ((double) tq_guc_delta_merge_live_percent_threshold / 100.0)),
+		((total_dead_count > 0)
+		 && post_dead_fraction
+		 >= ((double) tq_guc_maintenance_dead_tuple_percent_threshold / 100.0))
+		|| (reclaimable_pages >= (uint32_t) tq_guc_maintenance_reclaimable_page_threshold),
+		post_maintenance_required);
+
+	if (delta_merge_performed && compaction_pass_performed)
+		action = "merge_delta_and_compact";
+	else if (delta_merge_performed)
+		action = "merge_delta";
+	else if (compaction_pass_performed)
+		action = "compact";
+	else
+		action = "noop";
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf,
+					 "{\"action\":\"%s\",\"delta_merge_performed\":%s,"
+					 "\"compaction_pass_performed\":%s,"
+					 "\"pre_maintenance_required\":%s,"
+					 "\"post_maintenance_required\":%s,"
+					 "\"pre_maintenance_action_recommended\":\"%s\","
+					 "\"post_maintenance_action_recommended\":\"%s\","
+					 "\"merged_delta_count\":%llu,\"rewritten_list_count\":%u,"
+					 "\"recycled_delta_page_count\":%u,"
+					 "\"total_live_count\":%llu,\"total_dead_count\":%llu,"
+					 "\"batch_page_count\":%u,\"reclaimable_pages\":%u}",
+					 action,
+					 delta_merge_performed ? "true" : "false",
+					 compaction_pass_performed ? "true" : "false",
+					 pre_maintenance_required ? "true" : "false",
+					 post_maintenance_required ? "true" : "false",
+					 pre_maintenance_action_recommended,
+					 post_maintenance_action_recommended,
+					 (unsigned long long) merged_delta_count,
+					 rewritten_list_count,
+					 recycled_delta_page_count,
+					 (unsigned long long) total_live_count,
+					 (unsigned long long) total_dead_count,
+					 batch_page_count,
+					 reclaimable_pages);
 	RelationClose(index_relation);
 	PG_RETURN_TEXT_P(cstring_to_text(buf.data));
 }

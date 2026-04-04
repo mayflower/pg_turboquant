@@ -5,15 +5,17 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "src/tq_metadata.h"
 #include "src/tq_options.h"
 #include "src/tq_transform.h"
 
 #define TQ_PAGE_MAGIC UINT32_C(0x54515047)
-#define TQ_PAGE_FORMAT_VERSION 14
+#define TQ_PAGE_FORMAT_VERSION 17
 #define TQ_INVALID_BLOCK_NUMBER UINT32_MAX
 #define TQ_DETACHED_FREE_LIST_ID UINT32_MAX
+#define TQ_DELTA_LIST_ID (UINT32_MAX - 1u)
 #define TQ_BATCH_PAGE_NO_REPRESENTATIVE UINT16_MAX
-#define TQ_MAX_STORED_INT4_ATTRIBUTES 8
+#define TQ_MAX_STORED_INT4_ATTRIBUTES TQ_MAX_STORED_METADATA_ATTRIBUTES
 
 #define TQ_ALGORITHM_VERSION 3
 #define TQ_QUANTIZER_VERSION 2
@@ -26,7 +28,8 @@ typedef enum TqPageKind
 	TQ_PAGE_KIND_LIST_DIRECTORY = 2,
 	TQ_PAGE_KIND_BATCH = 3,
 	TQ_PAGE_KIND_CENTROID = 4,
-	TQ_PAGE_KIND_BATCH_SUMMARY = 5
+	TQ_PAGE_KIND_BATCH_SUMMARY = 5,
+	TQ_PAGE_KIND_EXACT_KEY = 6
 } TqPageKind;
 
 typedef enum TqDistanceKind
@@ -41,6 +44,12 @@ typedef struct TqTid
 	uint32_t	block_number;
 	uint16_t	offset_number;
 } TqTid;
+
+typedef struct TqExactKeyRef
+{
+	uint32_t	block_number;
+	uint16_t	entry_index;
+} TqExactKeyRef;
 
 typedef struct TqMetaPageFields
 {
@@ -70,6 +79,13 @@ typedef struct TqMetaPageFields
 	float			router_coeff_var;
 	float			router_balance_penalty;
 	float			router_selection_score;
+	uint32_t		delta_head_block;
+	uint32_t		delta_tail_block;
+	uint32_t		delta_live_count;
+	uint32_t		delta_batch_page_count;
+	uint32_t		exact_key_head_block;
+	uint32_t		exact_key_tail_block;
+	uint32_t		exact_key_page_count;
 	uint16_t		algorithm_version;
 	uint16_t		quantizer_version;
 	uint16_t		residual_sketch_version;
@@ -104,7 +120,11 @@ typedef struct TqBatchPageParams
 	uint32_t	list_id;
 	uint32_t	next_block;
 	uint32_t	dimension;		/* >0 selects SoA nibble layout; 0 uses legacy AoS */
-	uint16_t	int4_attribute_count;
+	union
+	{
+		uint16_t	int4_attribute_count;
+		uint16_t	metadata_attribute_count;
+	};
 } TqBatchPageParams;
 
 typedef struct TqBatchPageHeaderView
@@ -142,6 +162,14 @@ typedef struct TqBatchSummaryPageHeaderView
 	uint32_t	next_block;
 } TqBatchSummaryPageHeaderView;
 
+typedef struct TqExactKeyPageHeaderView
+{
+	uint32_t	key_bytes;
+	uint16_t	entry_capacity;
+	uint16_t	entry_count;
+	uint32_t	next_block;
+} TqExactKeyPageHeaderView;
+
 extern size_t tq_bitmap_bytes_for_lanes(uint16_t lane_count);
 extern size_t tq_batch_page_required_bytes(uint16_t lane_count, uint32_t code_bytes);
 extern bool tq_batch_page_can_fit(size_t page_size, uint16_t lane_count, uint32_t code_bytes);
@@ -155,6 +183,8 @@ extern size_t tq_centroid_page_required_bytes(uint32_t dimension, uint16_t centr
 extern uint16_t tq_centroid_page_capacity(size_t page_size, uint32_t dimension);
 extern size_t tq_batch_summary_page_required_bytes(uint16_t entry_capacity, uint32_t code_bytes);
 extern uint16_t tq_batch_summary_page_capacity(size_t page_size, uint32_t code_bytes);
+extern size_t tq_exact_key_page_required_bytes(uint16_t entry_capacity, uint32_t key_bytes);
+extern uint16_t tq_exact_key_page_capacity(size_t page_size, uint32_t key_bytes);
 
 extern bool tq_meta_page_init(void *page,
 							  size_t page_size,
@@ -256,6 +286,37 @@ extern bool tq_batch_summary_page_get_entry(const void *page,
 											size_t code_len,
 											char *errmsg,
 											size_t errmsg_len);
+extern bool tq_exact_key_page_init(void *page,
+								   size_t page_size,
+								   uint32_t key_bytes,
+								   uint16_t entry_capacity,
+								   uint32_t next_block,
+								   char *errmsg,
+								   size_t errmsg_len);
+extern bool tq_exact_key_page_read_header(const void *page,
+										  size_t page_size,
+										  TqExactKeyPageHeaderView *header,
+										  char *errmsg,
+										  size_t errmsg_len);
+extern bool tq_exact_key_page_set_next_block(void *page,
+											 size_t page_size,
+											 uint32_t next_block,
+											 char *errmsg,
+											 size_t errmsg_len);
+extern bool tq_exact_key_page_append_entry(void *page,
+										   size_t page_size,
+										   const uint8_t *key_bytes,
+										   size_t key_len,
+										   uint16_t *entry_index,
+										   char *errmsg,
+										   size_t errmsg_len);
+extern bool tq_exact_key_page_get_entry(const void *page,
+										size_t page_size,
+										uint16_t entry_index,
+										uint8_t *key_bytes,
+										size_t key_len,
+										char *errmsg,
+										size_t errmsg_len);
 
 extern bool tq_batch_page_init(void *page,
 							   size_t page_size,
@@ -304,6 +365,18 @@ extern bool tq_batch_page_get_tid(const void *page,
 								  TqTid *tid,
 								  char *errmsg,
 								  size_t errmsg_len);
+extern bool tq_batch_page_set_exact_key_ref(void *page,
+											size_t page_size,
+											uint16_t lane_index,
+											const TqExactKeyRef *key_ref,
+											char *errmsg,
+											size_t errmsg_len);
+extern bool tq_batch_page_get_exact_key_ref(const void *page,
+											size_t page_size,
+											uint16_t lane_index,
+											TqExactKeyRef *key_ref,
+											char *errmsg,
+											size_t errmsg_len);
 extern bool tq_batch_page_set_filter_int4(void *page,
 										  size_t page_size,
 										  uint16_t lane_index,
@@ -326,6 +399,27 @@ extern bool tq_batch_page_get_int4_attribute_count(const void *page,
 												   uint16_t *attribute_count,
 												   char *errmsg,
 												   size_t errmsg_len);
+extern bool tq_batch_page_get_metadata_attribute_count(const void *page,
+													   size_t page_size,
+													   uint16_t *attribute_count,
+													   char *errmsg,
+													   size_t errmsg_len);
+extern bool tq_batch_page_set_metadata_block(void *page,
+											 size_t page_size,
+											 uint16_t lane_index,
+											 const uint8_t *metadata_values,
+											 uint16_t metadata_attribute_count,
+											 uint16_t metadata_nullmask,
+											 char *errmsg,
+											 size_t errmsg_len);
+extern bool tq_batch_page_get_metadata_block(const void *page,
+											 size_t page_size,
+											 uint16_t lane_index,
+											 uint8_t *metadata_values,
+											 uint16_t metadata_attribute_count,
+											 uint16_t *metadata_nullmask,
+											 char *errmsg,
+											 size_t errmsg_len);
 extern bool tq_batch_page_set_int4_attribute(void *page,
 											 size_t page_size,
 											 uint16_t lane_index,
@@ -403,6 +497,10 @@ extern size_t tq_batch_page_soa_required_bytes_with_int4_attributes(uint16_t lan
 																	uint32_t dimension,
 																	uint32_t representative_code_bytes,
 																	uint16_t int4_attribute_count);
+extern size_t tq_batch_page_soa_required_bytes_with_metadata(uint16_t lane_count,
+															 uint32_t dimension,
+															 uint32_t representative_code_bytes,
+															 uint16_t metadata_attribute_count);
 extern bool tq_batch_page_can_fit_soa(size_t page_size, uint16_t lane_count,
 									  uint32_t dimension, uint32_t representative_code_bytes);
 extern bool tq_batch_page_can_fit_soa_with_filter(size_t page_size,
@@ -415,6 +513,11 @@ extern bool tq_batch_page_can_fit_soa_with_int4_attributes(size_t page_size,
 															uint32_t dimension,
 															uint32_t representative_code_bytes,
 															uint16_t int4_attribute_count);
+extern bool tq_batch_page_can_fit_soa_with_metadata(size_t page_size,
+													uint16_t lane_count,
+													uint32_t dimension,
+													uint32_t representative_code_bytes,
+													uint16_t metadata_attribute_count);
 extern bool tq_batch_page_set_representative_code(void *page, size_t page_size,
 												  const uint8_t *code, size_t code_len,
 												  char *errmsg, size_t errmsg_len);

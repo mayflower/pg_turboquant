@@ -54,5 +54,21 @@ extern bool tq_vector_copy_from_datum_typed(Datum value,
 											uint32_t *dimension,
 											char *errmsg,
 											size_t errmsg_len);
+extern size_t tq_vector_storage_size(TqVectorInputKind kind,
+									 uint32_t dimension);
+extern bool tq_vector_copy_raw_datum_typed(Datum value,
+										   TqVectorInputKind kind,
+										   uint8_t *out,
+										   size_t out_len,
+										   uint32_t *dimension,
+										   char *errmsg,
+										   size_t errmsg_len);
+extern bool tq_vector_datum_from_raw_bytes_typed(const uint8_t *raw_bytes,
+												 size_t raw_len,
+												 TqVectorInputKind kind,
+												 uint32_t dimension,
+												 Datum *value,
+												 char *errmsg,
+												 size_t errmsg_len);
 
 #endif

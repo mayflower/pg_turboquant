@@ -60,6 +60,15 @@ WHERE tenant_id = 1
 ORDER BY embedding <=> '[1,0,0,0]'::vector(4)
 LIMIT 1;
 
+EXPLAIN (COSTS OFF)
+SELECT doc_id, chunk_id, tenant_id, doc_version
+FROM tq_rag_surface_docs
+WHERE tenant_id = 1
+	AND source_id = 10
+	AND lang_id = 1
+ORDER BY embedding <=> '[1,0,0,0]'::vector(4)
+LIMIT 1;
+
 SELECT doc_id, chunk_id, tenant_id, doc_version
 FROM tq_rag_surface_docs
 WHERE tenant_id = 1

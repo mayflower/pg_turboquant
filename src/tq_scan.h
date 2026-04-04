@@ -6,24 +6,29 @@
 #include <stdint.h>
 
 #include "src/tq_codec_prod.h"
+#include "src/tq_metadata.h"
 #include "src/tq_page.h"
 #include "src/tq_simd_avx2.h"
 
 #define TQ_MAX_FILTER_VALUES_PER_CLAUSE 16
 
-typedef struct TqInt4FilterClause
+typedef struct TqMetadataFilterClause
 {
 	uint16_t	attribute_index;
+	TqMetadataKind kind;
+	bool		match_null;
 	uint16_t	value_count;
-	int32_t		values[TQ_MAX_FILTER_VALUES_PER_CLAUSE];
-} TqInt4FilterClause;
+	uint8_t		values[TQ_MAX_FILTER_VALUES_PER_CLAUSE][TQ_METADATA_SLOT_BYTES];
+} TqMetadataFilterClause;
 
 typedef struct TqCandidateEntry
 {
 	float		score;
 	TqTid		tid;
-	uint16_t	int4_attribute_count;
-	int32_t		int4_attributes[TQ_MAX_STORED_INT4_ATTRIBUTES];
+	TqExactKeyRef exact_key_ref;
+	uint16_t	metadata_attribute_count;
+	uint16_t	metadata_nullmask;
+	uint8_t		metadata_values[TQ_MAX_STORED_METADATA_ATTRIBUTES * TQ_METADATA_SLOT_BYTES];
 } TqCandidateEntry;
 
 typedef struct TqCandidateHeap
@@ -179,8 +184,9 @@ extern bool tq_candidate_heap_push(TqCandidateHeap *heap,
 								   float score,
 								   uint32_t block_number,
 								   uint16_t offset_number,
-								   const int32_t *int4_attributes,
-								   uint16_t int4_attribute_count);
+								   const TqExactKeyRef *exact_key_ref,
+								   const uint8_t *metadata_values,
+								   uint16_t metadata_attribute_count);
 extern bool tq_candidate_heap_pop_best(TqCandidateHeap *heap,
 									   TqCandidateEntry *entry);
 extern bool tq_metric_distance_from_ip_score(TqDistanceKind distance,
@@ -311,9 +317,9 @@ extern bool tq_batch_page_scan_prod_filtered(const void *page,
 											 const TqProdLut *lut,
 											 const float *query_values,
 											 size_t query_len,
-											 const TqInt4FilterClause *filter_clauses,
+											 const TqMetadataFilterClause *filter_clauses,
 											 uint16_t filter_clause_count,
-											 uint16_t int4_attribute_count,
+											 uint16_t metadata_attribute_count,
 											 TqCandidateHeap *heap,
 											 TqCandidateHeap *shadow_decode_heap,
 											 char *errmsg,
@@ -341,9 +347,9 @@ extern bool tq_batch_page_scan_prod_with_scratch_filtered(const void *page,
 														  const TqProdLut *lut,
 														  const float *query_values,
 														  size_t query_len,
-														  const TqInt4FilterClause *filter_clauses,
+														  const TqMetadataFilterClause *filter_clauses,
 														  uint16_t filter_clause_count,
-														  uint16_t int4_attribute_count,
+														  uint16_t metadata_attribute_count,
 														  TqCandidateHeap *heap,
 														  TqCandidateHeap *shadow_decode_heap,
 														  TqScanScratch *scratch,

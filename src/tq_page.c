@@ -1,6 +1,10 @@
 #include "src/tq_page.h"
 
 #ifdef TQ_UNIT_TEST
+#undef snprintf
+#endif
+
+#ifdef TQ_UNIT_TEST
 #include <stdlib.h>
 #else
 #include "postgres.h"
@@ -10,13 +14,15 @@
 #include <stdio.h>
 #include <string.h>
 
-#define TQ_META_PAGE_HEADER_BYTES 122
+#define TQ_META_PAGE_HEADER_BYTES 150
 #define TQ_LIST_DIR_PAGE_HEADER_BYTES 16
 #define TQ_LIST_DIR_ENTRY_BYTES 32
 #define TQ_BATCH_PAGE_HEADER_BYTES 44
 #define TQ_CENTROID_PAGE_HEADER_BYTES 20
 #define TQ_BATCH_SUMMARY_PAGE_HEADER_BYTES 20
+#define TQ_EXACT_KEY_PAGE_HEADER_BYTES 20
 #define TQ_TID_STORAGE_BYTES 6
+#define TQ_EXACT_KEY_REF_BYTES 6
 
 #define TQ_FLAG_NORMALIZED UINT16_C(0x0001)
 #define TQ_BATCH_FLAG_SOA_NIBBLES UINT16_C(0x0002)
@@ -55,12 +61,19 @@
 #define TQ_META_ROUTER_COEFF_VAR_OFFSET 96
 #define TQ_META_ROUTER_BALANCE_PENALTY_OFFSET 100
 #define TQ_META_ROUTER_SELECTION_SCORE_OFFSET 104
-#define TQ_META_ALGORITHM_VERSION_OFFSET 108
-#define TQ_META_QUANTIZER_VERSION_OFFSET 110
-#define TQ_META_RESIDUAL_SKETCH_VERSION_OFFSET 112
-#define TQ_META_RESIDUAL_BITS_PER_DIMENSION_OFFSET 114
-#define TQ_META_RESIDUAL_SKETCH_DIMENSION_OFFSET 116
-#define TQ_META_ESTIMATOR_VERSION_OFFSET 120
+#define TQ_META_DELTA_HEAD_BLOCK_OFFSET 108
+#define TQ_META_DELTA_TAIL_BLOCK_OFFSET 112
+#define TQ_META_DELTA_LIVE_COUNT_OFFSET 116
+#define TQ_META_DELTA_BATCH_PAGE_COUNT_OFFSET 120
+#define TQ_META_EXACT_KEY_HEAD_BLOCK_OFFSET 124
+#define TQ_META_EXACT_KEY_TAIL_BLOCK_OFFSET 128
+#define TQ_META_EXACT_KEY_PAGE_COUNT_OFFSET 132
+#define TQ_META_ALGORITHM_VERSION_OFFSET 136
+#define TQ_META_QUANTIZER_VERSION_OFFSET 138
+#define TQ_META_RESIDUAL_SKETCH_VERSION_OFFSET 140
+#define TQ_META_RESIDUAL_BITS_PER_DIMENSION_OFFSET 142
+#define TQ_META_RESIDUAL_SKETCH_DIMENSION_OFFSET 144
+#define TQ_META_ESTIMATOR_VERSION_OFFSET 148
 
 #define TQ_LIST_DIR_ENTRY_CAPACITY_OFFSET 8
 #define TQ_LIST_DIR_ENTRY_COUNT_OFFSET 10
@@ -89,6 +102,11 @@
 #define TQ_BATCH_SUMMARY_ENTRY_CAPACITY_OFFSET 12
 #define TQ_BATCH_SUMMARY_ENTRY_COUNT_OFFSET 14
 #define TQ_BATCH_SUMMARY_NEXT_BLOCK_OFFSET 16
+
+#define TQ_EXACT_KEY_BYTES_OFFSET 8
+#define TQ_EXACT_KEY_ENTRY_CAPACITY_OFFSET 12
+#define TQ_EXACT_KEY_ENTRY_COUNT_OFFSET 14
+#define TQ_EXACT_KEY_NEXT_BLOCK_OFFSET 16
 
 static void
 tq_set_error(char *errmsg, size_t errmsg_len, const char *message)
@@ -169,6 +187,20 @@ tq_read_float32(const uint8_t *src, size_t offset)
 
 	memcpy(&value, &bits, sizeof(value));
 	return value;
+}
+
+static void
+tq_write_exact_key_ref(uint8_t *dst, size_t offset, const TqExactKeyRef *key_ref)
+{
+	tq_write_u32(dst, offset, key_ref->block_number);
+	tq_write_u16(dst, offset + 4, key_ref->entry_index);
+}
+
+static void
+tq_read_exact_key_ref(const uint8_t *src, size_t offset, TqExactKeyRef *key_ref)
+{
+	key_ref->block_number = tq_read_u32(src, offset);
+	key_ref->entry_index = tq_read_u16(src, offset + 4);
 }
 
 static uint16_t
@@ -311,20 +343,22 @@ tq_list_dir_validate_index(const uint8_t *page,
 
 /* Forward declarations for SoA offset helpers (defined after tq_bitmap_bytes_for_lanes) */
 static size_t tq_batch_soa_tid_array_offset(uint16_t lane_count);
-static size_t tq_batch_soa_filter_array_offset(uint16_t lane_count);
-static size_t tq_batch_soa_gamma_array_offset(uint16_t lane_count, uint16_t int4_attribute_count);
-static size_t tq_batch_soa_nibble_block_offset(uint16_t lane_count, uint16_t int4_attribute_count);
+static size_t tq_batch_soa_metadata_array_offset(uint16_t lane_count);
+static size_t tq_batch_soa_exact_key_ref_array_offset(uint16_t lane_count,
+													  uint16_t metadata_attribute_count);
+static size_t tq_batch_soa_gamma_array_offset(uint16_t lane_count, uint16_t metadata_attribute_count);
+static size_t tq_batch_soa_nibble_block_offset(uint16_t lane_count, uint16_t metadata_attribute_count);
 static size_t tq_batch_soa_representative_offset(uint16_t lane_count, uint32_t dimension,
-												 uint16_t int4_attribute_count);
+												 uint16_t metadata_attribute_count);
 static bool tq_batch_is_soa_page(const uint8_t *page);
 static size_t tq_batch_entry_stride_from_layout(const uint8_t *page);
 static size_t tq_batch_required_bytes_internal(uint16_t lane_count,
 											   uint32_t code_bytes,
-											   uint16_t int4_attribute_count);
+											   uint16_t metadata_attribute_count);
 static size_t tq_batch_soa_required_bytes_internal(uint16_t lane_count,
 												   uint32_t dimension,
 												   uint32_t representative_code_bytes,
-												   uint16_t int4_attribute_count);
+												   uint16_t metadata_attribute_count);
 
 static bool
 tq_batch_validate_header(const uint8_t *page,
@@ -336,7 +370,7 @@ tq_batch_validate_header(const uint8_t *page,
 	uint32_t	code_bytes = 0;
 	uint16_t	total_bytes = 0;
 	uint16_t	flags = 0;
-	uint16_t	int4_attribute_count = 0;
+	uint16_t	metadata_attribute_count = 0;
 
 	if (!tq_validate_page_common(page, page_size, TQ_PAGE_KIND_BATCH,
 								 TQ_BATCH_PAGE_HEADER_BYTES, errmsg, errmsg_len))
@@ -346,7 +380,7 @@ tq_batch_validate_header(const uint8_t *page,
 	code_bytes = tq_read_u32(page, TQ_BATCH_CODE_BYTES_OFFSET);
 	total_bytes = tq_read_u16(page, TQ_BATCH_TOTAL_BYTES_OFFSET);
 	flags = tq_read_u16(page, TQ_BATCH_FLAGS_OFFSET);
-	int4_attribute_count = tq_batch_flag_int4_attribute_count(flags);
+	metadata_attribute_count = tq_batch_flag_int4_attribute_count(flags);
 
 	if (lane_count == 0 || code_bytes == 0)
 	{
@@ -363,10 +397,10 @@ tq_batch_validate_header(const uint8_t *page,
 		return false;
 	}
 
-	if (int4_attribute_count > TQ_MAX_STORED_INT4_ATTRIBUTES)
+	if (metadata_attribute_count > TQ_MAX_STORED_METADATA_ATTRIBUTES)
 	{
 		tq_set_error(errmsg, errmsg_len,
-					 "invalid turboquant batch page: unsupported int4 attribute count");
+					 "invalid turboquant batch page: unsupported metadata attribute count");
 		return false;
 	}
 
@@ -388,7 +422,7 @@ tq_batch_validate_header(const uint8_t *page,
 		}
 
 		expected_total = tq_batch_soa_representative_offset(lane_count, dimension,
-															int4_attribute_count)
+															metadata_attribute_count)
 						 + (size_t) code_bytes;
 		if ((size_t) total_bytes != expected_total)
 		{
@@ -405,7 +439,7 @@ tq_batch_validate_header(const uint8_t *page,
 		if ((size_t) total_bytes != tq_batch_required_bytes_internal(
 				lane_count,
 				code_bytes,
-				int4_attribute_count))
+				metadata_attribute_count))
 		{
 			tq_set_error(errmsg, errmsg_len,
 						 "invalid turboquant batch page: total bytes do not match layout");
@@ -416,7 +450,8 @@ tq_batch_validate_header(const uint8_t *page,
 										   + tq_bitmap_bytes_for_lanes(lane_count));
 		expected_code_offset = (uint16_t) (expected_tid_offset
 										   + TQ_TID_STORAGE_BYTES
-										   + ((size_t) int4_attribute_count * sizeof(int32_t)));
+										   + tq_metadata_block_bytes(metadata_attribute_count)
+										   + TQ_EXACT_KEY_REF_BYTES);
 
 		if (tq_read_u16(page, TQ_BATCH_TID_OFFSET_OFFSET) != expected_tid_offset)
 		{
@@ -614,12 +649,19 @@ tq_batch_filter_int4_offset(const uint8_t *page, uint16_t lane_index)
 }
 
 static size_t
-tq_batch_int4_attribute_offset(const uint8_t *page,
-								   uint16_t lane_index,
-								   uint16_t attribute_index)
+tq_batch_metadata_nullmask_offset(const uint8_t *page, uint16_t lane_index)
 {
-	return tq_batch_filter_int4_offset(page, lane_index)
-		+ ((size_t) attribute_index * sizeof(int32_t));
+	return tq_batch_filter_int4_offset(page, lane_index);
+}
+
+static size_t
+tq_batch_exact_key_ref_offset(const uint8_t *page, uint16_t lane_index)
+{
+	uint16_t metadata_attribute_count = tq_batch_flag_int4_attribute_count(
+		tq_read_u16(page, TQ_BATCH_FLAGS_OFFSET));
+
+	return tq_batch_metadata_nullmask_offset(page, lane_index)
+		+ tq_metadata_block_bytes(metadata_attribute_count);
 }
 
 static size_t
@@ -629,43 +671,50 @@ tq_batch_soa_tid_array_offset(uint16_t lane_count)
 }
 
 static size_t
-tq_batch_soa_filter_array_offset(uint16_t lane_count)
+tq_batch_soa_metadata_array_offset(uint16_t lane_count)
 {
 	return tq_batch_soa_tid_array_offset(lane_count)
 		+ (size_t) lane_count * TQ_TID_STORAGE_BYTES;
 }
 
 static size_t
-tq_batch_soa_int4_attribute_offset(uint16_t lane_count,
+tq_batch_soa_metadata_block_offset(uint16_t lane_count,
 								   uint16_t lane_index,
-								   uint16_t attribute_index)
+								   uint16_t metadata_attribute_count)
 {
-	return tq_batch_soa_filter_array_offset(lane_count)
-		+ ((((size_t) attribute_index * (size_t) lane_count) + (size_t) lane_index)
-		   * sizeof(int32_t));
+	return tq_batch_soa_metadata_array_offset(lane_count)
+		+ (size_t) lane_index * tq_metadata_block_bytes(metadata_attribute_count);
 }
 
 static size_t
-tq_batch_soa_gamma_array_offset(uint16_t lane_count, uint16_t int4_attribute_count)
+tq_batch_soa_exact_key_ref_array_offset(uint16_t lane_count,
+											uint16_t metadata_attribute_count)
 {
-	return tq_batch_soa_filter_array_offset(lane_count)
-		+ ((size_t) lane_count * (size_t) int4_attribute_count * sizeof(int32_t));
+	return tq_batch_soa_metadata_array_offset(lane_count)
+		+ (size_t) lane_count * tq_metadata_block_bytes(metadata_attribute_count);
 }
 
 static size_t
-tq_batch_soa_nibble_block_offset(uint16_t lane_count, uint16_t int4_attribute_count)
+tq_batch_soa_gamma_array_offset(uint16_t lane_count, uint16_t metadata_attribute_count)
 {
-	return tq_batch_soa_gamma_array_offset(lane_count, int4_attribute_count)
+	return tq_batch_soa_exact_key_ref_array_offset(lane_count, metadata_attribute_count)
+		+ (size_t) lane_count * TQ_EXACT_KEY_REF_BYTES;
+}
+
+static size_t
+tq_batch_soa_nibble_block_offset(uint16_t lane_count, uint16_t metadata_attribute_count)
+{
+	return tq_batch_soa_gamma_array_offset(lane_count, metadata_attribute_count)
 		+ (size_t) lane_count * sizeof(float);
 }
 
 static size_t
 tq_batch_soa_representative_offset(uint16_t lane_count, uint32_t dimension,
-								   uint16_t int4_attribute_count)
+								   uint16_t metadata_attribute_count)
 {
 	size_t	nibble_pair_cols = ((size_t) lane_count + 1u) / 2u;
 
-	return tq_batch_soa_nibble_block_offset(lane_count, int4_attribute_count)
+	return tq_batch_soa_nibble_block_offset(lane_count, metadata_attribute_count)
 		+ (size_t) dimension * nibble_pair_cols;
 }
 
@@ -732,16 +781,17 @@ tq_bitmap_bytes_for_lanes(uint16_t lane_count)
 size_t
 tq_batch_page_required_bytes(uint16_t lane_count, uint32_t code_bytes)
 {
-	return tq_batch_required_bytes_internal(lane_count, code_bytes, false);
+	return tq_batch_required_bytes_internal(lane_count, code_bytes, 0);
 }
 
 static size_t
 tq_batch_required_bytes_internal(uint16_t lane_count,
 								 uint32_t code_bytes,
-								 uint16_t int4_attribute_count)
+								 uint16_t metadata_attribute_count)
 {
 	size_t per_lane_bytes = (size_t) TQ_TID_STORAGE_BYTES
-		+ ((size_t) int4_attribute_count * sizeof(int32_t))
+		+ tq_metadata_block_bytes(metadata_attribute_count)
+		+ (size_t) TQ_EXACT_KEY_REF_BYTES
 		+ (size_t) code_bytes;
 
 	return (size_t) TQ_BATCH_PAGE_HEADER_BYTES
@@ -753,9 +803,9 @@ static size_t
 tq_batch_soa_required_bytes_internal(uint16_t lane_count,
 									 uint32_t dimension,
 									 uint32_t representative_code_bytes,
-									 uint16_t int4_attribute_count)
+									 uint16_t metadata_attribute_count)
 {
-	return tq_batch_soa_representative_offset(lane_count, dimension, int4_attribute_count)
+	return tq_batch_soa_representative_offset(lane_count, dimension, metadata_attribute_count)
 		+ (size_t) representative_code_bytes;
 }
 
@@ -810,6 +860,23 @@ tq_batch_summary_page_capacity(size_t page_size, uint32_t code_bytes)
 
 	return (uint16_t) ((page_size - TQ_BATCH_SUMMARY_PAGE_HEADER_BYTES)
 					   / tq_batch_summary_entry_bytes(code_bytes));
+}
+
+size_t
+tq_exact_key_page_required_bytes(uint16_t entry_capacity, uint32_t key_bytes)
+{
+	return (size_t) TQ_EXACT_KEY_PAGE_HEADER_BYTES
+		+ ((size_t) entry_capacity * (size_t) key_bytes);
+}
+
+uint16_t
+tq_exact_key_page_capacity(size_t page_size, uint32_t key_bytes)
+{
+	if (key_bytes == 0 || page_size <= TQ_EXACT_KEY_PAGE_HEADER_BYTES)
+		return 0;
+
+	return (uint16_t) ((page_size - TQ_EXACT_KEY_PAGE_HEADER_BYTES)
+					   / (size_t) key_bytes);
 }
 
 bool
@@ -869,6 +936,13 @@ tq_meta_page_init(void *page,
 	tq_write_float32(bytes, TQ_META_ROUTER_COEFF_VAR_OFFSET, fields->router_coeff_var);
 	tq_write_float32(bytes, TQ_META_ROUTER_BALANCE_PENALTY_OFFSET, fields->router_balance_penalty);
 	tq_write_float32(bytes, TQ_META_ROUTER_SELECTION_SCORE_OFFSET, fields->router_selection_score);
+	tq_write_u32(bytes, TQ_META_DELTA_HEAD_BLOCK_OFFSET, fields->delta_head_block);
+	tq_write_u32(bytes, TQ_META_DELTA_TAIL_BLOCK_OFFSET, fields->delta_tail_block);
+	tq_write_u32(bytes, TQ_META_DELTA_LIVE_COUNT_OFFSET, fields->delta_live_count);
+	tq_write_u32(bytes, TQ_META_DELTA_BATCH_PAGE_COUNT_OFFSET, fields->delta_batch_page_count);
+	tq_write_u32(bytes, TQ_META_EXACT_KEY_HEAD_BLOCK_OFFSET, fields->exact_key_head_block);
+	tq_write_u32(bytes, TQ_META_EXACT_KEY_TAIL_BLOCK_OFFSET, fields->exact_key_tail_block);
+	tq_write_u32(bytes, TQ_META_EXACT_KEY_PAGE_COUNT_OFFSET, fields->exact_key_page_count);
 	tq_write_u16(bytes, TQ_META_ALGORITHM_VERSION_OFFSET, fields->algorithm_version);
 	tq_write_u16(bytes, TQ_META_QUANTIZER_VERSION_OFFSET, fields->quantizer_version);
 	tq_write_u16(bytes, TQ_META_RESIDUAL_SKETCH_VERSION_OFFSET, fields->residual_sketch_version);
@@ -937,6 +1011,13 @@ tq_meta_page_read(const void *page,
 	fields->router_coeff_var = tq_read_float32(bytes, TQ_META_ROUTER_COEFF_VAR_OFFSET);
 	fields->router_balance_penalty = tq_read_float32(bytes, TQ_META_ROUTER_BALANCE_PENALTY_OFFSET);
 	fields->router_selection_score = tq_read_float32(bytes, TQ_META_ROUTER_SELECTION_SCORE_OFFSET);
+	fields->delta_head_block = tq_read_u32(bytes, TQ_META_DELTA_HEAD_BLOCK_OFFSET);
+	fields->delta_tail_block = tq_read_u32(bytes, TQ_META_DELTA_TAIL_BLOCK_OFFSET);
+	fields->delta_live_count = tq_read_u32(bytes, TQ_META_DELTA_LIVE_COUNT_OFFSET);
+	fields->delta_batch_page_count = tq_read_u32(bytes, TQ_META_DELTA_BATCH_PAGE_COUNT_OFFSET);
+	fields->exact_key_head_block = tq_read_u32(bytes, TQ_META_EXACT_KEY_HEAD_BLOCK_OFFSET);
+	fields->exact_key_tail_block = tq_read_u32(bytes, TQ_META_EXACT_KEY_TAIL_BLOCK_OFFSET);
+	fields->exact_key_page_count = tq_read_u32(bytes, TQ_META_EXACT_KEY_PAGE_COUNT_OFFSET);
 	fields->algorithm_version = tq_read_u16(bytes, TQ_META_ALGORITHM_VERSION_OFFSET);
 	fields->quantizer_version = tq_read_u16(bytes, TQ_META_QUANTIZER_VERSION_OFFSET);
 	fields->residual_sketch_version = tq_read_u16(bytes, TQ_META_RESIDUAL_SKETCH_VERSION_OFFSET);
@@ -957,7 +1038,61 @@ tq_meta_page_read(const void *page,
 						 "invalid turboquant meta page: empty indexes must not store transform output dimension");
 			return false;
 		}
+		if (fields->delta_head_block != TQ_INVALID_BLOCK_NUMBER
+			|| fields->delta_tail_block != TQ_INVALID_BLOCK_NUMBER
+			|| fields->delta_live_count != 0
+			|| fields->delta_batch_page_count != 0
+			|| fields->exact_key_head_block != TQ_INVALID_BLOCK_NUMBER
+			|| fields->exact_key_tail_block != TQ_INVALID_BLOCK_NUMBER
+			|| fields->exact_key_page_count != 0)
+		{
+			tq_set_error(errmsg, errmsg_len,
+						 "invalid turboquant meta page: empty indexes must not store delta or exact-key state");
+			return false;
+		}
 		return true;
+	}
+	if ((fields->delta_head_block == TQ_INVALID_BLOCK_NUMBER)
+		!= (fields->delta_tail_block == TQ_INVALID_BLOCK_NUMBER))
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant meta page: delta head/tail must be both valid or both invalid");
+		return false;
+	}
+	if (fields->delta_head_block == TQ_INVALID_BLOCK_NUMBER
+		&& (fields->delta_live_count != 0 || fields->delta_batch_page_count != 0))
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant meta page: empty delta state must not carry counts");
+		return false;
+	}
+	if (fields->delta_head_block != TQ_INVALID_BLOCK_NUMBER
+		&& (fields->delta_live_count == 0 || fields->delta_batch_page_count == 0))
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant meta page: populated delta state requires nonzero counts");
+		return false;
+	}
+	if ((fields->exact_key_head_block == TQ_INVALID_BLOCK_NUMBER)
+		!= (fields->exact_key_tail_block == TQ_INVALID_BLOCK_NUMBER))
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant meta page: exact-key head/tail must be both valid or both invalid");
+		return false;
+	}
+	if (fields->exact_key_head_block == TQ_INVALID_BLOCK_NUMBER
+		&& fields->exact_key_page_count != 0)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant meta page: empty exact-key state must not carry counts");
+		return false;
+	}
+	if (fields->exact_key_head_block != TQ_INVALID_BLOCK_NUMBER
+		&& fields->exact_key_page_count == 0)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant meta page: populated exact-key state requires nonzero page count");
+		return false;
 	}
 	if (fields->transform_output_dimension != tq_transform_padded_dimension(fields->dimension))
 	{
@@ -1465,6 +1600,196 @@ tq_batch_summary_page_get_entry(const void *page,
 }
 
 bool
+tq_exact_key_page_init(void *page,
+					   size_t page_size,
+					   uint32_t key_bytes,
+					   uint16_t entry_capacity,
+					   uint32_t next_block,
+					   char *errmsg,
+					   size_t errmsg_len)
+{
+	uint8_t *bytes = (uint8_t *) page;
+	size_t required_bytes = tq_exact_key_page_required_bytes(entry_capacity, key_bytes);
+
+	if (page == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant exact key page: page must be non-null");
+		return false;
+	}
+	if (key_bytes == 0 || entry_capacity == 0)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant exact key page: key bytes and capacity must be positive");
+		return false;
+	}
+	if (page_size < required_bytes)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant exact key page: page buffer is too small for requested capacity");
+		return false;
+	}
+
+	memset(page, 0, page_size);
+	tq_write_page_common(bytes, TQ_PAGE_KIND_EXACT_KEY, TQ_EXACT_KEY_PAGE_HEADER_BYTES);
+	tq_write_u32(bytes, TQ_EXACT_KEY_BYTES_OFFSET, key_bytes);
+	tq_write_u16(bytes, TQ_EXACT_KEY_ENTRY_CAPACITY_OFFSET, entry_capacity);
+	tq_write_u16(bytes, TQ_EXACT_KEY_ENTRY_COUNT_OFFSET, 0);
+	tq_write_u32(bytes, TQ_EXACT_KEY_NEXT_BLOCK_OFFSET, next_block);
+	return true;
+}
+
+bool
+tq_exact_key_page_read_header(const void *page,
+							  size_t page_size,
+							  TqExactKeyPageHeaderView *header,
+							  char *errmsg,
+							  size_t errmsg_len)
+{
+	const uint8_t *bytes = (const uint8_t *) page;
+
+	if (page == NULL || header == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant exact key page: page and header must be non-null");
+		return false;
+	}
+	if (!tq_validate_page_common(bytes,
+								 page_size,
+								 TQ_PAGE_KIND_EXACT_KEY,
+								 TQ_EXACT_KEY_PAGE_HEADER_BYTES,
+								 errmsg,
+								 errmsg_len))
+		return false;
+
+	header->key_bytes = tq_read_u32(bytes, TQ_EXACT_KEY_BYTES_OFFSET);
+	header->entry_capacity = tq_read_u16(bytes, TQ_EXACT_KEY_ENTRY_CAPACITY_OFFSET);
+	header->entry_count = tq_read_u16(bytes, TQ_EXACT_KEY_ENTRY_COUNT_OFFSET);
+	header->next_block = tq_read_u32(bytes, TQ_EXACT_KEY_NEXT_BLOCK_OFFSET);
+	if (header->key_bytes == 0 || header->entry_capacity == 0 || header->entry_count > header->entry_capacity)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant exact key page: header fields are inconsistent");
+		return false;
+	}
+	if (tq_exact_key_page_required_bytes(header->entry_capacity, header->key_bytes) > page_size)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant exact key page: storage exceeds page size");
+		return false;
+	}
+	return true;
+}
+
+bool
+tq_exact_key_page_set_next_block(void *page,
+								 size_t page_size,
+								 uint32_t next_block,
+								 char *errmsg,
+								 size_t errmsg_len)
+{
+	uint8_t *bytes = (uint8_t *) page;
+	TqExactKeyPageHeaderView header;
+
+	if (page == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant exact key page: page must be non-null");
+		return false;
+	}
+	memset(&header, 0, sizeof(header));
+	if (!tq_exact_key_page_read_header(page, page_size, &header, errmsg, errmsg_len))
+		return false;
+
+	tq_write_u32(bytes, TQ_EXACT_KEY_NEXT_BLOCK_OFFSET, next_block);
+	return true;
+}
+
+bool
+tq_exact_key_page_append_entry(void *page,
+							   size_t page_size,
+							   const uint8_t *key_bytes,
+							   size_t key_len,
+							   uint16_t *entry_index,
+							   char *errmsg,
+							   size_t errmsg_len)
+{
+	uint8_t *bytes = (uint8_t *) page;
+	TqExactKeyPageHeaderView header;
+	size_t offset = 0;
+
+	memset(&header, 0, sizeof(header));
+	if (page == NULL || key_bytes == NULL || entry_index == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant exact key page: page, key bytes, and entry output must be non-null");
+		return false;
+	}
+	if (!tq_exact_key_page_read_header(page, page_size, &header, errmsg, errmsg_len))
+		return false;
+	if (key_len != (size_t) header.key_bytes)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant exact key page: key length does not match page layout");
+		return false;
+	}
+	if (header.entry_count >= header.entry_capacity)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant exact key page: no free entries remain");
+		return false;
+	}
+
+	offset = (size_t) TQ_EXACT_KEY_PAGE_HEADER_BYTES
+		+ ((size_t) header.entry_count * (size_t) header.key_bytes);
+	memcpy(bytes + offset, key_bytes, key_len);
+	*entry_index = header.entry_count;
+	tq_write_u16(bytes, TQ_EXACT_KEY_ENTRY_COUNT_OFFSET, (uint16_t) (header.entry_count + 1));
+	return true;
+}
+
+bool
+tq_exact_key_page_get_entry(const void *page,
+							size_t page_size,
+							uint16_t entry_index,
+							uint8_t *key_bytes,
+							size_t key_len,
+							char *errmsg,
+							size_t errmsg_len)
+{
+	const uint8_t *bytes = (const uint8_t *) page;
+	TqExactKeyPageHeaderView header;
+	size_t offset = 0;
+
+	memset(&header, 0, sizeof(header));
+	if (page == NULL || key_bytes == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant exact key page: page and key output must be non-null");
+		return false;
+	}
+	if (!tq_exact_key_page_read_header(page, page_size, &header, errmsg, errmsg_len))
+		return false;
+	if (entry_index >= header.entry_count)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant exact key page: entry has not been initialized");
+		return false;
+	}
+	if (key_len < (size_t) header.key_bytes)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant exact key page: key output buffer is too small");
+		return false;
+	}
+
+	offset = (size_t) TQ_EXACT_KEY_PAGE_HEADER_BYTES
+		+ ((size_t) entry_index * (size_t) header.key_bytes);
+	memcpy(key_bytes, bytes + offset, (size_t) header.key_bytes);
+	return true;
+}
+
+bool
 tq_batch_page_init(void *page,
 				   size_t page_size,
 				   const TqBatchPageParams *params,
@@ -1488,7 +1813,7 @@ tq_batch_page_init(void *page,
 		/* SoA nibble layout */
 		total_bytes = tq_batch_soa_representative_offset(params->lane_count,
 														 params->dimension,
-														 params->int4_attribute_count)
+														 params->metadata_attribute_count)
 					  + (size_t) params->code_bytes;
 
 		if (params->lane_count == 0 || params->code_bytes == 0
@@ -1499,14 +1824,14 @@ tq_batch_page_init(void *page,
 			return false;
 		}
 
-		if (params->int4_attribute_count > TQ_MAX_STORED_INT4_ATTRIBUTES)
+		if (params->metadata_attribute_count > TQ_MAX_STORED_METADATA_ATTRIBUTES)
 		{
 			tq_set_error(errmsg, errmsg_len,
-						 "invalid turboquant batch page: too many int4 attributes");
+						 "invalid turboquant batch page: too many metadata attributes");
 			return false;
 		}
 
-		flags = tq_batch_make_flags(true, params->int4_attribute_count);
+		flags = tq_batch_make_flags(true, params->metadata_attribute_count);
 
 		memset(page, 0, page_size);
 		tq_write_page_common(bytes, TQ_PAGE_KIND_BATCH, TQ_BATCH_PAGE_HEADER_BYTES);
@@ -1533,27 +1858,28 @@ tq_batch_page_init(void *page,
 
 		if (tq_batch_required_bytes_internal(params->lane_count,
 											 params->code_bytes,
-											 params->int4_attribute_count) > page_size)
+											 params->metadata_attribute_count) > page_size)
 		{
 			tq_set_error(errmsg, errmsg_len,
 						 "invalid turboquant batch page: requested layout does not fit on the page");
 			return false;
 		}
 
-		if (params->int4_attribute_count > TQ_MAX_STORED_INT4_ATTRIBUTES)
+		if (params->metadata_attribute_count > TQ_MAX_STORED_METADATA_ATTRIBUTES)
 		{
 			tq_set_error(errmsg, errmsg_len,
-						 "invalid turboquant batch page: too many int4 attributes");
+						 "invalid turboquant batch page: too many metadata attributes");
 			return false;
 		}
 
 		tid_offset = bitmap_offset + tq_bitmap_bytes_for_lanes(params->lane_count);
 		code_offset = tid_offset + (size_t) TQ_TID_STORAGE_BYTES
-			+ ((size_t) params->int4_attribute_count * sizeof(int32_t));
+			+ tq_metadata_block_bytes(params->metadata_attribute_count)
+			+ (size_t) TQ_EXACT_KEY_REF_BYTES;
 		total_bytes = tq_batch_required_bytes_internal(params->lane_count,
 													   params->code_bytes,
-													   params->int4_attribute_count);
-		flags = tq_batch_make_flags(false, params->int4_attribute_count);
+													   params->metadata_attribute_count);
+		flags = tq_batch_make_flags(false, params->metadata_attribute_count);
 
 		memset(page, 0, page_size);
 		tq_write_page_common(bytes, TQ_PAGE_KIND_BATCH, TQ_BATCH_PAGE_HEADER_BYTES);
@@ -1823,13 +2149,29 @@ tq_batch_page_append_lane(void *page,
 		/* SoA layout: write TID to contiguous TID array */
 		size_t	tid_off = tq_batch_soa_tid_array_offset(lane_count)
 						  + (size_t) occupied_count * TQ_TID_STORAGE_BYTES;
+		size_t	key_ref_off;
+		uint16_t metadata_attribute_count = tq_batch_flag_int4_attribute_count(
+			tq_read_u16(bytes, TQ_BATCH_FLAGS_OFFSET));
+		TqExactKeyRef invalid_key_ref;
 
 		tq_write_u32(bytes, tid_off, tid->block_number);
 		tq_write_u16(bytes, tid_off + 4, tid->offset_number);
+		invalid_key_ref.block_number = TQ_INVALID_BLOCK_NUMBER;
+		invalid_key_ref.entry_index = UINT16_MAX;
+		key_ref_off = tq_batch_soa_exact_key_ref_array_offset(lane_count, metadata_attribute_count)
+			+ (size_t) occupied_count * TQ_EXACT_KEY_REF_BYTES;
+		tq_write_exact_key_ref(bytes, key_ref_off, &invalid_key_ref);
 	}
 	else
 	{
+		TqExactKeyRef invalid_key_ref;
+
 		tq_write_tid(bytes, occupied_count, tid);
+		invalid_key_ref.block_number = TQ_INVALID_BLOCK_NUMBER;
+		invalid_key_ref.entry_index = UINT16_MAX;
+		tq_write_exact_key_ref(bytes,
+							 tq_batch_exact_key_ref_offset(bytes, occupied_count),
+							 &invalid_key_ref);
 	}
 
 	tq_batch_set_live(bytes, occupied_count, true);
@@ -1885,11 +2227,109 @@ tq_batch_page_get_tid(const void *page,
 }
 
 bool
+tq_batch_page_set_exact_key_ref(void *page,
+								size_t page_size,
+								uint16_t lane_index,
+								const TqExactKeyRef *key_ref,
+								char *errmsg,
+								size_t errmsg_len)
+{
+	uint8_t *bytes = (uint8_t *) page;
+	size_t offset = 0;
+
+	if (page == NULL || key_ref == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant batch page: page and exact key ref must be non-null");
+		return false;
+	}
+	if (!tq_batch_validate_header(bytes, page_size, errmsg, errmsg_len))
+		return false;
+	if (lane_index >= tq_read_u16(bytes, TQ_BATCH_OCCUPIED_COUNT_OFFSET))
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant batch page: lane index is not occupied");
+		return false;
+	}
+
+	if (tq_batch_is_soa_page(bytes))
+	{
+		uint16_t lane_count = tq_read_u16(bytes, TQ_BATCH_LANE_COUNT_OFFSET);
+		uint16_t metadata_attribute_count = tq_batch_flag_int4_attribute_count(
+			tq_read_u16(bytes, TQ_BATCH_FLAGS_OFFSET));
+
+		offset = tq_batch_soa_exact_key_ref_array_offset(lane_count, metadata_attribute_count)
+			+ ((size_t) lane_index * TQ_EXACT_KEY_REF_BYTES);
+	}
+	else
+		offset = tq_batch_exact_key_ref_offset(bytes, lane_index);
+
+	tq_write_exact_key_ref(bytes, offset, key_ref);
+	return true;
+}
+
+bool
+tq_batch_page_get_exact_key_ref(const void *page,
+								size_t page_size,
+								uint16_t lane_index,
+								TqExactKeyRef *key_ref,
+								char *errmsg,
+								size_t errmsg_len)
+{
+	const uint8_t *bytes = (const uint8_t *) page;
+	size_t offset = 0;
+
+	if (page == NULL || key_ref == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant batch page: page and exact key ref output must be non-null");
+		return false;
+	}
+	if (!tq_batch_validate_header(bytes, page_size, errmsg, errmsg_len))
+		return false;
+	if (lane_index >= tq_read_u16(bytes, TQ_BATCH_OCCUPIED_COUNT_OFFSET))
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant batch page: lane index is not occupied");
+		return false;
+	}
+
+	if (tq_batch_is_soa_page(bytes))
+	{
+		uint16_t lane_count = tq_read_u16(bytes, TQ_BATCH_LANE_COUNT_OFFSET);
+		uint16_t metadata_attribute_count = tq_batch_flag_int4_attribute_count(
+			tq_read_u16(bytes, TQ_BATCH_FLAGS_OFFSET));
+
+		offset = tq_batch_soa_exact_key_ref_array_offset(lane_count, metadata_attribute_count)
+			+ ((size_t) lane_index * TQ_EXACT_KEY_REF_BYTES);
+	}
+	else
+		offset = tq_batch_exact_key_ref_offset(bytes, lane_index);
+
+	tq_read_exact_key_ref(bytes, offset, key_ref);
+	return true;
+}
+
+bool
 tq_batch_page_get_int4_attribute_count(const void *page,
 									   size_t page_size,
 									   uint16_t *attribute_count,
 									   char *errmsg,
 									   size_t errmsg_len)
+{
+	return tq_batch_page_get_metadata_attribute_count(page,
+													  page_size,
+													  attribute_count,
+													  errmsg,
+													  errmsg_len);
+}
+
+bool
+tq_batch_page_get_metadata_attribute_count(const void *page,
+										   size_t page_size,
+										   uint16_t *attribute_count,
+										   char *errmsg,
+										   size_t errmsg_len)
 {
 	const uint8_t *bytes = (const uint8_t *) page;
 
@@ -1909,6 +2349,121 @@ tq_batch_page_get_int4_attribute_count(const void *page,
 }
 
 bool
+tq_batch_page_set_metadata_block(void *page,
+								 size_t page_size,
+								 uint16_t lane_index,
+								 const uint8_t *metadata_values,
+								 uint16_t metadata_attribute_count,
+								 uint16_t metadata_nullmask,
+								 char *errmsg,
+								 size_t errmsg_len)
+{
+	uint8_t *bytes = (uint8_t *) page;
+	uint16_t stored_attribute_count = 0;
+	size_t offset = 0;
+	size_t block_bytes = 0;
+
+	if (page == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant batch page: page must be non-null");
+		return false;
+	}
+
+	if (!tq_batch_page_get_metadata_attribute_count(page, page_size,
+													&stored_attribute_count,
+													errmsg, errmsg_len))
+		return false;
+	if (stored_attribute_count != metadata_attribute_count)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant batch page: metadata attribute count does not match page layout");
+		return false;
+	}
+	if (lane_index >= tq_read_u16(bytes, TQ_BATCH_OCCUPIED_COUNT_OFFSET))
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant batch page: lane index is not occupied");
+		return false;
+	}
+
+	block_bytes = tq_metadata_block_bytes(metadata_attribute_count);
+	if (tq_batch_is_soa_page(bytes))
+	{
+		uint16_t lane_count = tq_read_u16(bytes, TQ_BATCH_LANE_COUNT_OFFSET);
+
+		offset = tq_batch_soa_metadata_block_offset(lane_count, lane_index, metadata_attribute_count);
+	}
+	else
+		offset = tq_batch_metadata_nullmask_offset(bytes, lane_index);
+
+	tq_write_u16(bytes, offset, metadata_nullmask);
+	if (metadata_attribute_count > 0 && metadata_values != NULL)
+		memcpy(bytes + offset + TQ_METADATA_NULLMASK_BYTES,
+			   metadata_values,
+			   block_bytes - TQ_METADATA_NULLMASK_BYTES);
+	return true;
+}
+
+bool
+tq_batch_page_get_metadata_block(const void *page,
+								 size_t page_size,
+								 uint16_t lane_index,
+								 uint8_t *metadata_values,
+								 uint16_t metadata_attribute_count,
+								 uint16_t *metadata_nullmask,
+								 char *errmsg,
+								 size_t errmsg_len)
+{
+	const uint8_t *bytes = (const uint8_t *) page;
+	uint16_t stored_attribute_count = 0;
+	size_t offset = 0;
+	size_t block_bytes = 0;
+
+	if (page == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant batch page: page must be non-null");
+		return false;
+	}
+
+	if (!tq_batch_page_get_metadata_attribute_count(page, page_size,
+													&stored_attribute_count,
+													errmsg, errmsg_len))
+		return false;
+	if (stored_attribute_count != metadata_attribute_count)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant batch page: metadata attribute count does not match page layout");
+		return false;
+	}
+	if (lane_index >= tq_read_u16(bytes, TQ_BATCH_OCCUPIED_COUNT_OFFSET))
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant batch page: lane index is not occupied");
+		return false;
+	}
+
+	block_bytes = tq_metadata_block_bytes(metadata_attribute_count);
+	if (tq_batch_is_soa_page(bytes))
+	{
+		uint16_t lane_count = tq_read_u16(bytes, TQ_BATCH_LANE_COUNT_OFFSET);
+
+		offset = tq_batch_soa_metadata_block_offset(lane_count, lane_index, metadata_attribute_count);
+	}
+	else
+		offset = tq_batch_metadata_nullmask_offset(bytes, lane_index);
+
+	if (metadata_nullmask != NULL)
+		*metadata_nullmask = tq_read_u16(bytes, offset);
+	if (metadata_attribute_count > 0 && metadata_values != NULL)
+		memcpy(metadata_values,
+			   bytes + offset + TQ_METADATA_NULLMASK_BYTES,
+			   block_bytes - TQ_METADATA_NULLMASK_BYTES);
+	return true;
+}
+
+bool
 tq_batch_page_set_int4_attribute(void *page,
 								 size_t page_size,
 								 uint16_t lane_index,
@@ -1919,6 +2474,8 @@ tq_batch_page_set_int4_attribute(void *page,
 {
 	uint8_t *bytes = (uint8_t *) page;
 	uint16_t attribute_count = 0;
+	uint16_t nullmask = 0;
+	uint8_t metadata_values[TQ_MAX_STORED_METADATA_ATTRIBUTES * TQ_METADATA_SLOT_BYTES];
 	size_t offset = 0;
 
 	if (page == NULL)
@@ -1928,8 +2485,8 @@ tq_batch_page_set_int4_attribute(void *page,
 		return false;
 	}
 
-	if (!tq_batch_page_get_int4_attribute_count(page, page_size, &attribute_count,
-												errmsg, errmsg_len))
+	if (!tq_batch_page_get_metadata_attribute_count(page, page_size, &attribute_count,
+													errmsg, errmsg_len))
 		return false;
 
 	if (attribute_count == 0 || attribute_index >= attribute_count)
@@ -1946,17 +2503,28 @@ tq_batch_page_set_int4_attribute(void *page,
 		return false;
 	}
 
-	if (tq_batch_is_soa_page(bytes))
-	{
-		uint16_t lane_count = tq_read_u16(bytes, TQ_BATCH_LANE_COUNT_OFFSET);
+	memset(metadata_values, 0, sizeof(metadata_values));
+	if (!tq_batch_page_get_metadata_block(page,
+										  page_size,
+										  lane_index,
+										  metadata_values,
+										  attribute_count,
+										  &nullmask,
+										  errmsg,
+										  errmsg_len))
+		return false;
 
-		offset = tq_batch_soa_int4_attribute_offset(lane_count, lane_index, attribute_index);
-	}
-	else
-		offset = tq_batch_int4_attribute_offset(bytes, lane_index, attribute_index);
-
-	tq_write_u32(bytes, offset, (uint32_t) value);
-	return true;
+	nullmask &= (uint16_t) ~(1u << attribute_index);
+	offset = (size_t) attribute_index * (size_t) TQ_METADATA_SLOT_BYTES;
+	memcpy(metadata_values + offset, &value, sizeof(value));
+	return tq_batch_page_set_metadata_block(page,
+											page_size,
+											lane_index,
+											metadata_values,
+											attribute_count,
+											nullmask,
+											errmsg,
+											errmsg_len);
 }
 
 bool
@@ -1970,6 +2538,8 @@ tq_batch_page_get_int4_attribute(const void *page,
 {
 	const uint8_t *bytes = (const uint8_t *) page;
 	uint16_t attribute_count = 0;
+	uint16_t nullmask = 0;
+	uint8_t metadata_values[TQ_MAX_STORED_METADATA_ATTRIBUTES * TQ_METADATA_SLOT_BYTES];
 	size_t offset = 0;
 
 	if (page == NULL || value == NULL)
@@ -1979,8 +2549,8 @@ tq_batch_page_get_int4_attribute(const void *page,
 		return false;
 	}
 
-	if (!tq_batch_page_get_int4_attribute_count(page, page_size, &attribute_count,
-												errmsg, errmsg_len))
+	if (!tq_batch_page_get_metadata_attribute_count(page, page_size, &attribute_count,
+													errmsg, errmsg_len))
 		return false;
 
 	if (attribute_count == 0 || attribute_index >= attribute_count)
@@ -1997,16 +2567,25 @@ tq_batch_page_get_int4_attribute(const void *page,
 		return false;
 	}
 
-	if (tq_batch_is_soa_page(bytes))
+	memset(metadata_values, 0, sizeof(metadata_values));
+	if (!tq_batch_page_get_metadata_block(page,
+										  page_size,
+										  lane_index,
+										  metadata_values,
+										  attribute_count,
+										  &nullmask,
+										  errmsg,
+										  errmsg_len))
+		return false;
+
+	if ((nullmask & (uint16_t) (1u << attribute_index)) != 0)
 	{
-		uint16_t lane_count = tq_read_u16(bytes, TQ_BATCH_LANE_COUNT_OFFSET);
-
-		offset = tq_batch_soa_int4_attribute_offset(lane_count, lane_index, attribute_index);
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant batch page: requested int4 attribute is null");
+		return false;
 	}
-	else
-		offset = tq_batch_int4_attribute_offset(bytes, lane_index, attribute_index);
-
-	*value = (int32_t) tq_read_u32(bytes, offset);
+	offset = (size_t) attribute_index * (size_t) TQ_METADATA_SLOT_BYTES;
+	memcpy(value, metadata_values + offset, sizeof(*value));
 	return true;
 }
 
@@ -2265,12 +2844,15 @@ tq_batch_page_compact(void *page,
 	{
 		uint16_t	lane_count = tq_read_u16(bytes, TQ_BATCH_LANE_COUNT_OFFSET);
 		uint16_t	dimension = tq_read_u16(bytes, TQ_BATCH_TID_OFFSET_OFFSET);
-		uint16_t	int4_attribute_count = tq_batch_flag_int4_attribute_count(
+		uint16_t	metadata_attribute_count = tq_batch_flag_int4_attribute_count(
 			tq_read_u16(bytes, TQ_BATCH_FLAGS_OFFSET));
 		size_t		tid_base = tq_batch_soa_tid_array_offset(lane_count);
-		size_t		filter_base = tq_batch_soa_filter_array_offset(lane_count);
-		size_t		gamma_base = tq_batch_soa_gamma_array_offset(lane_count, int4_attribute_count);
-		size_t		nibble_base = tq_batch_soa_nibble_block_offset(lane_count, int4_attribute_count);
+		size_t		metadata_base = tq_batch_soa_metadata_array_offset(lane_count);
+		size_t		exact_key_ref_base = tq_batch_soa_exact_key_ref_array_offset(lane_count,
+																			 metadata_attribute_count);
+		size_t		gamma_base = tq_batch_soa_gamma_array_offset(lane_count, metadata_attribute_count);
+		size_t		nibble_base = tq_batch_soa_nibble_block_offset(lane_count, metadata_attribute_count);
+		size_t		metadata_block_bytes = tq_metadata_block_bytes(metadata_attribute_count);
 		uint32_t	d;
 
 		for (read_lane = 0; read_lane < occupied_count; read_lane++)
@@ -2284,19 +2866,13 @@ tq_batch_page_compact(void *page,
 						   bytes + tid_base + (size_t) read_lane * TQ_TID_STORAGE_BYTES,
 						   TQ_TID_STORAGE_BYTES);
 
-					if (int4_attribute_count > 0)
-					{
-						uint16_t attribute_index = 0;
-
-						for (attribute_index = 0; attribute_index < int4_attribute_count; attribute_index++)
-							memcpy(bytes + filter_base
-								   + ((((size_t) attribute_index * (size_t) lane_count)
-									   + (size_t) write_lane) * sizeof(int32_t)),
-								   bytes + filter_base
-								   + ((((size_t) attribute_index * (size_t) lane_count)
-									   + (size_t) read_lane) * sizeof(int32_t)),
-								   sizeof(int32_t));
-					}
+					if (metadata_block_bytes > 0)
+						memcpy(bytes + metadata_base + (size_t) write_lane * metadata_block_bytes,
+							   bytes + metadata_base + (size_t) read_lane * metadata_block_bytes,
+							   metadata_block_bytes);
+					memcpy(bytes + exact_key_ref_base + (size_t) write_lane * TQ_EXACT_KEY_REF_BYTES,
+						   bytes + exact_key_ref_base + (size_t) read_lane * TQ_EXACT_KEY_REF_BYTES,
+						   TQ_EXACT_KEY_REF_BYTES);
 
 					/* Move gamma */
 					memcpy(bytes + gamma_base + (size_t) write_lane * sizeof(float),
@@ -2358,26 +2934,19 @@ tq_batch_page_compact(void *page,
 				if (write_lane != read_lane)
 				{
 					TqTid tid;
-					uint16_t attribute_count = tq_batch_flag_int4_attribute_count(
+					uint16_t metadata_attribute_count = tq_batch_flag_int4_attribute_count(
 						tq_read_u16(bytes, TQ_BATCH_FLAGS_OFFSET));
-					uint16_t attribute_index = 0;
+					size_t metadata_block_bytes = tq_metadata_block_bytes(metadata_attribute_count);
 
 					memset(&tid, 0, sizeof(tid));
 					tq_read_tid(bytes, read_lane, &tid);
 					tq_write_tid(bytes, write_lane, &tid);
-					for (attribute_index = 0; attribute_index < attribute_count; attribute_index++)
-					{
-						uint32_t value = tq_read_u32(bytes,
-													 tq_batch_int4_attribute_offset(bytes,
-																				 read_lane,
-																				 attribute_index));
-
-						tq_write_u32(bytes,
-									 tq_batch_int4_attribute_offset(bytes,
-																	write_lane,
-																	attribute_index),
-									 value);
-					}
+					memcpy(bytes + tq_batch_metadata_nullmask_offset(bytes, write_lane),
+						   bytes + tq_batch_metadata_nullmask_offset(bytes, read_lane),
+						   metadata_block_bytes);
+					memcpy(bytes + tq_batch_exact_key_ref_offset(bytes, write_lane),
+						   bytes + tq_batch_exact_key_ref_offset(bytes, read_lane),
+						   TQ_EXACT_KEY_REF_BYTES);
 					if (code_bytes > 0)
 					{
 						memcpy(scratch, bytes + tq_batch_code_offset(bytes, read_lane), code_bytes);
@@ -2528,9 +3097,21 @@ tq_batch_page_soa_required_bytes_with_int4_attributes(uint16_t lane_count,
 														 uint32_t representative_code_bytes,
 														 uint16_t int4_attribute_count)
 {
+	return tq_batch_page_soa_required_bytes_with_metadata(lane_count,
+														  dimension,
+														  representative_code_bytes,
+														  int4_attribute_count);
+}
+
+size_t
+tq_batch_page_soa_required_bytes_with_metadata(uint16_t lane_count,
+												 uint32_t dimension,
+												 uint32_t representative_code_bytes,
+												 uint16_t metadata_attribute_count)
+{
 	return tq_batch_soa_required_bytes_internal(lane_count, dimension,
 												representative_code_bytes,
-												int4_attribute_count);
+												metadata_attribute_count);
 }
 
 bool
@@ -2562,13 +3143,27 @@ tq_batch_page_can_fit_soa_with_int4_attributes(size_t page_size,
 												   uint32_t representative_code_bytes,
 												   uint16_t int4_attribute_count)
 {
+	return tq_batch_page_can_fit_soa_with_metadata(page_size,
+												   lane_count,
+												   dimension,
+												   representative_code_bytes,
+												   int4_attribute_count);
+}
+
+bool
+tq_batch_page_can_fit_soa_with_metadata(size_t page_size,
+										 uint16_t lane_count,
+										 uint32_t dimension,
+										 uint32_t representative_code_bytes,
+										 uint16_t metadata_attribute_count)
+{
 	if (lane_count == 0 || dimension == 0 || representative_code_bytes == 0)
 		return false;
 
-	return tq_batch_page_soa_required_bytes_with_int4_attributes(lane_count,
-																dimension,
-																representative_code_bytes,
-																int4_attribute_count) <= page_size;
+	return tq_batch_page_soa_required_bytes_with_metadata(lane_count,
+														  dimension,
+														  representative_code_bytes,
+														  metadata_attribute_count) <= page_size;
 }
 
 bool

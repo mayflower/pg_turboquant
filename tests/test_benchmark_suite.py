@@ -116,9 +116,15 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
         self.assertIn("page_summary", scenario["index_metadata"])
         self.assertIn("capabilities", scenario["index_metadata"])
         self.assertIn("index_only_scan", scenario["index_metadata"]["capabilities"])
+        self.assertIn("vector_key_returnable", scenario["index_metadata"]["capabilities"])
+        self.assertIn("ordered_vector_key_index_only_scan", scenario["index_metadata"]["capabilities"])
         self.assertIn("multicolumn", scenario["index_metadata"]["capabilities"])
         self.assertIn("include_columns", scenario["index_metadata"]["capabilities"])
         self.assertIn("bitmap_scan", scenario["index_metadata"]["capabilities"])
+        self.assertIn("operability", scenario["index_metadata"])
+        self.assertIn("parallel_scan", scenario["index_metadata"]["operability"])
+        self.assertIn("parallel_vacuum", scenario["index_metadata"]["operability"])
+        self.assertIn("maintenance_work_mem_aware", scenario["index_metadata"]["operability"])
         self.assertIn("mode", scenario["index_metadata"]["page_summary"])
         self.assertIn("safe_pruning", scenario["index_metadata"]["page_summary"])
         if scenario["method"].startswith("turboquant_"):
@@ -740,6 +746,8 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
         self.assertIn("avg_result_count", scenario["metrics"])
         self.assertTrue(scenario["index_metadata"]["capabilities"]["bitmap_scan"])
         self.assertFalse(scenario["index_metadata"]["capabilities"]["index_only_scan"])
+        self.assertFalse(scenario["index_metadata"]["capabilities"]["ordered_vector_key_index_only_scan"])
+        self.assertFalse(scenario["index_metadata"]["capabilities"]["vector_key_returnable"])
         self.assertEqual(scenario["simd"]["selected_kernel"], scenario["simd"]["preferred_kernel"])
         self.assertEqual(scenario["scan_stats"]["score_kernel"], "none")
         self.assertEqual(scenario["simd"]["code_domain_kernel"], "none")
@@ -755,6 +763,9 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
         )
 
         scenario = payload["scenarios"][0]
+        self.assertTrue(scenario["index_metadata"]["capabilities"]["index_only_scan"])
+        self.assertTrue(scenario["index_metadata"]["capabilities"]["ordered_vector_key_index_only_scan"])
+        self.assertTrue(scenario["index_metadata"]["capabilities"]["vector_key_returnable"])
         self.assertTrue(scenario["index_metadata"]["capabilities"]["multicolumn"])
         self.assertTrue(scenario["index_metadata"]["capabilities"]["include_columns"])
 

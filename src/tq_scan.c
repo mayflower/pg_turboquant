@@ -8,6 +8,11 @@
 #include "src/tq_guc.h"
 #include "src/tq_simd_avx2.h"
 
+#ifdef TQ_UNIT_TEST
+#undef snprintf
+#define pg_qsort qsort
+#endif
+
 static void
 tq_set_error(char *errmsg, size_t errmsg_len, const char *message)
 {
@@ -40,28 +45,33 @@ static bool tq_scan_scratch_ensure_decoded_capacity(TqScanScratch *scratch,
 static void tq_scan_stats_record_heap_insert(TqCandidateHeapMetricsMode metrics_mode);
 static void tq_scan_stats_record_heap_replace(TqCandidateHeapMetricsMode metrics_mode);
 static void tq_scan_stats_record_heap_reject(TqCandidateHeapMetricsMode metrics_mode);
-static bool tq_int4_filter_clause_matches(int32_t value,
-										  const TqInt4FilterClause *clause);
+static bool tq_metadata_filter_clause_matches(const uint8_t value[TQ_METADATA_SLOT_BYTES],
+											  const TqMetadataFilterClause *clause,
+											  char *errmsg,
+											  size_t errmsg_len);
 static bool tq_batch_page_lane_matches_filters(const void *page,
 											   size_t page_size,
 											   uint16_t lane_index,
-											   const TqInt4FilterClause *filter_clauses,
+											   const TqMetadataFilterClause *filter_clauses,
 											   uint16_t filter_clause_count,
 											   char *errmsg,
 											   size_t errmsg_len);
-static bool tq_batch_page_read_lane_int4_attributes(const void *page,
-													size_t page_size,
-													uint16_t lane_index,
-													int32_t *values,
-													uint16_t int4_attribute_count,
-													char *errmsg,
-													size_t errmsg_len);
+static bool tq_batch_page_read_lane_metadata(const void *page,
+											 size_t page_size,
+											 uint16_t lane_index,
+											 uint8_t *metadata_values,
+											 uint16_t metadata_attribute_count,
+											 uint16_t *metadata_nullmask,
+											 char *errmsg,
+											 size_t errmsg_len);
 static bool tq_candidate_heap_push_internal(TqCandidateHeap *heap,
 											 float score,
 											 uint32_t block_number,
 											 uint16_t offset_number,
-											 const int32_t *int4_attributes,
-											 uint16_t int4_attribute_count,
+											 const TqExactKeyRef *exact_key_ref,
+											 const uint8_t *metadata_values,
+											 uint16_t metadata_attribute_count,
+											 uint16_t metadata_nullmask,
 											 TqCandidateHeapMetricsMode metrics_mode);
 static bool tq_candidate_heap_merge_into_global(TqCandidateHeap *global_heap,
 												 const TqCandidateHeap *local_heap);
@@ -230,16 +240,27 @@ tq_candidate_tid_equal(const TqCandidateEntry *left, const TqCandidateEntry *rig
 }
 
 static bool
-tq_int4_filter_clause_matches(int32_t value, const TqInt4FilterClause *clause)
+tq_metadata_filter_clause_matches(const uint8_t value[TQ_METADATA_SLOT_BYTES],
+								  const TqMetadataFilterClause *clause,
+								  char *errmsg,
+								  size_t errmsg_len)
 {
 	uint16_t index = 0;
 
-	if (clause == NULL || clause->value_count == 0)
+	if (clause == NULL)
+		return true;
+	if (clause->match_null)
+		return false;
+	if (clause->value_count == 0)
 		return true;
 
 	for (index = 0; index < clause->value_count; index++)
 	{
-		if (clause->values[index] == value)
+		if (tq_metadata_slot_equals(clause->kind,
+									value,
+									clause->values[index],
+									errmsg,
+									errmsg_len))
 			return true;
 	}
 
@@ -250,26 +271,49 @@ static bool
 tq_batch_page_lane_matches_filters(const void *page,
 								   size_t page_size,
 								   uint16_t lane_index,
-								   const TqInt4FilterClause *filter_clauses,
+								   const TqMetadataFilterClause *filter_clauses,
 								   uint16_t filter_clause_count,
 								   char *errmsg,
 								   size_t errmsg_len)
 {
 	uint16_t clause_index = 0;
+	uint16_t metadata_attribute_count = 0;
+	uint16_t nullmask = 0;
+	uint8_t metadata_values[TQ_MAX_STORED_METADATA_ATTRIBUTES * TQ_METADATA_SLOT_BYTES];
+
+	memset(metadata_values, 0, sizeof(metadata_values));
+	if (!tq_batch_page_get_metadata_attribute_count(page,
+													page_size,
+													&metadata_attribute_count,
+													errmsg,
+													errmsg_len))
+		return false;
+	if (!tq_batch_page_get_metadata_block(page,
+										  page_size,
+										  lane_index,
+										  metadata_values,
+										  metadata_attribute_count,
+										  &nullmask,
+										  errmsg,
+										  errmsg_len))
+		return false;
 
 	for (clause_index = 0; clause_index < filter_clause_count; clause_index++)
 	{
-		int32_t value = 0;
+		const TqMetadataFilterClause *clause = &filter_clauses[clause_index];
+		const uint8_t *value = metadata_values
+			+ (size_t) clause->attribute_index * (size_t) TQ_METADATA_SLOT_BYTES;
+		bool is_null = (nullmask & (uint16_t) (1u << clause->attribute_index)) != 0;
 
-		if (!tq_batch_page_get_int4_attribute(page,
-											  page_size,
-											  lane_index,
-											  filter_clauses[clause_index].attribute_index,
-											  &value,
-											  errmsg,
-											  errmsg_len))
+		if (is_null)
+		{
+			if (!clause->match_null)
+				return false;
+			continue;
+		}
+		if (clause->match_null)
 			return false;
-		if (!tq_int4_filter_clause_matches(value, &filter_clauses[clause_index]))
+		if (!tq_metadata_filter_clause_matches(value, clause, errmsg, errmsg_len))
 			return false;
 	}
 
@@ -277,34 +321,31 @@ tq_batch_page_lane_matches_filters(const void *page,
 }
 
 static bool
-tq_batch_page_read_lane_int4_attributes(const void *page,
-										size_t page_size,
-										uint16_t lane_index,
-										int32_t *values,
-										uint16_t int4_attribute_count,
-										char *errmsg,
-										size_t errmsg_len)
+tq_batch_page_read_lane_metadata(const void *page,
+								 size_t page_size,
+								 uint16_t lane_index,
+								 uint8_t *metadata_values,
+								 uint16_t metadata_attribute_count,
+								 uint16_t *metadata_nullmask,
+								 char *errmsg,
+								 size_t errmsg_len)
 {
-	uint16_t attribute_index = 0;
-
-	if (int4_attribute_count == 0)
-		return true;
-	if (values == NULL)
-		return false;
-
-	for (attribute_index = 0; attribute_index < int4_attribute_count; attribute_index++)
+	if (metadata_attribute_count == 0)
 	{
-		if (!tq_batch_page_get_int4_attribute(page,
-											  page_size,
-											  lane_index,
-											  attribute_index,
-											  &values[attribute_index],
-											  errmsg,
-											  errmsg_len))
-			return false;
+		if (metadata_nullmask != NULL)
+			*metadata_nullmask = 0;
+		return true;
 	}
-
-	return true;
+	if (metadata_values == NULL)
+		return false;
+	return tq_batch_page_get_metadata_block(page,
+											page_size,
+											lane_index,
+											metadata_values,
+											metadata_attribute_count,
+											metadata_nullmask,
+											errmsg,
+											errmsg_len);
 }
 
 static bool
@@ -1550,15 +1591,18 @@ tq_candidate_heap_push(TqCandidateHeap *heap,
 					   float score,
 					   uint32_t block_number,
 					   uint16_t offset_number,
-					   const int32_t *int4_attributes,
-					   uint16_t int4_attribute_count)
+					   const TqExactKeyRef *exact_key_ref,
+					   const uint8_t *metadata_values,
+					   uint16_t metadata_attribute_count)
 {
 	return tq_candidate_heap_push_internal(heap,
 											 score,
 											 block_number,
 											 offset_number,
-											 int4_attributes,
-											 int4_attribute_count,
+											 exact_key_ref,
+											 metadata_values,
+											 metadata_attribute_count,
+											 0,
 											 TQ_CANDIDATE_HEAP_METRICS_GLOBAL);
 }
 
@@ -1567,8 +1611,10 @@ tq_candidate_heap_push_internal(TqCandidateHeap *heap,
 								 float score,
 								 uint32_t block_number,
 								 uint16_t offset_number,
-								 const int32_t *int4_attributes,
-								 uint16_t int4_attribute_count,
+								 const TqExactKeyRef *exact_key_ref,
+								 const uint8_t *metadata_values,
+								 uint16_t metadata_attribute_count,
+								 uint16_t metadata_nullmask,
 								 TqCandidateHeapMetricsMode metrics_mode)
 {
 	TqCandidateEntry entry;
@@ -1579,20 +1625,26 @@ tq_candidate_heap_push_internal(TqCandidateHeap *heap,
 	entry.score = score;
 	entry.tid.block_number = block_number;
 	entry.tid.offset_number = offset_number;
-	entry.int4_attribute_count = 0;
-	memset(entry.int4_attributes, 0, sizeof(entry.int4_attributes));
+	entry.exact_key_ref.block_number = TQ_INVALID_BLOCK_NUMBER;
+	entry.exact_key_ref.entry_index = UINT16_MAX;
+	entry.metadata_attribute_count = 0;
+	entry.metadata_nullmask = 0;
+	memset(entry.metadata_values, 0, sizeof(entry.metadata_values));
 
-	if (int4_attribute_count > TQ_MAX_STORED_INT4_ATTRIBUTES)
+	if (metadata_attribute_count > TQ_MAX_STORED_METADATA_ATTRIBUTES)
 		return false;
-	if (int4_attribute_count > 0)
+	if (metadata_attribute_count > 0)
 	{
-		if (int4_attributes == NULL)
+		if (metadata_values == NULL)
 			return false;
-		entry.int4_attribute_count = int4_attribute_count;
-		memcpy(entry.int4_attributes,
-			   int4_attributes,
-			   (size_t) int4_attribute_count * sizeof(int32_t));
+		entry.metadata_attribute_count = metadata_attribute_count;
+		entry.metadata_nullmask = metadata_nullmask;
+		memcpy(entry.metadata_values,
+			   metadata_values,
+			   (size_t) metadata_attribute_count * (size_t) TQ_METADATA_SLOT_BYTES);
 	}
+	if (exact_key_ref != NULL)
+		entry.exact_key_ref = *exact_key_ref;
 
 	if (heap->count < heap->capacity)
 	{
@@ -1633,8 +1685,10 @@ tq_candidate_heap_merge_into_global(TqCandidateHeap *global_heap,
 												 local_heap->entries[index].score,
 												 local_heap->entries[index].tid.block_number,
 												 local_heap->entries[index].tid.offset_number,
-												 local_heap->entries[index].int4_attributes,
-												 local_heap->entries[index].int4_attribute_count,
+												 &local_heap->entries[index].exact_key_ref,
+												 local_heap->entries[index].metadata_values,
+												 local_heap->entries[index].metadata_attribute_count,
+												 local_heap->entries[index].metadata_nullmask,
 												 TQ_CANDIDATE_HEAP_METRICS_GLOBAL))
 			return false;
 	}
@@ -1889,7 +1943,7 @@ tq_batch_page_scan_prod(const void *page,
 						char *errmsg,
 						size_t errmsg_len)
 {
-	TqInt4FilterClause clause;
+	TqMetadataFilterClause clause;
 	TqScanScratch scratch;
 	bool ok = false;
 
@@ -1898,8 +1952,10 @@ tq_batch_page_scan_prod(const void *page,
 	if (filter_enabled)
 	{
 		clause.attribute_index = 0;
+		clause.kind = TQ_METADATA_KIND_INT4;
+		clause.match_null = false;
 		clause.value_count = 1;
-		clause.values[0] = filter_value;
+		memcpy(clause.values[0], &filter_value, sizeof(filter_value));
 	}
 	ok = tq_batch_page_scan_prod_with_scratch_filtered(page,
 													   page_size,
@@ -1930,9 +1986,9 @@ tq_batch_page_scan_prod_filtered(const void *page,
 								 const TqProdLut *lut,
 								 const float *query_values,
 								 size_t query_len,
-								 const TqInt4FilterClause *filter_clauses,
+								 const TqMetadataFilterClause *filter_clauses,
 								 uint16_t filter_clause_count,
-								 uint16_t int4_attribute_count,
+								 uint16_t metadata_attribute_count,
 								 TqCandidateHeap *heap,
 								 TqCandidateHeap *shadow_decode_heap,
 								 char *errmsg,
@@ -1952,7 +2008,7 @@ tq_batch_page_scan_prod_filtered(const void *page,
 													   query_len,
 													   filter_clauses,
 													   filter_clause_count,
-													   int4_attribute_count,
+													   metadata_attribute_count,
 													   heap,
 													   shadow_decode_heap,
 													   &scratch,
@@ -1979,14 +2035,16 @@ tq_batch_page_scan_prod_with_scratch(const void *page,
 									 char *errmsg,
 									 size_t errmsg_len)
 {
-	TqInt4FilterClause clause;
+	TqMetadataFilterClause clause;
 
 	memset(&clause, 0, sizeof(clause));
 	if (filter_enabled)
 	{
 		clause.attribute_index = 0;
+		clause.kind = TQ_METADATA_KIND_INT4;
+		clause.match_null = false;
 		clause.value_count = 1;
-		clause.values[0] = filter_value;
+		memcpy(clause.values[0], &filter_value, sizeof(filter_value));
 	}
 	return tq_batch_page_scan_prod_with_scratch_filtered(page,
 														 page_size,
@@ -2015,9 +2073,9 @@ tq_batch_page_scan_prod_with_scratch_filtered(const void *page,
 											  const TqProdLut *lut,
 											  const float *query_values,
 											  size_t query_len,
-											  const TqInt4FilterClause *filter_clauses,
+											  const TqMetadataFilterClause *filter_clauses,
 											  uint16_t filter_clause_count,
-											  uint16_t int4_attribute_count,
+											  uint16_t metadata_attribute_count,
 											  TqCandidateHeap *heap,
 											  TqCandidateHeap *shadow_decode_heap,
 											  TqScanScratch *scratch,
@@ -2065,18 +2123,18 @@ tq_batch_page_scan_prod_with_scratch_filtered(const void *page,
 
 	if (filter_clause_count > 0)
 	{
-		uint16_t page_int4_attribute_count = 0;
+		uint16_t page_metadata_attribute_count = 0;
 
-		if (!tq_batch_page_get_int4_attribute_count(page,
-													 page_size,
-													 &page_int4_attribute_count,
-													 errmsg,
-													 errmsg_len))
+		if (!tq_batch_page_get_metadata_attribute_count(page,
+														page_size,
+														&page_metadata_attribute_count,
+														errmsg,
+														errmsg_len))
 			return false;
-		if (page_int4_attribute_count < int4_attribute_count)
+		if (page_metadata_attribute_count < metadata_attribute_count)
 		{
 			tq_set_error(errmsg, errmsg_len,
-						 "invalid turboquant scan: filtered ordered scans require stored int4 payloads on batch pages");
+						 "invalid turboquant scan: filtered ordered scans require stored metadata payloads on batch pages");
 			return false;
 		}
 	}
@@ -2096,11 +2154,12 @@ tq_batch_page_scan_prod_with_scratch_filtered(const void *page,
 		&& shadow_decode_heap != NULL
 		&& shadow_decode_heap->entries != NULL
 		&& shadow_decode_heap->capacity > 0;
-	use_block16 = use_code_domain
-		&& !use_shadow_decode
-		&& scratch->lut16 != NULL
-		&& scratch->lut16->quantized_ready
-		&& tq_prod_lut16_is_supported(config, NULL, 0);
+	/*
+	 * The exact-key IOS path needs a per-candidate exact-key reference in the
+	 * heap. The block16 transpose fast path currently only carries TIDs, so keep
+	 * it disabled until that scratch path grows an exact-key-ref sidecar.
+	 */
+	use_block16 = false;
 	tq_scan_stats_set_score_mode(use_code_domain ? TQ_SCAN_SCORE_MODE_CODE_DOMAIN
 												 : TQ_SCAN_SCORE_MODE_DECODE);
 	tq_scan_stats_set_score_kernel(use_code_domain
@@ -2189,9 +2248,10 @@ tq_batch_page_scan_prod_with_scratch_filtered(const void *page,
 			{
 				float	distance_value = 0.0f;
 				TqTid	tid;
-				int32_t lane_int4_attributes[TQ_MAX_STORED_INT4_ATTRIBUTES];
+				uint8_t lane_metadata_values[TQ_MAX_STORED_METADATA_ATTRIBUTES * TQ_METADATA_SLOT_BYTES];
+				uint16_t lane_metadata_nullmask = 0;
 
-				memset(lane_int4_attributes, 0, sizeof(lane_int4_attributes));
+				memset(lane_metadata_values, 0, sizeof(lane_metadata_values));
 				if (filter_clause_count > 0
 					&& !tq_batch_page_lane_matches_filters(page,
 															page_size,
@@ -2201,14 +2261,15 @@ tq_batch_page_scan_prod_with_scratch_filtered(const void *page,
 															errmsg,
 															errmsg_len))
 					continue;
-				if (int4_attribute_count > 0
-					&& !tq_batch_page_read_lane_int4_attributes(page,
-																page_size,
-																(uint16_t) i,
-																lane_int4_attributes,
-																int4_attribute_count,
-																errmsg,
-																errmsg_len))
+				if (metadata_attribute_count > 0
+					&& !tq_batch_page_read_lane_metadata(page,
+														page_size,
+														(uint16_t) i,
+														lane_metadata_values,
+														metadata_attribute_count,
+														&lane_metadata_nullmask,
+														errmsg,
+														errmsg_len))
 					return false;
 
 				tq_scan_stats_record_code_visit(false);
@@ -2228,8 +2289,10 @@ tq_batch_page_scan_prod_with_scratch_filtered(const void *page,
 													 distance_value,
 													 tid.block_number,
 													 tid.offset_number,
-													 int4_attribute_count > 0 ? lane_int4_attributes : NULL,
-													 int4_attribute_count,
+													 NULL,
+													 metadata_attribute_count > 0 ? lane_metadata_values : NULL,
+													 metadata_attribute_count,
+													 lane_metadata_nullmask,
 													 TQ_CANDIDATE_HEAP_METRICS_LOCAL))
 					return false;
 				selected_count++;
@@ -2306,6 +2369,8 @@ tq_batch_page_scan_prod_with_scratch_filtered(const void *page,
 													 blk->tids[i].block_number,
 													 blk->tids[i].offset_number,
 													 NULL,
+													 NULL,
+													 0,
 													 0,
 													 TQ_CANDIDATE_HEAP_METRICS_LOCAL))
 					return false;
@@ -2355,13 +2420,27 @@ tq_batch_page_scan_prod_with_scratch_filtered(const void *page,
 		do
 		{
 			TqTid		tid;
+			TqExactKeyRef exact_key_ref;
 			float		distance_value = 0.0f;
 			float		ip_score = 0.0f;
-			int32_t		lane_int4_attributes[TQ_MAX_STORED_INT4_ATTRIBUTES];
+			uint8_t		lane_metadata_values[TQ_MAX_STORED_METADATA_ATTRIBUTES * TQ_METADATA_SLOT_BYTES];
+			uint16_t	lane_metadata_nullmask = 0;
 
-			memset(lane_int4_attributes, 0, sizeof(lane_int4_attributes));
+			memset(lane_metadata_values, 0, sizeof(lane_metadata_values));
 			memset(&tid, 0, sizeof(tid));
+			exact_key_ref.block_number = TQ_INVALID_BLOCK_NUMBER;
+			exact_key_ref.entry_index = UINT16_MAX;
 			if (!tq_batch_page_get_tid(page, page_size, lane, &tid, errmsg, errmsg_len))
+			{
+				free(reconstructed_code);
+				return false;
+			}
+			if (!tq_batch_page_get_exact_key_ref(page,
+												 page_size,
+												 lane,
+												 &exact_key_ref,
+												 errmsg,
+												 errmsg_len))
 			{
 				free(reconstructed_code);
 				return false;
@@ -2377,14 +2456,15 @@ tq_batch_page_scan_prod_with_scratch_filtered(const void *page,
 													   errmsg_len))
 				continue;
 
-			if (int4_attribute_count > 0
-				&& !tq_batch_page_read_lane_int4_attributes(page,
-															page_size,
-															lane,
-															lane_int4_attributes,
-															int4_attribute_count,
-															errmsg,
-															errmsg_len))
+			if (metadata_attribute_count > 0
+				&& !tq_batch_page_read_lane_metadata(page,
+													page_size,
+													lane,
+													lane_metadata_values,
+													metadata_attribute_count,
+													&lane_metadata_nullmask,
+													errmsg,
+													errmsg_len))
 			{
 				free(reconstructed_code);
 				return false;
@@ -2487,8 +2567,10 @@ tq_batch_page_scan_prod_with_scratch_filtered(const void *page,
 															 shadow_distance_value,
 															 tid.block_number,
 															 tid.offset_number,
-															 int4_attribute_count > 0 ? lane_int4_attributes : NULL,
-															 int4_attribute_count,
+															 &exact_key_ref,
+															 metadata_attribute_count > 0 ? lane_metadata_values : NULL,
+															 metadata_attribute_count,
+															 lane_metadata_nullmask,
 															 TQ_CANDIDATE_HEAP_METRICS_NONE))
 					{
 						free(reconstructed_code);
@@ -2525,8 +2607,10 @@ tq_batch_page_scan_prod_with_scratch_filtered(const void *page,
 												 distance_value,
 												 tid.block_number,
 												 tid.offset_number,
-												 int4_attribute_count > 0 ? lane_int4_attributes : NULL,
-												 int4_attribute_count,
+												 &exact_key_ref,
+												 metadata_attribute_count > 0 ? lane_metadata_values : NULL,
+												 metadata_attribute_count,
+												 lane_metadata_nullmask,
 												 TQ_CANDIDATE_HEAP_METRICS_LOCAL))
 			{
 				free(reconstructed_code);
@@ -2604,6 +2688,7 @@ tq_batch_page_rescore_prod_candidates_with_scratch(const void *page,
 												   size_t errmsg_len)
 {
 	TqBatchPageHeaderView header;
+	uint16_t page_metadata_attribute_count = 0;
 	const uint8_t *code = NULL;
 	size_t code_len = 0;
 	float *decoded = NULL;
@@ -2643,6 +2728,12 @@ tq_batch_page_rescore_prod_candidates_with_scratch(const void *page,
 
 	memset(&header, 0, sizeof(header));
 	if (!tq_batch_page_read_header(page, page_size, &header, errmsg, errmsg_len))
+		return false;
+	if (!tq_batch_page_get_metadata_attribute_count(page,
+													page_size,
+													&page_metadata_attribute_count,
+													errmsg,
+													errmsg_len))
 		return false;
 
 	tq_scan_stats_set_score_mode(TQ_SCAN_SCORE_MODE_DECODE_RESCORE);
@@ -2695,9 +2786,15 @@ tq_batch_page_rescore_prod_candidates_with_scratch(const void *page,
 		do
 		{
 			TqTid tid;
+			TqExactKeyRef exact_key_ref;
 			float distance_value = 0.0f;
+			uint8_t metadata_values[TQ_MAX_STORED_METADATA_ATTRIBUTES * TQ_METADATA_SLOT_BYTES];
+			uint16_t metadata_nullmask = 0;
 
 			memset(&tid, 0, sizeof(tid));
+			exact_key_ref.block_number = TQ_INVALID_BLOCK_NUMBER;
+			exact_key_ref.entry_index = UINT16_MAX;
+			memset(metadata_values, 0, sizeof(metadata_values));
 			if (!tq_batch_page_get_tid(page, page_size, lane, &tid, errmsg, errmsg_len))
 			{
 				free(reconstructed_code);
@@ -2706,6 +2803,28 @@ tq_batch_page_rescore_prod_candidates_with_scratch(const void *page,
 
 			if (!tq_candidate_tid_is_selected(candidate_tids, candidate_tid_count, &tid))
 				continue;
+			if (!tq_batch_page_get_exact_key_ref(page,
+												 page_size,
+												 lane,
+												 &exact_key_ref,
+												 errmsg,
+												 errmsg_len))
+			{
+				free(reconstructed_code);
+				return false;
+			}
+			if (!tq_batch_page_read_lane_metadata(page,
+												 page_size,
+												 lane,
+												 metadata_values,
+												 page_metadata_attribute_count,
+												 &metadata_nullmask,
+												 errmsg,
+												 errmsg_len))
+			{
+				free(reconstructed_code);
+				return false;
+			}
 
 			if (page_is_soa)
 			{
@@ -2772,11 +2891,12 @@ tq_batch_page_rescore_prod_candidates_with_scratch(const void *page,
 														errmsg,
 														errmsg_len)
 				|| !tq_candidate_heap_push(heap,
-											 distance_value,
-											 tid.block_number,
-											 tid.offset_number,
-											 NULL,
-											 0))
+										   distance_value,
+										   tid.block_number,
+										   tid.offset_number,
+										   &exact_key_ref,
+										   page_metadata_attribute_count > 0 ? metadata_values : NULL,
+										   page_metadata_attribute_count))
 			{
 				free(reconstructed_code);
 				return false;

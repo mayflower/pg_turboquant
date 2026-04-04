@@ -103,9 +103,16 @@ BEGIN
 		'capabilities', jsonb_build_object(
 			'ordered_scan', true,
 			'bitmap_scan', true,
-			'index_only_scan', false,
+			'index_only_scan', true,
+			'vector_key_returnable', true,
+			'ordered_vector_key_index_only_scan', true,
 			'multicolumn', true,
 			'include_columns', true
+		),
+		'operability', jsonb_build_object(
+			'parallel_scan', false,
+			'parallel_vacuum', false,
+			'maintenance_work_mem_aware', false
 		)
 	);
 END;

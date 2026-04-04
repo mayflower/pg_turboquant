@@ -1,5 +1,6 @@
 #include "src/tq_pgvector_compat.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #ifdef TQ_UNIT_TEST
@@ -121,6 +122,20 @@ tq_vector_copy_from_halfvec(const HalfVector *vector,
 	return true;
 }
 
+size_t
+tq_vector_storage_size(TqVectorInputKind kind, uint32_t dimension)
+{
+	switch (kind)
+	{
+		case TQ_VECTOR_INPUT_VECTOR:
+			return VECTOR_SIZE(dimension);
+		case TQ_VECTOR_INPUT_HALFVEC:
+			return HALFVEC_SIZE(dimension);
+		default:
+			return 0;
+	}
+}
+
 bool
 tq_vector_input_kind_from_typid(Oid type_oid,
 								TqVectorInputKind *kind,
@@ -195,6 +210,120 @@ tq_vector_copy_from_datum_typed(Datum value,
 						 "invalid tq_pgvector conversion: unsupported input kind");
 			return false;
 	}
+}
+
+bool
+tq_vector_copy_raw_datum_typed(Datum value,
+							   TqVectorInputKind kind,
+							   uint8_t *out,
+							   size_t out_len,
+							   uint32_t *dimension,
+							   char *errmsg,
+							   size_t errmsg_len)
+{
+	Pointer		original = DatumGetPointer(value);
+	Vector	   *vector = NULL;
+	HalfVector *halfvec = NULL;
+	size_t		raw_len = 0;
+
+	if (out == NULL || dimension == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid tq_pgvector conversion: raw output and dimension must be non-null");
+		return false;
+	}
+
+	switch (kind)
+	{
+		case TQ_VECTOR_INPUT_VECTOR:
+			vector = tq_pgvector_detoast(value);
+			if (vector == NULL || vector->dim <= 0)
+			{
+				tq_set_error(errmsg, errmsg_len,
+							 "invalid tq_pgvector conversion: vector must be non-null with positive dimension");
+				tq_pgvector_release(vector, original);
+				return false;
+			}
+			raw_len = VECTOR_SIZE(vector->dim);
+			if (out_len < raw_len)
+			{
+				tq_set_error(errmsg, errmsg_len,
+							 "invalid tq_pgvector conversion: raw vector output buffer is too small");
+				tq_pgvector_release(vector, original);
+				return false;
+			}
+			memcpy(out, vector, raw_len);
+			*dimension = (uint32_t) vector->dim;
+			tq_pgvector_release(vector, original);
+			return true;
+		case TQ_VECTOR_INPUT_HALFVEC:
+			halfvec = tq_halfvec_detoast(value);
+			if (halfvec == NULL || halfvec->dim <= 0)
+			{
+				tq_set_error(errmsg, errmsg_len,
+							 "invalid tq_pgvector conversion: halfvec must be non-null with positive dimension");
+				tq_halfvec_release(halfvec, original);
+				return false;
+			}
+			raw_len = HALFVEC_SIZE(halfvec->dim);
+			if (out_len < raw_len)
+			{
+				tq_set_error(errmsg, errmsg_len,
+							 "invalid tq_pgvector conversion: raw halfvec output buffer is too small");
+				tq_halfvec_release(halfvec, original);
+				return false;
+			}
+			memcpy(out, halfvec, raw_len);
+			*dimension = (uint32_t) halfvec->dim;
+			tq_halfvec_release(halfvec, original);
+			return true;
+		default:
+			tq_set_error(errmsg, errmsg_len,
+						 "invalid tq_pgvector conversion: unsupported input kind");
+			return false;
+	}
+}
+
+bool
+tq_vector_datum_from_raw_bytes_typed(const uint8_t *raw_bytes,
+									 size_t raw_len,
+									 TqVectorInputKind kind,
+									 uint32_t dimension,
+									 Datum *value,
+									 char *errmsg,
+									 size_t errmsg_len)
+{
+	size_t expected_len = tq_vector_storage_size(kind, dimension);
+	void   *copy = NULL;
+
+	if (raw_bytes == NULL || value == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid tq_pgvector conversion: raw input and datum output must be non-null");
+		return false;
+	}
+
+	if (expected_len == 0 || raw_len != expected_len)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid tq_pgvector conversion: raw value length does not match vector contract");
+		return false;
+	}
+
+#ifdef TQ_UNIT_TEST
+	copy = malloc(raw_len);
+#else
+	copy = palloc(raw_len);
+#endif
+	if (copy == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid tq_pgvector conversion: out of memory constructing vector datum");
+		return false;
+	}
+	memcpy(copy, raw_bytes, raw_len);
+	*value = PointerGetDatum(copy);
+	return true;
 }
 
 bool
