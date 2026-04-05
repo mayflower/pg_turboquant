@@ -5,6 +5,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef TQ_UNIT_TEST
+#undef snprintf
+#endif
+
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
 #define TQ_CAN_COMPILE_AVX2 1

@@ -1,0 +1,92 @@
+{
+  "dataset": {
+    "name": "kilt_hotpotqa_filtered_churn_live",
+    "version": "2026-04-04",
+    "source_path": "hf://kilt_tasks/hotpotqa[validation][:10000]"
+  },
+  "embedding": {
+    "model": "BAAI/bge-small-en-v1.5",
+    "dimension": 384,
+    "normalized": false
+  },
+  "chunking": {
+    "strategy": "question_answer_seed",
+    "chunk_size": 1,
+    "chunk_overlap": 0
+  },
+  "schema": {
+    "documents_table": "rag_documents",
+    "passages_table": "rag_passages"
+  },
+  "regression_gate": {
+    "dataset_id": "kilt_hotpotqa",
+    "method_id": "pg_turboquant_approx",
+    "recall_at_10_floor": 0.9,
+    "max_visited_code_fraction": 0.9,
+    "max_visited_page_fraction": 0.7,
+    "expected_score_mode": "code_domain",
+    "max_effective_probe_count": 8
+  },
+  "backends": [
+    {
+      "kind": "pg_turboquant",
+      "index_name": "rag_passages_tq_idx",
+      "metric": "cosine",
+      "mode": "approx",
+      "filter_columns": ["tenant_id", "source_id", "lang_id", "doc_version"],
+      "include_columns": ["doc_id_int", "chunk_id_int", "tenant_id", "doc_version"],
+      "ann": {
+        "probes": 8,
+        "oversampling": 4,
+        "max_visited_codes": 4096,
+        "max_visited_pages": 0,
+        "filters": {
+          "tenant_id": 1,
+          "source_id": [1, 2, 3],
+          "lang_id": 1,
+          "doc_version": [7, 8]
+        },
+        "stage1_payload_columns": [
+          "doc_id_int",
+          "chunk_id_int",
+          "tenant_id",
+          "doc_version"
+        ],
+        "text_join_column": "passage_id",
+        "iterative_scan": "strict_order",
+        "min_rows_after_filter": 20,
+        "native_delta": true,
+        "churn_profile": {
+          "insert_rows": 500,
+          "delete_fraction": 0.1,
+          "reembed_fraction": 0.2,
+          "maintenance_after_batches": 2
+        }
+      },
+      "options": {
+        "lists": 64,
+        "bits": 4,
+        "router_restarts": 3
+      }
+    },
+    {
+      "kind": "pgvector_hnsw",
+      "index_name": "rag_passages_hnsw_idx",
+      "metric": "cosine",
+      "mode": "approx",
+      "options": {
+        "m": 16,
+        "ef_construction": 64
+      }
+    },
+    {
+      "kind": "pgvector_ivfflat",
+      "index_name": "rag_passages_ivf_idx",
+      "metric": "cosine",
+      "mode": "approx",
+      "options": {
+        "lists": 64
+      }
+    }
+  ]
+}

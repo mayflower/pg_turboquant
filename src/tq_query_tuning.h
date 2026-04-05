@@ -18,6 +18,7 @@ typedef struct TqPlannerCostEstimate
 	double		pages_fetched;
 	double		candidate_bound;
 	double		selectivity;
+	double		qual_selectivity;
 	double		visited_tuples;
 	double		effective_probe_count;
 } TqPlannerCostEstimate;
@@ -71,6 +72,7 @@ extern bool tq_select_cost_aware_probes(const double *ranked_scores,
 extern bool tq_estimate_ordered_scan_cost(double index_pages,
 										  double index_tuples,
 										  double output_rows,
+										  double qual_selectivity,
 										  unsigned int list_count,
 										  int probes,
 										  int oversample_factor,

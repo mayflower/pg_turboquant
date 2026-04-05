@@ -5,6 +5,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef TQ_UNIT_TEST
+#undef snprintf
+#endif
+
 static void
 tq_set_error(char *errmsg, size_t errmsg_len, const char *message)
 {

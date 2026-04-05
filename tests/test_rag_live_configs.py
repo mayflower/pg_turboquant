@@ -9,6 +9,12 @@ POPQA_CONFIG = ROOT / "benchmarks" / "rag" / "configs" / "live" / "popqa_small_l
 KILT_NQ_CONFIG = ROOT / "benchmarks" / "rag" / "configs" / "live" / "kilt_nq_small_live.json"
 KILT_HOTPOTQA_CONFIG = ROOT / "benchmarks" / "rag" / "configs" / "live" / "kilt_hotpotqa_small_live.json"
 KILT_HOTPOTQA_IVF_CONFIG = ROOT / "benchmarks" / "rag" / "configs" / "live" / "kilt_hotpotqa_ivf_live.json"
+KILT_HOTPOTQA_FILTERED_CHURN_CONFIG = (
+    ROOT / "benchmarks" / "rag" / "configs" / "live" / "kilt_hotpotqa_filtered_churn_live.json"
+)
+KILT_HOTPOTQA_FILTERED_EXTERNAL_DELTA_CONFIG = (
+    ROOT / "benchmarks" / "rag" / "configs" / "live" / "kilt_hotpotqa_filtered_external_delta_live.json"
+)
 
 
 class RagLiveConfigContractTest(unittest.TestCase):
@@ -69,6 +75,43 @@ class RagLiveConfigContractTest(unittest.TestCase):
         self.assertEqual(config.regression_gate["max_visited_page_fraction"], 0.60)
         self.assertEqual(config.regression_gate["expected_score_mode"], "code_domain")
         self.assertEqual(config.regression_gate["max_effective_probe_count"], 8)
+        self.assertEqual(len(config.backends), 3)
+
+    def test_kilt_hotpotqa_filtered_churn_live_config_parses(self):
+        config = load_campaign_config(KILT_HOTPOTQA_FILTERED_CHURN_CONFIG)
+
+        self.assertEqual(config.dataset.name, "kilt_hotpotqa_filtered_churn_live")
+        self.assertEqual(config.embedding.model, "BAAI/bge-small-en-v1.5")
+        self.assertEqual(config.embedding.dimension, 384)
+        self.assertEqual(config.backends[0]["kind"], "pg_turboquant")
+        self.assertEqual(config.backends[0]["filter_columns"], ["tenant_id", "source_id", "lang_id", "doc_version"])
+        self.assertTrue(config.backends[0]["ann"]["native_delta"])
+        self.assertEqual(
+            config.backends[0]["ann"]["churn_profile"],
+            {
+                "insert_rows": 500,
+                "delete_fraction": 0.1,
+                "reembed_fraction": 0.2,
+                "maintenance_after_batches": 2,
+            },
+        )
+        self.assertEqual(config.regression_gate["dataset_id"], "kilt_hotpotqa")
+        self.assertEqual(config.regression_gate["expected_score_mode"], "code_domain")
+        self.assertEqual(len(config.backends), 3)
+
+    def test_kilt_hotpotqa_filtered_external_delta_live_config_parses(self):
+        config = load_campaign_config(KILT_HOTPOTQA_FILTERED_EXTERNAL_DELTA_CONFIG)
+
+        self.assertEqual(config.dataset.name, "kilt_hotpotqa_filtered_external_delta_live")
+        self.assertEqual(config.embedding.model, "BAAI/bge-small-en-v1.5")
+        self.assertEqual(config.embedding.dimension, 384)
+        self.assertEqual(config.backends[0]["kind"], "pg_turboquant")
+        self.assertEqual(config.backends[0]["filter_columns"], ["tenant_id", "source_id", "lang_id", "doc_version"])
+        self.assertEqual(config.backends[0]["ann"]["delta_table_name"], "rag_passages_delta")
+        self.assertEqual(config.backends[0]["ann"]["delta_candidate_limit"], 64)
+        self.assertNotIn("native_delta", config.backends[0]["ann"])
+        self.assertEqual(config.regression_gate["dataset_id"], "kilt_hotpotqa")
+        self.assertEqual(config.regression_gate["expected_score_mode"], "code_domain")
         self.assertEqual(len(config.backends), 3)
 
 

@@ -77,10 +77,11 @@ class PgTurboquantBackend:
         stage1_payload_columns = _normalize_identifier_list(request.ann.get("stage1_payload_columns"))
         text_join_column = str(request.ann.get("text_join_column") or table.id_column)
         delta_table_name = request.ann.get("delta_table_name")
+        native_delta = bool(request.ann.get("native_delta"))
         delta_candidate_limit = int(request.ann.get("delta_candidate_limit") or max(request.top_k, 1))
         stage1_limit = int(request.ann.get("stage1_candidate_limit") or request.top_k)
         if self.mode == MODE_APPROX:
-            if filters or stage1_payload_columns or delta_table_name:
+            if filters or stage1_payload_columns or delta_table_name or native_delta:
                 sql, params = self._build_filtered_stage1_plan(
                     table=table,
                     query_literal=query_literal,
@@ -90,6 +91,7 @@ class PgTurboquantBackend:
                     stage1_payload_columns=stage1_payload_columns,
                     text_join_column=text_join_column,
                     delta_table_name=str(delta_table_name) if delta_table_name else None,
+                    native_delta=native_delta,
                     delta_candidate_limit=delta_candidate_limit,
                     stage1_limit=stage1_limit,
                 )
@@ -105,7 +107,7 @@ class PgTurboquantBackend:
                     f"LIMIT %s"
                 )
                 params = (query_literal, request.top_k)
-        elif filters or stage1_payload_columns or delta_table_name:
+        elif filters or stage1_payload_columns or delta_table_name or native_delta:
             sql, params = self._build_filtered_stage1_plan(
                 table=table,
                 query_literal=query_literal,
@@ -115,6 +117,7 @@ class PgTurboquantBackend:
                 stage1_payload_columns=stage1_payload_columns,
                 text_join_column=text_join_column,
                 delta_table_name=str(delta_table_name) if delta_table_name else None,
+                native_delta=native_delta,
                 delta_candidate_limit=delta_candidate_limit,
                 stage1_limit=self.rerank_k or stage1_limit,
             )
@@ -154,6 +157,7 @@ class PgTurboquantBackend:
         stage1_payload_columns: Sequence[str],
         text_join_column: str,
         delta_table_name: str | None,
+        native_delta: bool,
         delta_candidate_limit: int,
         stage1_limit: int,
     ) -> tuple[str, tuple[Any, ...]]:
@@ -181,7 +185,7 @@ class PgTurboquantBackend:
         params.append(stage1_limit)
 
         union_source = "SELECT * FROM base_stage1"
-        if delta_table_name:
+        if delta_table_name and not native_delta:
             delta_where_sql, delta_where_params = _render_filter_clause("p", filters)
             stage1_ctes.append(
                 "delta_stage1 AS ("
@@ -206,6 +210,7 @@ class PgTurboquantBackend:
             f"/* tq_filters: {json.dumps(filters, sort_keys=True)} */ "
             f"/* tq_stage1_payload_columns: {json.dumps(list(stage1_payload_columns))} */ "
             f"/* tq_delta_table_name: {json.dumps(delta_table_name)} */ "
+            f"/* tq_delta_mode: {json.dumps('native' if native_delta else ('union' if delta_table_name else None))} */ "
             f"/* tq_delta_candidate_limit: {json.dumps(delta_candidate_limit if delta_table_name else None)} */ "
             "WITH "
             + ", ".join(stage1_ctes)
@@ -252,6 +257,7 @@ class PgTurboquantBackend:
         filters = _extract_json_comment(plan.sql, "tq_filters")
         stage1_payload_columns = _extract_json_comment(plan.sql, "tq_stage1_payload_columns")
         delta_table_name = _extract_json_comment(plan.sql, "tq_delta_table_name")
+        delta_mode = _extract_json_comment(plan.sql, "tq_delta_mode")
         delta_candidate_limit = _extract_json_comment(plan.sql, "tq_delta_candidate_limit")
         return {
             "index_kind": "pg_turboquant",
@@ -269,6 +275,12 @@ class PgTurboquantBackend:
             "filters": filters,
             "stage1_payload_columns": stage1_payload_columns,
             "delta_table_name": delta_table_name,
+            "delta_mode": delta_mode,
+            "delta_surface": (
+                "native_index_delta"
+                if delta_mode == "native"
+                else ("external_union_delta" if delta_mode == "union" else "none")
+            ),
             "delta_candidate_limit": delta_candidate_limit,
             "sql_template_hash": sql_template_hash,
         }

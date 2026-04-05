@@ -7,6 +7,10 @@
 #include <stdint.h>
 #include <string.h>
 
+#ifdef TQ_UNIT_TEST
+#undef snprintf
+#endif
+
 static size_t
 tq_positive_value(int value)
 {
@@ -483,6 +487,7 @@ bool
 tq_estimate_ordered_scan_cost(double index_pages,
 							  double index_tuples,
 							  double output_rows,
+							  double qual_selectivity,
 							  unsigned int list_count,
 							  int probes,
 							  int oversample_factor,
@@ -498,9 +503,11 @@ tq_estimate_ordered_scan_cost(double index_pages,
 	double		pages = tq_positive_double(index_pages, 1.0);
 	double		oversample = (double) tq_positive_value(oversample_factor);
 	double		selectivity = 1.0;
+	double		filter_selectivity = 1.0;
 	double		scanned_fraction = 1.0;
 	double		scanned_tuples = 0.0;
 	double		candidate_bound = 0.0;
+	double		required_candidates = 0.0;
 	double		pages_fetched = 0.0;
 	double		effective_probe_count = 1.0;
 	double		startup_cost = 0.0;
@@ -517,6 +524,12 @@ tq_estimate_ordered_scan_cost(double index_pages,
 		selectivity = 1.0 / tuples;
 	if (selectivity > 1.0)
 		selectivity = 1.0;
+	if (qual_selectivity > 0.0 && isfinite(qual_selectivity))
+		filter_selectivity = qual_selectivity;
+	if (filter_selectivity <= 0.0)
+		filter_selectivity = 1.0 / tuples;
+	if (filter_selectivity > 1.0)
+		filter_selectivity = 1.0;
 
 	if (list_count > 0)
 	{
@@ -532,19 +545,22 @@ tq_estimate_ordered_scan_cost(double index_pages,
 	}
 
 	scanned_tuples = tuples * scanned_fraction;
+	required_candidates = ceil(((output_rows > 1.0) ? output_rows : 1.0) / filter_selectivity);
 	candidate_bound = (double) tq_streaming_candidate_capacity(probes, oversample_factor);
+	if (required_candidates > candidate_bound)
+		candidate_bound = required_candidates;
 	if (candidate_bound > scanned_tuples)
 		candidate_bound = scanned_tuples;
 	pages_fetched = pages * scanned_fraction;
 	if (pages_fetched < 1.0)
 		pages_fetched = 1.0;
 
-	heap_fetches = candidate_bound * selectivity;
+	heap_fetches = candidate_bound;
 	if (heap_fetches < 1.0)
 		heap_fetches = 1.0;
 
 	if (list_count > 0)
-		router_penalty = 2.0
+		router_penalty = 3.0
 			+ ((double) list_count * 0.10)
 			+ (effective_probe_count * cpu_operator_cost * 0.5);
 
@@ -561,6 +577,7 @@ tq_estimate_ordered_scan_cost(double index_pages,
 	estimate->pages_fetched = pages_fetched;
 	estimate->candidate_bound = candidate_bound;
 	estimate->selectivity = selectivity;
+	estimate->qual_selectivity = filter_selectivity;
 	estimate->visited_tuples = scanned_tuples;
 	estimate->effective_probe_count = effective_probe_count;
 	return true;

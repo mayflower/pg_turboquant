@@ -1,0 +1,98 @@
+SET client_min_messages = warning;
+DROP EXTENSION IF EXISTS pg_turboquant CASCADE;
+DROP EXTENSION IF EXISTS vector CASCADE;
+CREATE EXTENSION vector;
+CREATE EXTENSION pg_turboquant;
+SET TIME ZONE 'UTC';
+SET datestyle = ISO, MDY;
+
+CREATE TABLE tq_metadata_v2_docs (
+	passage_id int4 PRIMARY KEY,
+	tenant_id int4 NOT NULL,
+	source_uuid uuid NOT NULL,
+	lang_id int2 NOT NULL,
+	is_live bool,
+	valid_on date NOT NULL,
+	acl_bucket int8 NOT NULL,
+	doc_version int4 NOT NULL,
+	doc_uuid uuid NOT NULL,
+	ingested_at timestamptz NOT NULL,
+	payload text NOT NULL,
+	embedding vector(4)
+);
+
+INSERT INTO tq_metadata_v2_docs (
+	passage_id,
+	tenant_id,
+	source_uuid,
+	lang_id,
+	is_live,
+	valid_on,
+	acl_bucket,
+	doc_version,
+	doc_uuid,
+	ingested_at,
+	payload,
+	embedding
+) VALUES
+	(1, 1, '00000000-0000-0000-0000-000000000001', 1, true,  DATE '2026-04-01', 9000000001, 7, '11111111-1111-1111-1111-111111111111', TIMESTAMPTZ '2026-04-01 00:00:00+00', 'tenant1-live-a', '[1,0,0,0]'),
+	(2, 1, '00000000-0000-0000-0000-000000000002', 1, NULL,  DATE '2026-04-02', 9000000002, 8, '22222222-2222-2222-2222-222222222222', TIMESTAMPTZ '2026-04-02 00:00:00+00', 'tenant1-null-b', '[0.99,0.01,0,0]'),
+	(3, 1, '00000000-0000-0000-0000-000000000001', 2, false, DATE '2026-04-01', 9000000003, 9, '33333333-3333-3333-3333-333333333333', TIMESTAMPTZ '2026-04-03 00:00:00+00', 'tenant1-de-c',   '[0.98,0.02,0,0]'),
+	(4, 2, '00000000-0000-0000-0000-000000000003', 1, true,  DATE '2026-04-01', 9000000004, 5, '44444444-4444-4444-4444-444444444444', TIMESTAMPTZ '2026-04-04 00:00:00+00', 'tenant2-live-d', '[1,0,0,0]');
+
+CREATE INDEX tq_metadata_v2_docs_idx
+	ON tq_metadata_v2_docs
+	USING turboquant (
+		embedding tq_cosine_ops,
+		tenant_id tq_int4_filter_ops,
+		source_uuid tq_uuid_filter_ops,
+		lang_id tq_int2_filter_ops,
+		is_live tq_bool_filter_ops,
+		valid_on tq_date_filter_ops
+	)
+	INCLUDE (acl_bucket, doc_uuid, ingested_at)
+	WITH (
+		bits = 4,
+		lists = 2,
+		lanes = auto,
+		transform = 'hadamard',
+		normalized = true
+	);
+
+VACUUM (FREEZE, ANALYZE) tq_metadata_v2_docs;
+
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET turboquant.probes = 2;
+SET turboquant.iterative_scan = 'strict_order';
+SET turboquant.min_rows_after_filter = 1;
+
+EXPLAIN (COSTS OFF)
+SELECT acl_bucket, doc_version, doc_uuid, ingested_at
+FROM tq_metadata_v2_docs
+WHERE tenant_id = 1
+	AND source_uuid = '00000000-0000-0000-0000-000000000002'::uuid
+	AND lang_id = 1::int2
+	AND is_live IS NULL
+ORDER BY embedding <=> '[1,0,0,0]'::vector(4)
+LIMIT 1;
+
+SELECT acl_bucket, doc_uuid, ingested_at
+FROM tq_metadata_v2_docs
+WHERE tenant_id = 1
+	AND source_uuid = ANY (ARRAY[
+		'00000000-0000-0000-0000-000000000001'::uuid,
+		'00000000-0000-0000-0000-000000000002'::uuid
+	])
+	AND valid_on = DATE '2026-04-01'
+ORDER BY embedding <=> '[1,0,0,0]'::vector(4)
+LIMIT 2;
+
+WITH stats AS (
+	SELECT tq_last_scan_stats() AS stats
+)
+SELECT
+	stats->>'score_mode' AS score_mode,
+	(stats->>'decoded_vector_count')::int AS decoded_vector_count,
+	(stats->>'candidate_heap_count')::int >= 1 AS candidate_heap_populated
+FROM stats;

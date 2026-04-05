@@ -20,7 +20,7 @@ tq_init_amroutine(IndexAmRoutine *amroutine)
 	amroutine->amcanmulticol = true;
 	amroutine->amoptionalkey = true;
 	amroutine->amsearcharray = true;
-	amroutine->amsearchnulls = false;
+	amroutine->amsearchnulls = true;
 	amroutine->amstorage = false;
 	amroutine->amclusterable = false;
 	amroutine->ampredlocks = false;

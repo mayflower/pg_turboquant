@@ -211,8 +211,37 @@ class PgTurboquantBackendContractTest(unittest.TestCase):
         self.assertIn("FROM rag_docs_delta AS p", plan.sql)
         self.assertIn("UNION ALL", plan.sql)
         metadata = backend.serialize_run_metadata(plan)
+        self.assertEqual(metadata["delta_mode"], "union")
         self.assertEqual(metadata["delta_table_name"], "rag_docs_delta")
         self.assertEqual(metadata["delta_candidate_limit"], 8)
+
+    def test_native_delta_plan_stays_on_one_index_path(self):
+        backend = PgTurboquantBackend(
+            index_name="rag_docs_embedding_tq_idx",
+            metric="cosine",
+            normalized=True,
+            mode="approx",
+        )
+
+        plan = backend.build_plan(
+            self.table,
+            RetrievalRequest(
+                query_vector=[1.0, 0.0, 0.0],
+                top_k=2,
+                metric="cosine",
+                ann={
+                    "native_delta": True,
+                    "filters": {"tenant_id": 7, "doc_version": [7, 8]},
+                    "stage1_payload_columns": ["doc_id", "doc_version"],
+                },
+            ),
+        )
+
+        self.assertIn("stage1_candidates AS", plan.sql)
+        self.assertNotIn("UNION ALL", plan.sql)
+        metadata = backend.serialize_run_metadata(plan)
+        self.assertEqual(metadata["delta_mode"], "native")
+        self.assertIsNone(metadata["delta_table_name"])
 
     def test_inner_product_requires_normalized_vectors(self):
         backend = PgTurboquantBackend(

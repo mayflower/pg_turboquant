@@ -2,6 +2,10 @@
 
 #include <stdio.h>
 
+#ifdef TQ_UNIT_TEST
+#undef snprintf
+#endif
+
 bool
 tq_build_probe_budget_inputs(const TqListDirEntry *selected_entries,
 							 size_t selected_count,

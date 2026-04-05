@@ -15,6 +15,11 @@ int			tq_guc_max_visited_codes = 0;
 int			tq_guc_max_visited_pages = 0;
 int			tq_guc_iterative_scan = 0;
 int			tq_guc_min_rows_after_filter = 0;
+int			tq_guc_delta_merge_live_count_threshold = 256;
+int			tq_guc_delta_merge_page_count_threshold = 8;
+int			tq_guc_delta_merge_live_percent_threshold = 10;
+int			tq_guc_maintenance_dead_tuple_percent_threshold = 10;
+int			tq_guc_maintenance_reclaimable_page_threshold = 4;
 int			tq_guc_decode_rescore_factor = 1;
 int			tq_guc_decode_rescore_extra_candidates = -1;
 bool		tq_guc_enable_summary_bounds = true;
@@ -104,6 +109,71 @@ _PG_init(void)
 							&tq_guc_min_rows_after_filter,
 							0,
 							0,
+							INT_MAX,
+							PGC_USERSET,
+							0,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("turboquant.delta_merge_live_count_threshold",
+							"TurboQuant recommended delta-merge live-row threshold.",
+							"When the built-in delta tier reaches at least this many live rows, tq_index_metadata marks delta merge as recommended.",
+							&tq_guc_delta_merge_live_count_threshold,
+							256,
+							1,
+							INT_MAX,
+							PGC_USERSET,
+							0,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("turboquant.delta_merge_page_count_threshold",
+							"TurboQuant recommended delta-merge page-depth threshold.",
+							"When the built-in delta tier reaches at least this many batch pages, tq_index_metadata marks delta merge as recommended.",
+							&tq_guc_delta_merge_page_count_threshold,
+							8,
+							1,
+							INT_MAX,
+							PGC_USERSET,
+							0,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("turboquant.delta_merge_live_percent_threshold",
+							"TurboQuant recommended delta-merge live-fraction threshold.",
+							"When the built-in delta tier holds at least this percentage of live rows, tq_index_metadata marks delta merge as recommended.",
+							&tq_guc_delta_merge_live_percent_threshold,
+							10,
+							1,
+							100,
+							PGC_USERSET,
+							0,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("turboquant.maintenance_dead_tuple_percent_threshold",
+							"TurboQuant recommended dead-tuple compaction threshold.",
+							"When dead rows reach at least this percentage of stored tuples, tq_index_metadata marks compaction as recommended.",
+							&tq_guc_maintenance_dead_tuple_percent_threshold,
+							10,
+							1,
+							100,
+							PGC_USERSET,
+							0,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("turboquant.maintenance_reclaimable_page_threshold",
+							"TurboQuant recommended reclaimable-page compaction threshold.",
+							"When at least this many reclaimable pages accumulate, tq_index_metadata marks compaction as recommended.",
+							&tq_guc_maintenance_reclaimable_page_threshold,
+							4,
+							1,
 							INT_MAX,
 							PGC_USERSET,
 							0,

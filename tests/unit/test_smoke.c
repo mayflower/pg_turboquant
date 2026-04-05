@@ -62,7 +62,7 @@ test_tq_init_amroutine_flags(void)
 	assert(amroutine.amcanmulticol == true);
 	assert(amroutine.amoptionalkey == true);
 	assert(amroutine.amsearcharray == true);
-	assert(amroutine.amsearchnulls == false);
+	assert(amroutine.amsearchnulls == true);
 	assert(amroutine.amclusterable == false);
 	assert(amroutine.amcaninclude == true);
 	assert(amroutine.amsummarizing == false);
@@ -1575,10 +1575,10 @@ test_tq_planner_cost_helper_prefers_flat_for_small_tables(void)
 	memset(&flat, 0, sizeof(flat));
 	memset(&ivf, 0, sizeof(ivf));
 
-	assert(tq_estimate_ordered_scan_cost(4.0, 32.0, 10.0, 0, 1, 4,
+	assert(tq_estimate_ordered_scan_cost(4.0, 32.0, 10.0, 1.0, 0, 1, 4,
 										 0, 0,
 										 0.005, 0.0025, 4.0, 0.01, &flat));
-	assert(tq_estimate_ordered_scan_cost(4.0, 32.0, 10.0, 4, 1, 4,
+	assert(tq_estimate_ordered_scan_cost(4.0, 32.0, 10.0, 1.0, 4, 1, 4,
 										 0, 0,
 										 0.005, 0.0025, 4.0, 0.01, &ivf));
 	assert_float_close((float) flat.scanned_fraction, 1.0f, 1e-6f);
@@ -1595,10 +1595,10 @@ test_tq_planner_cost_helper_prefers_ivf_for_large_tables_and_low_probes(void)
 	memset(&flat, 0, sizeof(flat));
 	memset(&ivf, 0, sizeof(ivf));
 
-	assert(tq_estimate_ordered_scan_cost(512.0, 4096.0, 100.0, 0, 1, 4,
+	assert(tq_estimate_ordered_scan_cost(512.0, 4096.0, 100.0, 1.0, 0, 1, 4,
 										 0, 0,
 										 0.005, 0.0025, 4.0, 0.01, &flat));
-	assert(tq_estimate_ordered_scan_cost(512.0, 4096.0, 100.0, 16, 1, 4,
+	assert(tq_estimate_ordered_scan_cost(512.0, 4096.0, 100.0, 1.0, 16, 1, 4,
 										 0, 0,
 										 0.005, 0.0025, 4.0, 0.01, &ivf));
 	assert(ivf.scanned_fraction < 0.1);
@@ -1614,10 +1614,10 @@ test_tq_planner_cost_helper_high_probes_remove_ivf_advantage(void)
 	memset(&flat, 0, sizeof(flat));
 	memset(&ivf, 0, sizeof(ivf));
 
-	assert(tq_estimate_ordered_scan_cost(512.0, 4096.0, 100.0, 0, 16, 4,
+	assert(tq_estimate_ordered_scan_cost(512.0, 4096.0, 100.0, 1.0, 0, 16, 4,
 										 0, 0,
 										 0.005, 0.0025, 4.0, 0.01, &flat));
-	assert(tq_estimate_ordered_scan_cost(512.0, 4096.0, 100.0, 16, 16, 4,
+	assert(tq_estimate_ordered_scan_cost(512.0, 4096.0, 100.0, 1.0, 16, 16, 4,
 										 0, 0,
 										 0.005, 0.0025, 4.0, 0.01, &ivf));
 	assert_float_close((float) ivf.scanned_fraction, 1.0f, 1e-6f);
@@ -1635,13 +1635,13 @@ test_tq_planner_cost_helper_visit_budgets_limit_ivf_work(void)
 	memset(&bounded_codes, 0, sizeof(bounded_codes));
 	memset(&bounded_pages, 0, sizeof(bounded_pages));
 
-	assert(tq_estimate_ordered_scan_cost(512.0, 4096.0, 100.0, 16, 16, 4,
+	assert(tq_estimate_ordered_scan_cost(512.0, 4096.0, 100.0, 1.0, 16, 16, 4,
 										 0, 0,
 										 0.005, 0.0025, 4.0, 0.01, &unbounded));
-	assert(tq_estimate_ordered_scan_cost(512.0, 4096.0, 100.0, 16, 16, 4,
+	assert(tq_estimate_ordered_scan_cost(512.0, 4096.0, 100.0, 1.0, 16, 16, 4,
 										 256, 0,
 										 0.005, 0.0025, 4.0, 0.01, &bounded_codes));
-	assert(tq_estimate_ordered_scan_cost(512.0, 4096.0, 100.0, 16, 16, 4,
+	assert(tq_estimate_ordered_scan_cost(512.0, 4096.0, 100.0, 1.0, 16, 16, 4,
 										 0, 32,
 										 0.005, 0.0025, 4.0, 0.01, &bounded_pages));
 
@@ -1659,20 +1659,21 @@ test_tq_planner_cost_helper_visit_budgets_limit_ivf_work(void)
 static void
 test_tq_planner_cost_helper_accounts_for_filter_selectivity(void)
 {
-	TqPlannerCostEstimate unfiltered;
-	TqPlannerCostEstimate filtered;
+	TqPlannerCostEstimate broad_filter;
+	TqPlannerCostEstimate selective_filter;
 
-	memset(&unfiltered, 0, sizeof(unfiltered));
-	memset(&filtered, 0, sizeof(filtered));
+	memset(&broad_filter, 0, sizeof(broad_filter));
+	memset(&selective_filter, 0, sizeof(selective_filter));
 
-	assert(tq_estimate_ordered_scan_cost(512.0, 4096.0, 4096.0, 16, 2, 4,
+	assert(tq_estimate_ordered_scan_cost(512.0, 4096.0, 16.0, 1.0, 16, 2, 4,
 										 0, 0,
-										 0.005, 0.0025, 4.0, 0.01, &unfiltered));
-	assert(tq_estimate_ordered_scan_cost(512.0, 4096.0, 8.0, 16, 2, 4,
+										 0.005, 0.0025, 4.0, 0.01, &broad_filter));
+	assert(tq_estimate_ordered_scan_cost(512.0, 4096.0, 16.0, 0.01, 16, 2, 4,
 										 0, 0,
-										 0.005, 0.0025, 4.0, 0.01, &filtered));
-	assert(filtered.selectivity < unfiltered.selectivity);
-	assert(filtered.total_cost < unfiltered.total_cost);
+										 0.005, 0.0025, 4.0, 0.01, &selective_filter));
+	assert(selective_filter.qual_selectivity < broad_filter.qual_selectivity);
+	assert(selective_filter.candidate_bound > broad_filter.candidate_bound);
+	assert(selective_filter.total_cost > broad_filter.total_cost);
 }
 
 static void
@@ -2394,6 +2395,10 @@ test_tq_meta_page_roundtrip(void)
 		.list_count = 128,
 		.directory_root_block = 7,
 		.centroid_root_block = 9,
+		.delta_head_block = TQ_INVALID_BLOCK_NUMBER,
+		.delta_tail_block = TQ_INVALID_BLOCK_NUMBER,
+		.delta_live_count = 0,
+		.delta_batch_page_count = 0,
 		.transform_seed = UINT64_C(0x1122334455667788),
 		.algorithm_version = TQ_ALGORITHM_VERSION,
 		.quantizer_version = TQ_QUANTIZER_VERSION,
@@ -2422,6 +2427,10 @@ test_tq_meta_page_roundtrip(void)
 	assert(readback.list_count == written.list_count);
 	assert(readback.directory_root_block == written.directory_root_block);
 	assert(readback.centroid_root_block == written.centroid_root_block);
+	assert(readback.delta_head_block == written.delta_head_block);
+	assert(readback.delta_tail_block == written.delta_tail_block);
+	assert(readback.delta_live_count == written.delta_live_count);
+	assert(readback.delta_batch_page_count == written.delta_batch_page_count);
 	assert(readback.transform_seed == written.transform_seed);
 	assert(readback.algorithm_version == written.algorithm_version);
 	assert(readback.quantizer_version == written.quantizer_version);
@@ -2448,6 +2457,10 @@ test_tq_meta_page_rejects_old_format_version(void)
 		.list_count = 0,
 		.directory_root_block = TQ_INVALID_BLOCK_NUMBER,
 		.centroid_root_block = TQ_INVALID_BLOCK_NUMBER,
+		.delta_head_block = TQ_INVALID_BLOCK_NUMBER,
+		.delta_tail_block = TQ_INVALID_BLOCK_NUMBER,
+		.delta_live_count = 0,
+		.delta_batch_page_count = 0,
 		.transform_seed = UINT64_C(7),
 		.algorithm_version = TQ_ALGORITHM_VERSION,
 		.quantizer_version = TQ_QUANTIZER_VERSION,

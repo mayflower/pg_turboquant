@@ -7,6 +7,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef TQ_UNIT_TEST
+#undef snprintf
+#endif
+
 #define TQ_PROD_CODEBOOK_GRID 8192u
 #define TQ_PROD_LLOYD_MAX_ITERATIONS 64u
 #define TQ_PROD_QJL_SCALE ((float) 1.253314137315500251f)

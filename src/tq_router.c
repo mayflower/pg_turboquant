@@ -5,6 +5,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef TQ_UNIT_TEST
+#undef snprintf
+#endif
+
 typedef struct TqRouterObjective
 {
 	float		mean_distortion;
