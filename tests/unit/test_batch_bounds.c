@@ -344,7 +344,7 @@ test_early_stop_requires_full_heap(void)
 
 	memset(&heap, 0, sizeof(heap));
 	assert(tq_candidate_heap_init(&heap, 2));
-	assert(tq_candidate_heap_push(&heap, 0.10f, 1, 1, NULL, 0));
+	assert(tq_candidate_heap_push(&heap, 0.10f, 1, 1, NULL, NULL, 0));
 	assert(tq_scan_should_prune_page(&heap, 0.50f, &should_prune, errmsg, sizeof(errmsg)));
 	assert(!should_prune);
 	tq_candidate_heap_reset(&heap);
@@ -359,8 +359,8 @@ test_full_heap_prunes_worse_page_bounds(void)
 
 	memset(&heap, 0, sizeof(heap));
 	assert(tq_candidate_heap_init(&heap, 2));
-	assert(tq_candidate_heap_push(&heap, 0.10f, 1, 1, NULL, 0));
-	assert(tq_candidate_heap_push(&heap, 0.20f, 1, 2, NULL, 0));
+	assert(tq_candidate_heap_push(&heap, 0.10f, 1, 1, NULL, NULL, 0));
+	assert(tq_candidate_heap_push(&heap, 0.20f, 1, 2, NULL, NULL, 0));
 	assert(tq_scan_should_prune_page(&heap, 0.25f, &should_prune, errmsg, sizeof(errmsg)));
 	assert(should_prune);
 	tq_candidate_heap_reset(&heap);

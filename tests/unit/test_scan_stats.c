@@ -170,10 +170,10 @@ test_candidate_heap_event_counters_track_insert_replace_and_reject(void)
 
 	tq_scan_stats_begin(TQ_SCAN_MODE_IVF, 4);
 	assert(tq_candidate_heap_init(&heap, 2));
-	assert(tq_candidate_heap_push(&heap, 5.0f, 1, 1, NULL, 0));
-	assert(tq_candidate_heap_push(&heap, 3.0f, 1, 2, NULL, 0));
-	assert(tq_candidate_heap_push(&heap, 4.0f, 1, 3, NULL, 0));
-	assert(tq_candidate_heap_push(&heap, 6.0f, 1, 4, NULL, 0));
+	assert(tq_candidate_heap_push(&heap, 5.0f, 1, 1, NULL, NULL, 0));
+	assert(tq_candidate_heap_push(&heap, 3.0f, 1, 2, NULL, NULL, 0));
+	assert(tq_candidate_heap_push(&heap, 4.0f, 1, 3, NULL, NULL, 0));
+	assert(tq_candidate_heap_push(&heap, 6.0f, 1, 4, NULL, NULL, 0));
 	tq_scan_stats_set_candidate_heap_metrics(heap.capacity, heap.count);
 	tq_scan_stats_snapshot(&stats);
 
@@ -236,13 +236,13 @@ test_shadow_decode_metrics_track_heap_overlap(void)
 	assert(tq_candidate_heap_init(&primary, 3));
 	assert(tq_candidate_heap_init(&shadow, 3));
 
-	assert(tq_candidate_heap_push(&primary, 1.0f, 1, 1, NULL, 0));
-	assert(tq_candidate_heap_push(&primary, 2.0f, 1, 2, NULL, 0));
-	assert(tq_candidate_heap_push(&primary, 3.0f, 1, 3, NULL, 0));
+	assert(tq_candidate_heap_push(&primary, 1.0f, 1, 1, NULL, NULL, 0));
+	assert(tq_candidate_heap_push(&primary, 2.0f, 1, 2, NULL, NULL, 0));
+	assert(tq_candidate_heap_push(&primary, 3.0f, 1, 3, NULL, NULL, 0));
 
-	assert(tq_candidate_heap_push(&shadow, 2.0f, 1, 2, NULL, 0));
-	assert(tq_candidate_heap_push(&shadow, 3.0f, 1, 3, NULL, 0));
-	assert(tq_candidate_heap_push(&shadow, 4.0f, 1, 4, NULL, 0));
+	assert(tq_candidate_heap_push(&shadow, 2.0f, 1, 2, NULL, NULL, 0));
+	assert(tq_candidate_heap_push(&shadow, 3.0f, 1, 3, NULL, NULL, 0));
+	assert(tq_candidate_heap_push(&shadow, 4.0f, 1, 4, NULL, NULL, 0));
 
 	tq_scan_stats_record_shadow_decoded_vector();
 	tq_scan_stats_record_shadow_decoded_vector();

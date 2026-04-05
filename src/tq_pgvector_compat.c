@@ -46,6 +46,114 @@ tq_set_error(char *errmsg, size_t errmsg_len, const char *message)
 	errmsg[message_len] = '\0';
 }
 
+static bool
+tq_vector_input_dimension_and_raw_size(const void *input,
+										 TqVectorInputKind kind,
+										 uint32_t *dimension,
+										 size_t *raw_len,
+										 char *errmsg,
+										 size_t errmsg_len)
+{
+	int dim = 0;
+
+	if (input == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid tq_pgvector conversion: input value must be non-null with positive dimension");
+		return false;
+	}
+
+	switch (kind)
+	{
+		case TQ_VECTOR_INPUT_VECTOR:
+			dim = ((const Vector *) input)->dim;
+			if (raw_len != NULL)
+				*raw_len = VECTOR_SIZE(dim);
+			break;
+		case TQ_VECTOR_INPUT_HALFVEC:
+			dim = ((const HalfVector *) input)->dim;
+			if (raw_len != NULL)
+				*raw_len = HALFVEC_SIZE(dim);
+			break;
+		default:
+			tq_set_error(errmsg, errmsg_len,
+						 "invalid tq_pgvector conversion: unsupported input kind");
+			return false;
+	}
+
+	if (dim <= 0)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid tq_pgvector conversion: input value must be non-null with positive dimension");
+		return false;
+	}
+
+	if (dimension != NULL)
+		*dimension = (uint32_t) dim;
+
+	return true;
+}
+
+static bool
+tq_validate_copy_from_typed_vector_input(const void *input,
+										 TqVectorInputKind kind,
+										 float *out,
+										 size_t out_len,
+										 uint32_t *dimension,
+										 uint32_t *resolved_dimension,
+										 char *errmsg,
+										 size_t errmsg_len)
+{
+	uint32_t	dim = 0;
+
+	switch (kind)
+	{
+		case TQ_VECTOR_INPUT_VECTOR:
+			break;
+		case TQ_VECTOR_INPUT_HALFVEC:
+			break;
+		default:
+			tq_set_error(errmsg, errmsg_len,
+						 "invalid tq_pgvector conversion: unsupported input kind");
+			return false;
+	}
+
+	if (input == NULL || out == NULL || dimension == NULL || resolved_dimension == NULL)
+	{
+		if (kind == TQ_VECTOR_INPUT_VECTOR)
+			tq_set_error(errmsg, errmsg_len,
+						 "invalid tq_pgvector conversion: vector, output, and dimension must be non-null");
+		else
+			tq_set_error(errmsg, errmsg_len,
+						 "invalid tq_pgvector conversion: halfvec, output, and dimension must be non-null");
+		return false;
+	}
+
+	if (!tq_vector_input_dimension_and_raw_size(input, kind, &dim, NULL, errmsg, errmsg_len))
+	{
+		if (input != NULL)
+		{
+			if (kind == TQ_VECTOR_INPUT_VECTOR)
+				tq_set_error(errmsg, errmsg_len,
+							 "invalid tq_pgvector conversion: vector dimension must be positive");
+			else
+				tq_set_error(errmsg, errmsg_len,
+							 "invalid tq_pgvector conversion: halfvec dimension must be positive");
+		}
+		return false;
+	}
+
+	if (out_len < (size_t) dim)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid tq_pgvector conversion: output buffer is too small");
+		return false;
+	}
+
+	*resolved_dimension = dim;
+	return true;
+}
+
 bool
 tq_vector_copy_from_pgvector(const Vector *vector,
 							 float *out,
@@ -54,33 +162,23 @@ tq_vector_copy_from_pgvector(const Vector *vector,
 							 char *errmsg,
 							 size_t errmsg_len)
 {
+	uint32_t	resolved_dimension = 0;
 	uint32_t	i = 0;
 
-	if (vector == NULL || out == NULL || dimension == NULL)
-	{
-		tq_set_error(errmsg, errmsg_len,
-					 "invalid tq_pgvector conversion: vector, output, and dimension must be non-null");
+	if (!tq_validate_copy_from_typed_vector_input(vector,
+												  TQ_VECTOR_INPUT_VECTOR,
+												  out,
+												  out_len,
+												  dimension,
+												  &resolved_dimension,
+												  errmsg,
+												  errmsg_len))
 		return false;
-	}
 
-	if (vector->dim <= 0)
-	{
-		tq_set_error(errmsg, errmsg_len,
-					 "invalid tq_pgvector conversion: vector dimension must be positive");
-		return false;
-	}
-
-	if (out_len < (size_t) vector->dim)
-	{
-		tq_set_error(errmsg, errmsg_len,
-					 "invalid tq_pgvector conversion: output buffer is too small");
-		return false;
-	}
-
-	for (i = 0; i < (uint32_t) vector->dim; i++)
+	for (i = 0; i < resolved_dimension; i++)
 		out[i] = vector->x[i];
 
-	*dimension = (uint32_t) vector->dim;
+	*dimension = resolved_dimension;
 	return true;
 }
 
@@ -92,33 +190,23 @@ tq_vector_copy_from_halfvec(const HalfVector *vector,
 							char *errmsg,
 							size_t errmsg_len)
 {
+	uint32_t	resolved_dimension = 0;
 	uint32_t	i = 0;
 
-	if (vector == NULL || out == NULL || dimension == NULL)
-	{
-		tq_set_error(errmsg, errmsg_len,
-					 "invalid tq_pgvector conversion: halfvec, output, and dimension must be non-null");
+	if (!tq_validate_copy_from_typed_vector_input(vector,
+												  TQ_VECTOR_INPUT_HALFVEC,
+												  out,
+												  out_len,
+												  dimension,
+												  &resolved_dimension,
+												  errmsg,
+												  errmsg_len))
 		return false;
-	}
 
-	if (vector->dim <= 0)
-	{
-		tq_set_error(errmsg, errmsg_len,
-					 "invalid tq_pgvector conversion: halfvec dimension must be positive");
-		return false;
-	}
-
-	if (out_len < (size_t) vector->dim)
-	{
-		tq_set_error(errmsg, errmsg_len,
-					 "invalid tq_pgvector conversion: output buffer is too small");
-		return false;
-	}
-
-	for (i = 0; i < (uint32_t) vector->dim; i++)
+	for (i = 0; i < resolved_dimension; i++)
 		out[i] = HalfToFloat4(vector->x[i]);
 
-	*dimension = (uint32_t) vector->dim;
+	*dimension = resolved_dimension;
 	return true;
 }
 
@@ -237,14 +325,16 @@ tq_vector_copy_raw_datum_typed(Datum value,
 	{
 		case TQ_VECTOR_INPUT_VECTOR:
 			vector = tq_pgvector_detoast(value);
-			if (vector == NULL || vector->dim <= 0)
+			if (!tq_vector_input_dimension_and_raw_size(vector,
+														 kind,
+														 dimension,
+														 &raw_len,
+														 errmsg,
+														 errmsg_len))
 			{
-				tq_set_error(errmsg, errmsg_len,
-							 "invalid tq_pgvector conversion: vector must be non-null with positive dimension");
 				tq_pgvector_release(vector, original);
 				return false;
 			}
-			raw_len = VECTOR_SIZE(vector->dim);
 			if (out_len < raw_len)
 			{
 				tq_set_error(errmsg, errmsg_len,
@@ -253,19 +343,20 @@ tq_vector_copy_raw_datum_typed(Datum value,
 				return false;
 			}
 			memcpy(out, vector, raw_len);
-			*dimension = (uint32_t) vector->dim;
 			tq_pgvector_release(vector, original);
 			return true;
 		case TQ_VECTOR_INPUT_HALFVEC:
 			halfvec = tq_halfvec_detoast(value);
-			if (halfvec == NULL || halfvec->dim <= 0)
+			if (!tq_vector_input_dimension_and_raw_size(halfvec,
+														 kind,
+														 dimension,
+														 &raw_len,
+														 errmsg,
+														 errmsg_len))
 			{
-				tq_set_error(errmsg, errmsg_len,
-							 "invalid tq_pgvector conversion: halfvec must be non-null with positive dimension");
 				tq_halfvec_release(halfvec, original);
 				return false;
 			}
-			raw_len = HALFVEC_SIZE(halfvec->dim);
 			if (out_len < raw_len)
 			{
 				tq_set_error(errmsg, errmsg_len,
@@ -274,7 +365,6 @@ tq_vector_copy_raw_datum_typed(Datum value,
 				return false;
 			}
 			memcpy(out, halfvec, raw_len);
-			*dimension = (uint32_t) halfvec->dim;
 			tq_halfvec_release(halfvec, original);
 			return true;
 		default:
@@ -362,38 +452,22 @@ tq_vector_dimension_from_datum_typed(Datum value,
 	{
 		case TQ_VECTOR_INPUT_VECTOR:
 			vector = tq_pgvector_detoast(value);
-			if (vector == NULL)
-			{
-				tq_set_error(errmsg, errmsg_len,
-							 "invalid tq_pgvector conversion: vector and dimension must be non-null");
-				ok = false;
-			}
-			else if (vector->dim <= 0)
-			{
-				tq_set_error(errmsg, errmsg_len,
-							 "invalid tq_pgvector conversion: vector dimension must be positive");
-				ok = false;
-			}
-			else
-				*dimension = (uint32_t) vector->dim;
+			ok = tq_vector_input_dimension_and_raw_size(vector,
+													   kind,
+													   dimension,
+													   NULL,
+													   errmsg,
+													   errmsg_len);
 			tq_pgvector_release(vector, original);
 			return ok;
 		case TQ_VECTOR_INPUT_HALFVEC:
 			halfvec = tq_halfvec_detoast(value);
-			if (halfvec == NULL)
-			{
-				tq_set_error(errmsg, errmsg_len,
-							 "invalid tq_pgvector conversion: halfvec and dimension must be non-null");
-				ok = false;
-			}
-			else if (halfvec->dim <= 0)
-			{
-				tq_set_error(errmsg, errmsg_len,
-							 "invalid tq_pgvector conversion: halfvec dimension must be positive");
-				ok = false;
-			}
-			else
-				*dimension = (uint32_t) halfvec->dim;
+			ok = tq_vector_input_dimension_and_raw_size(halfvec,
+													   kind,
+													   dimension,
+													   NULL,
+													   errmsg,
+													   errmsg_len);
 			tq_halfvec_release(halfvec, original);
 			return ok;
 		default:

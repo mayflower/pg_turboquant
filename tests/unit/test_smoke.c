@@ -1529,6 +1529,92 @@ test_tq_vector_copy_from_halfvec_datum_typed(void)
 }
 
 static void
+test_tq_vector_copy_struct_validation_messages_are_consistent(void)
+{
+	const float	vector_values[3] = {1.0f, -0.5f, 0.25f};
+	const float	halfvec_values[3] = {0.5f, -0.25f, 0.125f};
+	Vector	   *vector = alloc_test_vector(3, vector_values);
+	HalfVector *halfvec = alloc_test_halfvec(3, halfvec_values);
+	float		out[3];
+	uint32_t	dimension = 0;
+	char		errmsg[256];
+
+	memset(out, 0, sizeof(out));
+	memset(errmsg, 0, sizeof(errmsg));
+	assert(!tq_vector_copy_from_pgvector(NULL, out, 3, &dimension, errmsg, sizeof(errmsg)));
+	assert(strcmp(errmsg,
+				  "invalid tq_pgvector conversion: vector, output, and dimension must be non-null") == 0);
+
+	memset(errmsg, 0, sizeof(errmsg));
+	assert(!tq_vector_copy_from_halfvec(NULL, out, 3, &dimension, errmsg, sizeof(errmsg)));
+	assert(strcmp(errmsg,
+				  "invalid tq_pgvector conversion: halfvec, output, and dimension must be non-null") == 0);
+
+	memset(errmsg, 0, sizeof(errmsg));
+	assert(!tq_vector_copy_from_pgvector(vector, out, 2, &dimension, errmsg, sizeof(errmsg)));
+	assert(strcmp(errmsg,
+				  "invalid tq_pgvector conversion: output buffer is too small") == 0);
+
+	memset(errmsg, 0, sizeof(errmsg));
+	assert(!tq_vector_copy_from_halfvec(halfvec, out, 2, &dimension, errmsg, sizeof(errmsg)));
+	assert(strcmp(errmsg,
+				  "invalid tq_pgvector conversion: output buffer is too small") == 0);
+
+	free(vector);
+	free(halfvec);
+}
+
+static void
+test_tq_vector_typed_validation_messages_are_consistent(void)
+{
+	uint32_t	dimension = 0;
+	uint8_t		raw[64];
+	char		errmsg[256];
+
+	memset(raw, 0, sizeof(raw));
+	memset(errmsg, 0, sizeof(errmsg));
+
+	assert(!tq_vector_dimension_from_datum_typed(PointerGetDatum(NULL),
+												 TQ_VECTOR_INPUT_VECTOR,
+												 &dimension,
+												 errmsg,
+												 sizeof(errmsg)));
+	assert(strcmp(errmsg,
+				  "invalid tq_pgvector conversion: input value must be non-null with positive dimension") == 0);
+
+	memset(errmsg, 0, sizeof(errmsg));
+	assert(!tq_vector_dimension_from_datum_typed(PointerGetDatum(NULL),
+												 TQ_VECTOR_INPUT_HALFVEC,
+												 &dimension,
+												 errmsg,
+												 sizeof(errmsg)));
+	assert(strcmp(errmsg,
+				  "invalid tq_pgvector conversion: input value must be non-null with positive dimension") == 0);
+
+	memset(errmsg, 0, sizeof(errmsg));
+	assert(!tq_vector_copy_raw_datum_typed(PointerGetDatum(NULL),
+										   TQ_VECTOR_INPUT_VECTOR,
+										   raw,
+										   sizeof(raw),
+										   &dimension,
+										   errmsg,
+										   sizeof(errmsg)));
+	assert(strcmp(errmsg,
+				  "invalid tq_pgvector conversion: input value must be non-null with positive dimension") == 0);
+
+	memset(errmsg, 0, sizeof(errmsg));
+	assert(!tq_vector_copy_raw_datum_typed(PointerGetDatum(NULL),
+										   TQ_VECTOR_INPUT_HALFVEC,
+										   raw,
+										   sizeof(raw),
+										   &dimension,
+										   errmsg,
+										   sizeof(errmsg)));
+	assert(strcmp(errmsg,
+				  "invalid tq_pgvector conversion: input value must be non-null with positive dimension") == 0);
+}
+
+static void
 test_tq_metric_distance_from_ip_score_modes(void)
 {
 	float		distance = 0.0f;
@@ -1686,11 +1772,11 @@ test_tq_candidate_heap_behavior(void)
 	memset(&entry, 0, sizeof(entry));
 
 	assert(tq_candidate_heap_init(&heap, 3));
-	assert(tq_candidate_heap_push(&heap, 0.40f, 10, 1, NULL, 0));
-	assert(tq_candidate_heap_push(&heap, 0.20f, 10, 2, NULL, 0));
-	assert(tq_candidate_heap_push(&heap, 0.30f, 10, 3, NULL, 0));
-	assert(tq_candidate_heap_push(&heap, 0.90f, 10, 4, NULL, 0));
-	assert(tq_candidate_heap_push(&heap, 0.10f, 10, 5, NULL, 0));
+	assert(tq_candidate_heap_push(&heap, 0.40f, 10, 1, NULL, NULL, 0));
+	assert(tq_candidate_heap_push(&heap, 0.20f, 10, 2, NULL, NULL, 0));
+	assert(tq_candidate_heap_push(&heap, 0.30f, 10, 3, NULL, NULL, 0));
+	assert(tq_candidate_heap_push(&heap, 0.90f, 10, 4, NULL, NULL, 0));
+	assert(tq_candidate_heap_push(&heap, 0.10f, 10, 5, NULL, NULL, 0));
 
 	assert(heap.count == 3);
 	assert(tq_candidate_heap_pop_best(&heap, &entry));
@@ -2399,6 +2485,9 @@ test_tq_meta_page_roundtrip(void)
 		.delta_tail_block = TQ_INVALID_BLOCK_NUMBER,
 		.delta_live_count = 0,
 		.delta_batch_page_count = 0,
+		.exact_key_head_block = TQ_INVALID_BLOCK_NUMBER,
+		.exact_key_tail_block = TQ_INVALID_BLOCK_NUMBER,
+		.exact_key_page_count = 0,
 		.transform_seed = UINT64_C(0x1122334455667788),
 		.algorithm_version = TQ_ALGORITHM_VERSION,
 		.quantizer_version = TQ_QUANTIZER_VERSION,
@@ -2431,6 +2520,9 @@ test_tq_meta_page_roundtrip(void)
 	assert(readback.delta_tail_block == written.delta_tail_block);
 	assert(readback.delta_live_count == written.delta_live_count);
 	assert(readback.delta_batch_page_count == written.delta_batch_page_count);
+	assert(readback.exact_key_head_block == written.exact_key_head_block);
+	assert(readback.exact_key_tail_block == written.exact_key_tail_block);
+	assert(readback.exact_key_page_count == written.exact_key_page_count);
 	assert(readback.transform_seed == written.transform_seed);
 	assert(readback.algorithm_version == written.algorithm_version);
 	assert(readback.quantizer_version == written.quantizer_version);
@@ -2461,6 +2553,9 @@ test_tq_meta_page_rejects_old_format_version(void)
 		.delta_tail_block = TQ_INVALID_BLOCK_NUMBER,
 		.delta_live_count = 0,
 		.delta_batch_page_count = 0,
+		.exact_key_head_block = TQ_INVALID_BLOCK_NUMBER,
+		.exact_key_tail_block = TQ_INVALID_BLOCK_NUMBER,
+		.exact_key_page_count = 0,
 		.transform_seed = UINT64_C(7),
 		.algorithm_version = TQ_ALGORITHM_VERSION,
 		.quantizer_version = TQ_QUANTIZER_VERSION,
@@ -2938,6 +3033,8 @@ main(void)
 	test_tq_vector_copy_from_pgvector_struct();
 	test_tq_vector_copy_from_halfvec_struct();
 	test_tq_vector_copy_from_halfvec_datum_typed();
+	test_tq_vector_copy_struct_validation_messages_are_consistent();
+	test_tq_vector_typed_validation_messages_are_consistent();
 	test_tq_candidate_budget_helper();
 	test_tq_streaming_candidate_budget_helper();
 	test_tq_planner_cost_helper_prefers_flat_for_small_tables();
