@@ -96,7 +96,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-backend-isolation",
         action="store_true",
-        help="Reuse the shared source table directly instead of cloning one backend-isolated table per index family",
+        help=(
+            "Reuse the shared source table directly instead of cloning one backend-isolated table per index family. "
+            "Unsafe for comparative runs with distinct backend indexes."
+        ),
     )
     return parser.parse_args()
 

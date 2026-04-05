@@ -453,6 +453,8 @@ tq_select_cost_aware_probes(const double *ranked_scores,
 			bool fits_code = code_budget == 0 || selected_live + next_live <= code_budget;
 			bool fits_pages = page_budget == 0 || selected_pages + next_pages <= page_budget;
 
+			if (next_live == 0 && next_pages == 0)
+				continue;
 			if (!fits_code || !fits_pages)
 				continue;
 

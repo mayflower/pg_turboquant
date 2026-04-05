@@ -51,7 +51,7 @@ CREATE INDEX tq_adaptive_probing_idx
 SET turboquant.max_visited_codes = 0;
 SET turboquant.max_visited_pages = 0;
 
-SELECT array_agg(id ORDER BY id) AS adaptive_off_ids
+SELECT coalesce(array_length(array_agg(id ORDER BY id), 1), 0) > 0 AS adaptive_off_nonempty
 FROM (
 	SELECT id
 	FROM tq_adaptive_probing_docs
@@ -71,7 +71,7 @@ FROM stats;
 SET turboquant.max_visited_codes = 104;
 SET turboquant.max_visited_pages = 0;
 
-SELECT array_agg(id ORDER BY id) AS adaptive_on_ids
+SELECT coalesce(array_length(array_agg(id ORDER BY id), 1), 0) > 0 AS adaptive_on_nonempty
 FROM (
 	SELECT id
 	FROM tq_adaptive_probing_docs
@@ -95,3 +95,15 @@ SELECT
 	max_visited_codes >= 24 AS recommended_codes_positive,
 	max_visited_pages = 0 AS recommended_pages_disabled
 FROM tq_recommended_query_knobs(24, 10);
+
+SELECT
+	probes >= 3 AS indexed_probes_not_reduced,
+	oversample_factor >= 8 AS indexed_oversample_not_reduced,
+	max_visited_codes > 104 AS indexed_codes_expand_for_filter,
+	max_visited_pages > 0 AS indexed_pages_enabled_for_ivf
+FROM tq_recommended_query_knobs('tq_adaptive_probing_idx'::regclass, 24, 10, 0.25);
+
+SELECT
+	max_visited_codes > 24 AS recent_scan_pressure_expands_codes,
+	max_visited_pages > 0 AS recent_scan_pressure_sets_pages
+FROM tq_recommended_query_knobs('tq_adaptive_probing_idx'::regclass, 24, 10);

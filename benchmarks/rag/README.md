@@ -208,6 +208,8 @@ uv run python benchmarks/rag/run_live_campaign.py \
 - The table's ID column must align with the selected dataset's stable evidence IDs.
   Exact match is preferred.
   For the bundled KILT-style configs and `popqa`, the live runner also accepts composite IDs whose leading component before `:` is the stable ID recorded by the dataset config.
+- Comparative live runs should keep backend isolation enabled.
+  Reusing one shared table with multiple ANN indexes can let PostgreSQL pick a different index than the benchmark backend requested, which invalidates backend-to-backend comparisons.
 - The live runner does not mix BEIR orchestration into this path.
   BEIR remains in `benchmarks/rag/regression_gate.py`, while the live campaign uses BERGEN-style datasets plus the PostgreSQL adapter stack in `benchmarks/rag/bergen_adapter/`.
 

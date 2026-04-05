@@ -40,6 +40,17 @@ SELECT * FROM tq_recommended_query_knobs(24, 10);
       3 |                 8 |               192 |                 0
 (1 row)
 
+SELECT
+	probes > 0 AS indexed_probes_positive,
+	oversample_factor >= 8 AS indexed_oversample_not_reduced,
+	max_visited_codes > 0 AS indexed_codes_positive_for_flat,
+	max_visited_pages = 0 AS flat_pages_stay_disabled
+FROM tq_recommended_query_knobs('tq_query_helper_docs_idx'::regclass, 24, 10, 0.25);
+ indexed_probes_positive | indexed_oversample_not_reduced | indexed_codes_positive_for_flat | flat_pages_stay_disabled 
+-------------------------+--------------------------------+---------------------------------+--------------------------
+ t                       | t                              | t                               | t
+(1 row)
+
 SELECT * FROM tq_resolve_query_knobs(24, 10, 6, 4);
  probes | oversample_factor | max_visited_codes | max_visited_pages 
 --------+-------------------+-------------------+-------------------
@@ -164,6 +175,10 @@ ERROR:  invalid turboquant limits: final_limit (8) exceeds candidate_limit (4)
 HINT:  final_limit must be less than or equal to candidate_limit.
 CONTEXT:  PL/pgSQL function tq_resolve_query_knobs(integer,integer,integer,integer) line 20 at RAISE
 SQL function "tq_recommended_query_knobs" statement 1
+SELECT * FROM tq_recommended_query_knobs('tq_query_helper_docs_idx'::regclass, 24, 10, 1.5);
+ERROR:  invalid turboquant filter_selectivity: 1.5
+HINT:  filter_selectivity must be greater than 0 and less than or equal to 1.
+CONTEXT:  PL/pgSQL function tq_recommended_query_knobs(regclass,integer,integer,double precision) line 36 at RAISE
 SELECT *
 FROM tq_approx_candidates(
 	'tq_query_helper_docs'::regclass,

@@ -7,7 +7,7 @@
   "embedding": {
     "model": "BAAI/bge-small-en-v1.5",
     "dimension": 384,
-    "normalized": false
+    "normalized": true
   },
   "chunking": {
     "strategy": "question_answer_seed",
@@ -24,9 +24,16 @@
       "index_name": "rag_passages_tq_idx",
       "metric": "cosine",
       "mode": "approx",
+      "ann": {
+        "probes": 8,
+        "oversampling": 4,
+        "max_visited_codes": 4096,
+        "max_visited_pages": 0
+      },
       "options": {
-        "lists": 0,
-        "bits": 4
+        "lists": 64,
+        "bits": 4,
+        "router_restarts": 3
       }
     },
     {

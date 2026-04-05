@@ -217,6 +217,12 @@ extern bool tq_scan_summary_optimistic_distance_bound(const TqProdCodecConfig *c
 														  float *optimistic_distance,
 														  char *errmsg,
 														  size_t errmsg_len);
+extern bool tq_scan_summary_matches_filters(const TqBatchPageSummary *summary,
+											 const TqMetadataFilterClause *filter_clauses,
+											 uint16_t filter_clause_count,
+											 bool *matches,
+											 char *errmsg,
+											 size_t errmsg_len);
 extern bool tq_scan_page_bounds_are_safe_for_pruning(bool normalized,
 													 TqDistanceKind distance);
 extern bool tq_scan_should_prune_page(const TqCandidateHeap *heap,

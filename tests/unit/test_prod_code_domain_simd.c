@@ -9,6 +9,7 @@
 #include "src/tq_page.h"
 #include "src/tq_scan.h"
 #include "src/tq_simd_avx2.h"
+#include "src/tq_transform.h"
 
 static void
 normalize(float *values, size_t len)
@@ -38,6 +39,35 @@ seeded_unit_vector(uint32_t seed, float *values, size_t len)
 	}
 
 	normalize(values, len);
+}
+
+static float
+cosine_distance(const float *left, const float *right, size_t len)
+{
+	double dot = 0.0;
+	double left_norm_sq = 0.0;
+	double right_norm_sq = 0.0;
+	size_t i = 0;
+
+	for (i = 0; i < len; i++)
+	{
+		dot += (double) left[i] * (double) right[i];
+		left_norm_sq += (double) left[i] * (double) left[i];
+		right_norm_sq += (double) right[i] * (double) right[i];
+	}
+
+	if (left_norm_sq <= 0.0 || right_norm_sq <= 0.0)
+		return 1.0f;
+
+	{
+		double similarity = dot / sqrt(left_norm_sq * right_norm_sq);
+
+		if (similarity > 1.0)
+			similarity = 1.0;
+		else if (similarity < -1.0)
+			similarity = -1.0;
+		return (float) (1.0 - similarity);
+	}
 }
 
 /*
@@ -561,6 +591,299 @@ test_code_domain_and_decode_fallback_match_ordering_on_seeded_fixture(void)
 }
 
 static void
+test_code_domain_and_decode_fallback_match_ordering_on_transformed_fast_lane_fixture(void)
+{
+	TqTransformConfig transform_config = {
+		.kind = TQ_TRANSFORM_HADAMARD,
+		.dimension = 384,
+		.seed = 0
+	};
+	TqTransformState transform_state;
+	TqProdCodecConfig config = {
+		.dimension = 512,
+		.bits = 4,
+		.qjl_dimension = 512,
+		.qjl_seed = 20260327u
+	};
+	TqProdPackedLayout layout;
+	TqProdLut lut;
+	TqBatchPageParams params;
+	uint8_t page[TQ_DEFAULT_BLOCK_SIZE];
+	float query_input[384];
+	float query[512];
+	TqCandidateHeap primary_heap;
+	TqCandidateHeap shadow_decode_heap;
+	TqCandidateEntry primary_entry;
+	TqCandidateEntry shadow_entry;
+	TqScanStats stats;
+	TqProdScoreKernel preferred_kernel = TQ_PROD_SCORE_SCALAR;
+	char errmsg[256];
+	uint16_t lane = 0;
+	size_t i = 0;
+	const size_t candidate_count = 24;
+
+	memset(&transform_state, 0, sizeof(transform_state));
+	memset(&layout, 0, sizeof(layout));
+	memset(&lut, 0, sizeof(lut));
+	memset(&params, 0, sizeof(params));
+	memset(page, 0, sizeof(page));
+	memset(query_input, 0, sizeof(query_input));
+	memset(query, 0, sizeof(query));
+	memset(&primary_heap, 0, sizeof(primary_heap));
+	memset(&shadow_decode_heap, 0, sizeof(shadow_decode_heap));
+	memset(&primary_entry, 0, sizeof(primary_entry));
+	memset(&shadow_entry, 0, sizeof(shadow_entry));
+	memset(&stats, 0, sizeof(stats));
+
+	seeded_unit_vector(3001u, query_input, 384);
+	assert(tq_transform_prepare(&transform_config, &transform_state, errmsg, sizeof(errmsg)));
+	assert(transform_state.padded_dimension == config.dimension);
+	assert(tq_transform_apply(&transform_state, query_input, query, config.dimension, errmsg, sizeof(errmsg)));
+	assert(tq_prod_packed_layout(&config, &layout, errmsg, sizeof(errmsg)));
+	assert(tq_prod_lut_build(&config, query, &lut, errmsg, sizeof(errmsg)));
+	assert(tq_candidate_heap_init(&primary_heap, candidate_count));
+	assert(tq_candidate_heap_init(&shadow_decode_heap, candidate_count));
+
+	params.lane_count = (uint16_t) candidate_count;
+	params.code_bytes = (uint32_t) layout.total_bytes;
+	params.list_id = 0;
+	params.next_block = TQ_INVALID_BLOCK_NUMBER;
+	assert(tq_batch_page_init(page, sizeof(page), &params, errmsg, sizeof(errmsg)));
+
+	for (i = 0; i < candidate_count; i++)
+	{
+		float input[384];
+		float transformed[512];
+		uint8_t *packed = NULL;
+
+		memset(input, 0, sizeof(input));
+		memset(transformed, 0, sizeof(transformed));
+
+		seeded_unit_vector((uint32_t) (7000 + i), input, 384);
+		assert(tq_transform_apply(&transform_state, input, transformed, config.dimension,
+								  errmsg, sizeof(errmsg)));
+
+		packed = (uint8_t *) calloc(layout.total_bytes, sizeof(uint8_t));
+		assert(packed != NULL);
+		assert(tq_prod_encode(&config, transformed, packed, layout.total_bytes, errmsg, sizeof(errmsg)));
+		assert(tq_batch_page_append_lane(page, sizeof(page),
+										 &(TqTid){.block_number = 1, .offset_number = (uint16_t) (i + 1)},
+										 &lane, errmsg, sizeof(errmsg)));
+		assert(tq_batch_page_set_code(page, sizeof(page), lane, packed, layout.total_bytes,
+									  errmsg, sizeof(errmsg)));
+		free(packed);
+	}
+
+	preferred_kernel = tq_prod_code_domain_preferred_kernel(&config);
+	tq_scan_stats_begin(TQ_SCAN_MODE_FLAT, 1);
+	assert(tq_batch_page_scan_prod(page,
+								   sizeof(page),
+								   &config,
+								   true,
+								   TQ_DISTANCE_COSINE,
+								   &lut,
+								   query,
+								   config.dimension,
+								   false,
+								   0,
+								   &primary_heap,
+								   &shadow_decode_heap,
+								   errmsg,
+								   sizeof(errmsg)));
+	tq_scan_stats_set_shadow_decode_metrics(&primary_heap, &shadow_decode_heap);
+	tq_scan_stats_snapshot(&stats);
+	assert(stats.score_mode == TQ_SCAN_SCORE_MODE_CODE_DOMAIN);
+	assert(stats.score_kernel == preferred_kernel);
+	assert(stats.faithful_fast_path);
+	assert(!stats.compatibility_fallback);
+	assert(stats.shadow_decode_candidate_count == 0);
+	assert(stats.shadow_decoded_vector_count == 0);
+	assert(stats.decoded_vector_count == candidate_count);
+	assert(primary_heap.count == candidate_count);
+	assert(shadow_decode_heap.count == 0);
+
+	for (i = 0; i < candidate_count; i++)
+		assert(tq_candidate_heap_pop_best(&primary_heap, &primary_entry));
+
+	tq_candidate_heap_reset(&primary_heap);
+	tq_candidate_heap_reset(&shadow_decode_heap);
+	tq_prod_lut_reset(&lut);
+	tq_transform_reset(&transform_state);
+}
+
+static void
+test_code_domain_and_decode_fallback_preserve_topk_on_transformed_search_fixture(void)
+{
+	TqTransformConfig transform_config = {
+		.kind = TQ_TRANSFORM_HADAMARD,
+		.dimension = 384,
+		.seed = 0
+	};
+	TqTransformState transform_state;
+	TqProdCodecConfig config = {
+		.dimension = 512,
+		.bits = 4,
+		.qjl_dimension = 512,
+		.qjl_seed = 20260327u
+	};
+	TqProdPackedLayout layout;
+	const size_t corpus_count = 96;
+	const size_t query_count = 8;
+	const size_t top_k = 16;
+	const uint16_t lanes_per_page = 16;
+	const size_t page_count = corpus_count / lanes_per_page;
+	uint8_t pages[6][TQ_DEFAULT_BLOCK_SIZE];
+	uint8_t *packed_corpus = NULL;
+	float *decoded = NULL;
+	size_t row = 0;
+	char errmsg[256];
+
+	memset(&transform_state, 0, sizeof(transform_state));
+	memset(&layout, 0, sizeof(layout));
+	memset(pages, 0, sizeof(pages));
+	assert(tq_transform_prepare(&transform_config, &transform_state, errmsg, sizeof(errmsg)));
+	assert(transform_state.padded_dimension == config.dimension);
+	assert(tq_prod_packed_layout(&config, &layout, errmsg, sizeof(errmsg)));
+
+	packed_corpus = (uint8_t *) calloc(corpus_count, layout.total_bytes);
+	decoded = (float *) calloc(config.dimension, sizeof(float));
+	assert(packed_corpus != NULL);
+	assert(decoded != NULL);
+
+	for (row = 0; row < page_count; row++)
+	{
+		TqBatchPageParams params;
+
+		memset(&params, 0, sizeof(params));
+		params.lane_count = lanes_per_page;
+		params.code_bytes = (uint32_t) layout.total_bytes;
+		params.list_id = 0;
+		params.next_block = TQ_INVALID_BLOCK_NUMBER;
+		assert(tq_batch_page_init(pages[row], sizeof(pages[row]), &params, errmsg, sizeof(errmsg)));
+	}
+
+	for (row = 0; row < corpus_count; row++)
+	{
+		float input[384];
+		float transformed[512];
+		uint16_t lane = 0;
+		size_t page_index = row / lanes_per_page;
+
+		memset(input, 0, sizeof(input));
+		memset(transformed, 0, sizeof(transformed));
+		seeded_unit_vector((uint32_t) (9000 + row), input, 384);
+		assert(tq_transform_apply(&transform_state, input, transformed, config.dimension,
+								  errmsg, sizeof(errmsg)));
+		assert(tq_prod_encode(&config,
+							  transformed,
+							  packed_corpus + (row * layout.total_bytes),
+							  layout.total_bytes,
+							  errmsg,
+							  sizeof(errmsg)));
+		assert(tq_batch_page_append_lane(pages[page_index],
+										 sizeof(pages[page_index]),
+										 &(TqTid){.block_number = 1, .offset_number = (uint16_t) (row + 1)},
+										 &lane,
+										 errmsg,
+										 sizeof(errmsg)));
+		assert(tq_batch_page_set_code(pages[page_index],
+									  sizeof(pages[page_index]),
+									  lane,
+									  packed_corpus + (row * layout.total_bytes),
+									  layout.total_bytes,
+									  errmsg,
+									  sizeof(errmsg)));
+	}
+
+	for (row = 0; row < query_count; row++)
+	{
+		float query_input[384];
+		float query[512];
+		TqProdLut lut;
+		TqCandidateHeap primary_heap;
+		TqCandidateHeap shadow_decode_heap;
+		TqScanStats stats;
+		size_t rank = 0;
+		size_t page_index = 0;
+
+		memset(query_input, 0, sizeof(query_input));
+		memset(query, 0, sizeof(query));
+		memset(&lut, 0, sizeof(lut));
+		memset(&primary_heap, 0, sizeof(primary_heap));
+		memset(&shadow_decode_heap, 0, sizeof(shadow_decode_heap));
+		memset(&stats, 0, sizeof(stats));
+
+		seeded_unit_vector((uint32_t) (12000 + row), query_input, 384);
+		assert(tq_transform_apply(&transform_state, query_input, query, config.dimension,
+								  errmsg, sizeof(errmsg)));
+		assert(tq_prod_lut_build(&config, query, &lut, errmsg, sizeof(errmsg)));
+		assert(tq_candidate_heap_init(&primary_heap, top_k));
+		assert(tq_candidate_heap_init(&shadow_decode_heap, top_k));
+
+		tq_scan_stats_begin(TQ_SCAN_MODE_FLAT, 1);
+		for (page_index = 0; page_index < page_count; page_index++)
+		{
+			assert(tq_batch_page_scan_prod(pages[page_index],
+										   sizeof(pages[page_index]),
+										   &config,
+										   true,
+										   TQ_DISTANCE_COSINE,
+										   &lut,
+										   query,
+										   config.dimension,
+										   false,
+										   0,
+										   &primary_heap,
+										   NULL,
+										   errmsg,
+										   sizeof(errmsg)));
+		}
+		tq_scan_stats_snapshot(&stats);
+		assert(stats.score_mode == TQ_SCAN_SCORE_MODE_CODE_DOMAIN);
+		assert(stats.faithful_fast_path);
+		assert(!stats.compatibility_fallback);
+
+		for (size_t candidate = 0; candidate < corpus_count; candidate++)
+		{
+			const uint8_t *packed = packed_corpus + (candidate * layout.total_bytes);
+			float shadow_distance_value = 0.0f;
+
+			assert(tq_prod_decode(&config, packed, layout.total_bytes, decoded, config.dimension,
+								  errmsg, sizeof(errmsg)));
+			shadow_distance_value = cosine_distance(query, decoded, config.dimension);
+
+			assert(tq_candidate_heap_push(&shadow_decode_heap,
+										  shadow_distance_value,
+										  1,
+										  (uint16_t) (candidate + 1),
+										  NULL,
+										  NULL,
+										  0));
+		}
+
+		for (rank = 0; rank < top_k; rank++)
+		{
+			TqCandidateEntry primary_entry;
+			TqCandidateEntry shadow_entry;
+
+			memset(&primary_entry, 0, sizeof(primary_entry));
+			memset(&shadow_entry, 0, sizeof(shadow_entry));
+			assert(tq_candidate_heap_pop_best(&primary_heap, &primary_entry));
+			assert(tq_candidate_heap_pop_best(&shadow_decode_heap, &shadow_entry));
+			assert(primary_entry.tid.offset_number == shadow_entry.tid.offset_number);
+		}
+
+		tq_candidate_heap_reset(&primary_heap);
+		tq_candidate_heap_reset(&shadow_decode_heap);
+		tq_prod_lut_reset(&lut);
+	}
+
+	free(decoded);
+	free(packed_corpus);
+	tq_transform_reset(&transform_state);
+}
+
+static void
 test_dispatch_falls_back_to_scalar_for_unsupported_shape_or_disabled_runtime(void)
 {
 	TqProdCodecConfig unsupported_config = {.dimension = 6, .bits = 4};
@@ -968,6 +1291,8 @@ main(void)
 	test_explicit_kernel_selection_reports_requested_or_scalar_fallback();
 	test_score_decompose_stays_consistent_with_packed_ip();
 	test_code_domain_and_decode_fallback_match_ordering_on_seeded_fixture();
+	test_code_domain_and_decode_fallback_match_ordering_on_transformed_fast_lane_fixture();
+	test_code_domain_and_decode_fallback_preserve_topk_on_transformed_search_fixture();
 	test_dispatch_falls_back_to_scalar_for_unsupported_shape_or_disabled_runtime();
 	test_malformed_packed_input_rejected_cleanly();
 	test_lut16_reference_matches_legacy_scalar_and_simd_code_domain();

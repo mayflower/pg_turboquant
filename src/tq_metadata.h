@@ -57,5 +57,11 @@ extern bool tq_metadata_slot_equals(TqMetadataKind kind,
 									const uint8_t right[TQ_METADATA_SLOT_BYTES],
 									char *errmsg,
 									size_t errmsg_len);
+extern bool tq_metadata_slot_compare(TqMetadataKind kind,
+									 const uint8_t left[TQ_METADATA_SLOT_BYTES],
+									 const uint8_t right[TQ_METADATA_SLOT_BYTES],
+									 int *cmp,
+									 char *errmsg,
+									 size_t errmsg_len);
 
 #endif

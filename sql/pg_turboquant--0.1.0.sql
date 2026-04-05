@@ -270,6 +270,161 @@ $$;
 
 COMMENT ON FUNCTION tq_recommended_query_knobs(integer, integer) IS 'Returns recommended turboquant probes, oversample_factor, and visit budgets for a two-stage query.';
 
+CREATE FUNCTION tq_recommended_query_knobs(indexed_index regclass,
+										   candidate_limit integer,
+										   final_limit integer DEFAULT NULL,
+										   filter_selectivity double precision DEFAULT NULL)
+RETURNS TABLE(probes integer,
+			  oversample_factor integer,
+			  max_visited_codes integer,
+			  max_visited_pages integer)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+	meta jsonb;
+	last_stats jsonb;
+	base_probes integer;
+	base_oversample integer;
+	base_max_visited_codes integer;
+	base_max_visited_pages integer;
+	list_count integer;
+	batch_page_count integer;
+	live_count bigint;
+	max_list_over_avg double precision;
+	effective_selectivity double precision;
+	budget_pressure_multiplier double precision;
+	imbalance_multiplier double precision;
+	recent_mode text;
+	last_max_visited_codes integer;
+	last_max_visited_pages integer;
+	visited_code_count integer;
+	visited_page_count integer;
+	selected_live_count integer;
+	candidate_heap_count integer;
+	desired_candidate_limit bigint;
+	desired_probes bigint;
+	desired_oversample bigint;
+	desired_code_budget bigint;
+	desired_page_budget bigint;
+	pages_per_probe double precision;
+BEGIN
+	SELECT knobs.probes, knobs.oversample_factor, knobs.max_visited_codes, knobs.max_visited_pages
+	INTO base_probes, base_oversample, base_max_visited_codes, base_max_visited_pages
+	FROM tq_resolve_query_knobs(candidate_limit, final_limit, NULL, NULL) AS knobs;
+
+	IF filter_selectivity IS NOT NULL
+	   AND (filter_selectivity <= 0.0 OR filter_selectivity > 1.0) THEN
+		RAISE EXCEPTION 'invalid turboquant filter_selectivity: %', filter_selectivity
+			USING ERRCODE = '22023',
+				  HINT = 'filter_selectivity must be greater than 0 and less than or equal to 1.';
+	END IF;
+
+	meta := tq_index_metadata(indexed_index);
+	last_stats := tq_last_scan_stats();
+	list_count := GREATEST(COALESCE((meta->>'list_count')::integer, 0), 0);
+	batch_page_count := GREATEST(COALESCE((meta->>'batch_page_count')::integer, 0), 0);
+	live_count := GREATEST(COALESCE((meta->>'live_count')::bigint, 0), 0);
+	max_list_over_avg := GREATEST(COALESCE((meta #>> '{list_distribution,max_list_over_avg}')::double precision, 1.0), 1.0);
+	effective_selectivity := GREATEST(0.05, LEAST(COALESCE(filter_selectivity, 1.0), 1.0));
+	budget_pressure_multiplier := 1.0;
+	imbalance_multiplier := LEAST(2.0, GREATEST(1.0, sqrt(max_list_over_avg)));
+	recent_mode := COALESCE(last_stats->>'mode', 'none');
+	last_max_visited_codes := GREATEST(COALESCE((last_stats->>'max_visited_codes')::integer, 0), 0);
+	last_max_visited_pages := GREATEST(COALESCE((last_stats->>'max_visited_pages')::integer, 0), 0);
+	visited_code_count := GREATEST(COALESCE((last_stats->>'visited_code_count')::integer, 0), 0);
+	visited_page_count := GREATEST(COALESCE((last_stats->>'visited_page_count')::integer, 0), 0);
+	selected_live_count := GREATEST(COALESCE((last_stats->>'selected_live_count')::integer, 0), 0);
+	candidate_heap_count := GREATEST(COALESCE((last_stats->>'candidate_heap_count')::integer, 0), 0);
+
+	IF (list_count = 0 AND recent_mode = 'flat')
+	   OR (list_count > 0 AND recent_mode = 'ivf') THEN
+		IF last_max_visited_codes > 0 AND visited_code_count >= last_max_visited_codes THEN
+			budget_pressure_multiplier := GREATEST(budget_pressure_multiplier, 2.0);
+		END IF;
+		IF last_max_visited_pages > 0 AND visited_page_count >= last_max_visited_pages THEN
+			budget_pressure_multiplier := GREATEST(budget_pressure_multiplier, 2.0);
+		END IF;
+		IF filter_selectivity IS NULL
+		   AND budget_pressure_multiplier > 1.0
+		   AND selected_live_count > 0
+		   AND candidate_heap_count > 0
+		   AND candidate_heap_count < COALESCE(final_limit, candidate_limit) THEN
+			effective_selectivity := GREATEST(
+				0.05,
+				LEAST(
+					1.0,
+					candidate_heap_count::double precision / selected_live_count::double precision
+				)
+			);
+		END IF;
+	END IF;
+
+	desired_candidate_limit := CEIL(candidate_limit::numeric
+									* budget_pressure_multiplier
+									/ effective_selectivity)::bigint;
+	desired_candidate_limit := GREATEST(desired_candidate_limit, candidate_limit::bigint);
+	IF live_count > 0 THEN
+		desired_candidate_limit := LEAST(desired_candidate_limit, live_count);
+	END IF;
+
+	IF list_count <= 0 THEN
+		probes := base_probes;
+		desired_oversample := GREATEST(
+			base_oversample::bigint,
+			CEIL(desired_candidate_limit::numeric
+				 / GREATEST(COALESCE(final_limit, candidate_limit), 1))::bigint
+		);
+		oversample_factor := LEAST(1024, desired_oversample)::integer;
+		desired_code_budget := GREATEST(
+			base_max_visited_codes::bigint,
+			desired_candidate_limit * GREATEST(2, LEAST(oversample_factor, 16))
+		);
+		max_visited_codes := LEAST(2147483647::bigint, desired_code_budget)::integer;
+		max_visited_pages := 0;
+	ELSE
+		desired_probes := CEIL(base_probes::numeric
+							   * imbalance_multiplier
+							   * sqrt(1.0 / effective_selectivity))::bigint;
+		desired_probes := GREATEST(base_probes::bigint, desired_probes);
+		desired_probes := LEAST(list_count::bigint, desired_probes);
+		probes := desired_probes::integer;
+
+		desired_oversample := GREATEST(
+			base_oversample::bigint,
+			CEIL(desired_candidate_limit::numeric
+				 / GREATEST(COALESCE(final_limit, candidate_limit), 1)
+			/ GREATEST(probes, 1))::bigint
+		);
+		oversample_factor := LEAST(1024, GREATEST(1, desired_oversample))::integer;
+
+		desired_code_budget := GREATEST(
+			base_max_visited_codes::bigint,
+			desired_candidate_limit * GREATEST(2, LEAST(oversample_factor, 16))
+		);
+		IF last_max_visited_codes > 0 AND visited_code_count >= last_max_visited_codes THEN
+			desired_code_budget := GREATEST(desired_code_budget, (visited_code_count * 2)::bigint);
+		END IF;
+		max_visited_codes := LEAST(2147483647::bigint, desired_code_budget)::integer;
+
+		pages_per_probe := GREATEST(1.0, batch_page_count::double precision / list_count::double precision);
+		desired_page_budget := CEIL(pages_per_probe * probes * imbalance_multiplier)::bigint;
+		desired_page_budget := GREATEST(base_max_visited_pages::bigint, desired_page_budget);
+		desired_page_budget := GREATEST(desired_page_budget, probes::bigint);
+		IF last_max_visited_pages > 0 AND visited_page_count >= last_max_visited_pages THEN
+			desired_page_budget := GREATEST(desired_page_budget, (visited_page_count * 2)::bigint);
+		END IF;
+		IF batch_page_count > 0 THEN
+			desired_page_budget := LEAST(desired_page_budget, batch_page_count::bigint);
+		END IF;
+		max_visited_pages := LEAST(2147483647::bigint, desired_page_budget)::integer;
+	END IF;
+
+	RETURN NEXT;
+END;
+$$;
+
+COMMENT ON FUNCTION tq_recommended_query_knobs(regclass, integer, integer, double precision) IS 'Returns index-aware turboquant probes, oversample_factor, and visit budgets using index health, optional filter selectivity, and recent scan pressure.';
+
 CREATE FUNCTION tq_effective_rerank_candidate_limit(candidate_limit integer,
 													final_limit integer)
 RETURNS integer

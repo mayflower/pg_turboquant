@@ -261,3 +261,82 @@ tq_metadata_slot_equals(TqMetadataKind kind,
 			return false;
 	}
 }
+
+bool
+tq_metadata_slot_compare(TqMetadataKind kind,
+						  const uint8_t left[TQ_METADATA_SLOT_BYTES],
+						  const uint8_t right[TQ_METADATA_SLOT_BYTES],
+						  int *cmp,
+						  char *errmsg,
+						  size_t errmsg_len)
+{
+	if (left == NULL || right == NULL || cmp == NULL)
+	{
+		tq_metadata_error(errmsg, errmsg_len,
+						  "invalid turboquant metadata comparison");
+		return false;
+	}
+
+	*cmp = 0;
+
+	switch (kind)
+	{
+		case TQ_METADATA_KIND_BOOL:
+		{
+			bool lhs = left[0] != 0;
+			bool rhs = right[0] != 0;
+
+			*cmp = (lhs > rhs) - (lhs < rhs);
+			return true;
+		}
+		case TQ_METADATA_KIND_INT2:
+		{
+			int16 lhs = 0;
+			int16 rhs = 0;
+
+			memcpy(&lhs, left, sizeof(lhs));
+			memcpy(&rhs, right, sizeof(rhs));
+			*cmp = (lhs > rhs) - (lhs < rhs);
+			return true;
+		}
+		case TQ_METADATA_KIND_INT4:
+		{
+			int32 lhs = 0;
+			int32 rhs = 0;
+
+			memcpy(&lhs, left, sizeof(lhs));
+			memcpy(&rhs, right, sizeof(rhs));
+			*cmp = (lhs > rhs) - (lhs < rhs);
+			return true;
+		}
+		case TQ_METADATA_KIND_INT8:
+		case TQ_METADATA_KIND_TIMESTAMPTZ:
+		{
+			int64 lhs = 0;
+			int64 rhs = 0;
+
+			memcpy(&lhs, left, sizeof(lhs));
+			memcpy(&rhs, right, sizeof(rhs));
+			*cmp = (lhs > rhs) - (lhs < rhs);
+			return true;
+		}
+		case TQ_METADATA_KIND_DATE:
+		{
+			DateADT lhs = 0;
+			DateADT rhs = 0;
+
+			memcpy(&lhs, left, sizeof(lhs));
+			memcpy(&rhs, right, sizeof(rhs));
+			*cmp = (lhs > rhs) - (lhs < rhs);
+			return true;
+		}
+		case TQ_METADATA_KIND_UUID:
+			*cmp = memcmp(left, right, UUID_LEN);
+			return true;
+		case TQ_METADATA_KIND_INVALID:
+		default:
+			tq_metadata_error(errmsg, errmsg_len,
+							  "invalid turboquant metadata kind");
+			return false;
+	}
+}

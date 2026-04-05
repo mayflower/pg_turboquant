@@ -49,6 +49,11 @@ static bool tq_metadata_filter_clause_matches(const uint8_t value[TQ_METADATA_SL
 											  const TqMetadataFilterClause *clause,
 											  char *errmsg,
 											  size_t errmsg_len);
+static bool tq_summary_filter_clause_may_match(const TqBatchPageSummary *summary,
+											   const TqMetadataFilterClause *clause,
+											   bool *matches,
+											   char *errmsg,
+											   size_t errmsg_len);
 static bool tq_batch_page_lane_matches_filters(const void *page,
 											   size_t page_size,
 											   uint16_t lane_index,
@@ -265,6 +270,132 @@ tq_metadata_filter_clause_matches(const uint8_t value[TQ_METADATA_SLOT_BYTES],
 	}
 
 	return false;
+}
+
+static bool
+tq_summary_filter_clause_may_match(const TqBatchPageSummary *summary,
+								   const TqMetadataFilterClause *clause,
+								   bool *matches,
+								   char *errmsg,
+								   size_t errmsg_len)
+{
+	const uint16_t bit = (uint16_t) (1u << clause->attribute_index);
+	uint16_t value_index = 0;
+
+	if (matches == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant scan: summary filter match output must be non-null");
+		return false;
+	}
+
+	*matches = true;
+	if (summary == NULL || clause == NULL)
+		return true;
+
+	if (clause->match_null)
+	{
+		*matches = (summary->null_any_mask & bit) != 0;
+		return true;
+	}
+
+	if ((summary->null_all_mask & bit) != 0)
+	{
+		*matches = false;
+		return true;
+	}
+
+	if (clause->value_count == 0)
+		return true;
+
+	if ((summary->all_same_mask & bit) != 0)
+	{
+		*matches = false;
+		for (value_index = 0; value_index < clause->value_count; value_index++)
+		{
+			if (tq_metadata_slot_equals(clause->kind,
+										summary->same_values[clause->attribute_index],
+										clause->values[value_index],
+										errmsg,
+										errmsg_len))
+			{
+				*matches = true;
+				return true;
+			}
+		}
+
+		return true;
+	}
+
+	*matches = false;
+	for (value_index = 0; value_index < clause->value_count; value_index++)
+	{
+		int min_cmp = 0;
+		int max_cmp = 0;
+
+		if (!tq_metadata_slot_compare(clause->kind,
+									  clause->values[value_index],
+									  summary->min_values[clause->attribute_index],
+									  &min_cmp,
+									  errmsg,
+									  errmsg_len)
+			|| !tq_metadata_slot_compare(clause->kind,
+										clause->values[value_index],
+										summary->max_values[clause->attribute_index],
+										&max_cmp,
+										errmsg,
+										errmsg_len))
+			return false;
+
+		if (min_cmp >= 0 && max_cmp <= 0)
+		{
+			*matches = true;
+			return true;
+		}
+	}
+
+	return true;
+}
+
+bool
+tq_scan_summary_matches_filters(const TqBatchPageSummary *summary,
+								 const TqMetadataFilterClause *filter_clauses,
+								 uint16_t filter_clause_count,
+								 bool *matches,
+								 char *errmsg,
+								 size_t errmsg_len)
+{
+	uint16_t clause_index = 0;
+
+	if (matches == NULL)
+	{
+		tq_set_error(errmsg, errmsg_len,
+					 "invalid turboquant scan: summary filter match output must be non-null");
+		return false;
+	}
+
+	*matches = true;
+	if (filter_clause_count == 0 || filter_clauses == NULL || summary == NULL)
+		return true;
+
+	for (clause_index = 0; clause_index < filter_clause_count; clause_index++)
+	{
+		bool clause_matches = true;
+
+		if (!tq_summary_filter_clause_may_match(summary,
+												&filter_clauses[clause_index],
+												&clause_matches,
+												errmsg,
+												errmsg_len))
+			return false;
+		if (!clause_matches)
+		{
+			*matches = false;
+			return true;
+		}
+	}
+
+	return true;
 }
 
 static bool
@@ -2090,6 +2221,7 @@ tq_batch_page_scan_prod_with_scratch_filtered(const void *page,
 	bool		use_code_domain = false;
 	bool		use_shadow_decode = false;
 	bool		use_block16 = false;
+	bool		cosine_requires_primary_decode = false;
 	float		query_norm_squared = 0.0f;
 	uint16_t	lane = 0;
 	bool		ok = false;
@@ -2150,7 +2282,10 @@ tq_batch_page_scan_prod_with_scratch_filtered(const void *page,
 
 	use_code_domain = tq_scan_can_use_prod_code_domain(normalized, distance)
 		&& !tq_guc_force_decode_score_diagnostics;
+	cosine_requires_primary_decode = use_code_domain
+		&& distance == TQ_DISTANCE_COSINE;
 	use_shadow_decode = use_code_domain
+		&& !cosine_requires_primary_decode
 		&& shadow_decode_heap != NULL
 		&& shadow_decode_heap->entries != NULL
 		&& shadow_decode_heap->capacity > 0;
@@ -2168,7 +2303,7 @@ tq_batch_page_scan_prod_with_scratch_filtered(const void *page,
 	tq_scan_stats_set_path_flags(use_code_domain, !use_code_domain);
 	tq_scan_stats_record_page_visit();
 
-	if (!use_code_domain || use_shadow_decode)
+	if (!use_code_domain || use_shadow_decode || cosine_requires_primary_decode)
 	{
 		if (!tq_scan_scratch_ensure_decoded_capacity(scratch,
 													 query_len,
@@ -2521,6 +2656,7 @@ tq_batch_page_scan_prod_with_scratch_filtered(const void *page,
 			{
 				TqProdScoreKernel used_kernel = TQ_PROD_SCORE_SCALAR;
 				float		shadow_distance_value = 0.0f;
+				bool		decoded_candidate = false;
 
 				if (!tq_prod_score_code_from_lut_dispatch(config, lut, code, code_len,
 														  tq_prod_code_domain_preferred_kernel(config),
@@ -2533,11 +2669,31 @@ tq_batch_page_scan_prod_with_scratch_filtered(const void *page,
 				tq_scan_stats_set_score_kernel(used_kernel);
 				tq_scan_stats_record_code_visit(false);
 
-				if (!tq_metric_distance_from_ip_score(distance,
-													  ip_score,
-													  &distance_value,
-													  errmsg,
-													  errmsg_len))
+				if (cosine_requires_primary_decode)
+				{
+					if (!tq_prod_decode(config, code, code_len, decoded, query_len,
+										 errmsg, errmsg_len)
+						|| !tq_metric_distance_from_decoded_vector(distance,
+																	query_values,
+																	query_len,
+																	decoded,
+																	query_len,
+																	query_norm_squared,
+																	&distance_value,
+																	errmsg,
+																	errmsg_len))
+					{
+						free(reconstructed_code);
+						return false;
+					}
+					decoded_candidate = true;
+					tq_scan_stats_record_decoded_vector_only();
+				}
+				else if (!tq_metric_distance_from_ip_score(distance,
+														   ip_score,
+														   &distance_value,
+														   errmsg,
+														   errmsg_len))
 				{
 					free(reconstructed_code);
 					return false;
@@ -2545,8 +2701,9 @@ tq_batch_page_scan_prod_with_scratch_filtered(const void *page,
 
 				if (use_shadow_decode)
 				{
-					if (!tq_prod_decode(config, code, code_len, decoded, query_len,
-										 errmsg, errmsg_len))
+					if (!decoded_candidate
+						&& !tq_prod_decode(config, code, code_len, decoded, query_len,
+										   errmsg, errmsg_len))
 					{
 						free(reconstructed_code);
 						return false;

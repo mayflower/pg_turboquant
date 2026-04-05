@@ -10,6 +10,8 @@ from .adapter import (
     PassageTable,
     RetrievalPlan,
     RetrievalRequest,
+    ann_benchmark_session_statements,
+    build_materialized_exact_rerank_sql,
     validate_ann_backend_request,
     vector_literal,
 )
@@ -46,7 +48,7 @@ class PgvectorBackendBase:
         )
 
         operator = METRIC_OPERATORS[request_metric]
-        session_statements = []
+        session_statements = ann_benchmark_session_statements()
         ann_value = request.ann.get(self.ann_key)
         if ann_value is not None:
             session_statements.append((f"SET LOCAL {self.ann_guc} = %s", (ann_value,)))
@@ -54,34 +56,29 @@ class PgvectorBackendBase:
         query_literal = vector_literal(request.query_vector)
         if self.mode == MODE_APPROX:
             sql = (
-                f"WITH query_vector AS (SELECT %s::{table.query_vector_cast} AS embedding) "
                 f"SELECT p.{table.id_column} AS id, "
-                f"p.{table.embedding_column} {operator} query_vector.embedding AS score "
+                f"p.{table.embedding_column} {operator} %s::{table.query_vector_cast} AS score "
                 f"FROM {table.table_name} AS p "
-                f"CROSS JOIN query_vector "
-                f"ORDER BY p.{table.embedding_column} {operator} query_vector.embedding ASC "
+                f"ORDER BY p.{table.embedding_column} {operator} %s::{table.query_vector_cast} ASC "
                 f"LIMIT %s"
             )
-            params = (query_literal, request.top_k)
+            params = (query_literal, query_literal, request.top_k)
         else:
-            sql = (
-                f"WITH query_vector AS (SELECT %s::{table.query_vector_cast} AS embedding), "
-                f"approx_candidates AS ("
-                f"SELECT p.{table.id_column} AS id, p.{table.embedding_column} AS embedding "
-                f"FROM {table.table_name} AS p "
-                f"CROSS JOIN query_vector "
-                f"ORDER BY p.{table.embedding_column} {operator} query_vector.embedding ASC "
-                f"LIMIT %s"
-                f") "
-                f"SELECT approx_candidates.id AS id, "
-                f"text_source.{table.embedding_column} {operator} query_vector.embedding AS score "
-                f"FROM approx_candidates "
-                f"JOIN {table.table_name} AS text_source ON text_source.{table.id_column} = approx_candidates.id "
-                f"CROSS JOIN query_vector "
-                f"ORDER BY score ASC "
-                f"LIMIT %s"
+            sql = build_materialized_exact_rerank_sql(
+                candidate_ctes=[
+                    "approx_candidates AS MATERIALIZED ("
+                    f"SELECT p.{table.id_column} AS id "
+                    f"FROM {table.table_name} AS p "
+                    f"ORDER BY p.{table.embedding_column} {operator} %s::{table.query_vector_cast} ASC "
+                    "LIMIT %s)"
+                ],
+                candidate_relation="approx_candidates",
+                table=table,
+                operator=operator,
+                query_expr=f"%s::{table.query_vector_cast}",
+                join_column=table.id_column,
             )
-            params = (query_literal, self.rerank_k, request.top_k)
+            params = (query_literal, self.rerank_k, query_literal, request.top_k)
 
         return RetrievalPlan(sql=sql, params=params, session_statements=session_statements)
 

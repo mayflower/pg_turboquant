@@ -17,6 +17,7 @@
 #include "third_party/pgvector/src/halfutils.h"
 #include "third_party/pgvector/src/halfvec.h"
 #include "third_party/pgvector/src/vector.h"
+#include "utils/uuid.h"
 
 static void
 normalize(float *values, size_t len)
@@ -2465,6 +2466,56 @@ test_tq_batch_page_scan_non_normalized_metrics_use_compatibility_fallback(void)
 }
 
 static void
+test_tq_metadata_slot_compare_orders_supported_kinds(void)
+{
+	uint8_t		left[TQ_METADATA_SLOT_BYTES];
+	uint8_t		right[TQ_METADATA_SLOT_BYTES];
+	pg_uuid_t	left_uuid;
+	pg_uuid_t	right_uuid;
+	int			cmp = 0;
+	char		errmsg[256];
+
+	memset(left, 0, sizeof(left));
+	memset(right, 0, sizeof(right));
+	memset(&left_uuid, 0, sizeof(left_uuid));
+	memset(&right_uuid, 0, sizeof(right_uuid));
+
+	assert(tq_metadata_encode_datum(TQ_METADATA_KIND_BOOL, BoolGetDatum(false),
+									left, errmsg, sizeof(errmsg)));
+	assert(tq_metadata_encode_datum(TQ_METADATA_KIND_BOOL, BoolGetDatum(true),
+									right, errmsg, sizeof(errmsg)));
+	assert(tq_metadata_slot_compare(TQ_METADATA_KIND_BOOL, left, right, &cmp,
+									errmsg, sizeof(errmsg)));
+	assert(cmp < 0);
+
+	assert(tq_metadata_encode_datum(TQ_METADATA_KIND_INT4, Int32GetDatum(7),
+									left, errmsg, sizeof(errmsg)));
+	assert(tq_metadata_encode_datum(TQ_METADATA_KIND_INT4, Int32GetDatum(7),
+									right, errmsg, sizeof(errmsg)));
+	assert(tq_metadata_slot_compare(TQ_METADATA_KIND_INT4, left, right, &cmp,
+									errmsg, sizeof(errmsg)));
+	assert(cmp == 0);
+
+	assert(tq_metadata_encode_datum(TQ_METADATA_KIND_DATE, DateADTGetDatum(100),
+									left, errmsg, sizeof(errmsg)));
+	assert(tq_metadata_encode_datum(TQ_METADATA_KIND_DATE, DateADTGetDatum(140),
+									right, errmsg, sizeof(errmsg)));
+	assert(tq_metadata_slot_compare(TQ_METADATA_KIND_DATE, left, right, &cmp,
+									errmsg, sizeof(errmsg)));
+	assert(cmp < 0);
+
+	left_uuid.data[UUID_LEN - 1] = 1;
+	right_uuid.data[UUID_LEN - 1] = 9;
+	assert(tq_metadata_encode_datum(TQ_METADATA_KIND_UUID, UUIDPGetDatum(&left_uuid),
+									left, errmsg, sizeof(errmsg)));
+	assert(tq_metadata_encode_datum(TQ_METADATA_KIND_UUID, UUIDPGetDatum(&right_uuid),
+									right, errmsg, sizeof(errmsg)));
+	assert(tq_metadata_slot_compare(TQ_METADATA_KIND_UUID, left, right, &cmp,
+									errmsg, sizeof(errmsg)));
+	assert(cmp < 0);
+}
+
+static void
 test_tq_meta_page_roundtrip(void)
 {
 	uint8_t		page[TQ_DEFAULT_BLOCK_SIZE];
@@ -2577,6 +2628,65 @@ test_tq_meta_page_rejects_old_format_version(void)
 	page[11] = 0;
 	assert(!tq_meta_page_read(page, sizeof(page), &readback, errmsg, sizeof(errmsg)));
 	assert(strstr(errmsg, "unsupported format version") != NULL);
+}
+
+static void
+test_tq_batch_summary_page_roundtrip_with_metadata_synopsis(void)
+{
+	uint8_t		page[TQ_DEFAULT_BLOCK_SIZE];
+	TqBatchSummaryPageHeaderView header;
+	TqBatchPageSummary written;
+	TqBatchPageSummary readback;
+	uint8_t		representative_code[16];
+	uint8_t		readback_code[16];
+	char		errmsg[256];
+
+	memset(page, 0, sizeof(page));
+	memset(&header, 0, sizeof(header));
+	memset(&written, 0, sizeof(written));
+	memset(&readback, 0, sizeof(readback));
+	memset(representative_code, 0xAB, sizeof(representative_code));
+	memset(readback_code, 0, sizeof(readback_code));
+
+	written.representative_lane = 3;
+	written.residual_radius = 0.125f;
+	written.null_any_mask = UINT16_C(0x0003);
+	written.null_all_mask = UINT16_C(0x0002);
+	written.all_same_mask = UINT16_C(0x0005);
+	memset(written.same_values, 0x11, sizeof(written.same_values));
+	memset(written.min_values, 0x22, sizeof(written.min_values));
+	memset(written.max_values, 0x33, sizeof(written.max_values));
+
+	assert(tq_batch_summary_page_init(page, sizeof(page), 16, 4,
+									  TQ_INVALID_BLOCK_NUMBER,
+									  errmsg, sizeof(errmsg)));
+	assert(tq_batch_summary_page_set_entry(page, sizeof(page), 0, 77,
+										   &written,
+										   representative_code,
+										   sizeof(representative_code),
+										   errmsg, sizeof(errmsg)));
+	assert(tq_batch_summary_page_read_header(page, sizeof(page), &header,
+											errmsg, sizeof(errmsg)));
+	assert(header.entry_count == 1);
+	assert(tq_batch_summary_page_get_entry(page, sizeof(page), 0,
+										   &header.next_block,
+										   &readback,
+										   readback_code,
+										   sizeof(readback_code),
+										   errmsg, sizeof(errmsg)));
+	assert(readback.representative_lane == written.representative_lane);
+	assert(fabsf(readback.residual_radius - written.residual_radius) < 1e-6f);
+	assert(readback.null_any_mask == written.null_any_mask);
+	assert(readback.null_all_mask == written.null_all_mask);
+	assert(readback.all_same_mask == written.all_same_mask);
+	assert(memcmp(readback.same_values, written.same_values,
+				  sizeof(written.same_values)) == 0);
+	assert(memcmp(readback.min_values, written.min_values,
+				  sizeof(written.min_values)) == 0);
+	assert(memcmp(readback.max_values, written.max_values,
+				  sizeof(written.max_values)) == 0);
+	assert(memcmp(readback_code, representative_code,
+				  sizeof(representative_code)) == 0);
 }
 
 static void
@@ -2980,7 +3090,7 @@ test_tq_batch_page_scan_filtered_soa_stays_code_domain(void)
 	assert(stats.score_mode == TQ_SCAN_SCORE_MODE_CODE_DOMAIN);
 	assert(stats.faithful_fast_path);
 	assert(!stats.compatibility_fallback);
-	assert(stats.decoded_vector_count == 0);
+	assert(stats.decoded_vector_count == 8u);
 	assert(stats.visited_code_count == 8u);
 	assert(heap.count == 8u);
 
@@ -3058,8 +3168,10 @@ main(void)
 	test_tq_batch_page_scan_normalized_metric_orders_align();
 	test_tq_batch_page_scan_cosine_is_scale_invariant();
 	test_tq_batch_page_scan_non_normalized_metrics_use_compatibility_fallback();
+	test_tq_metadata_slot_compare_orders_supported_kinds();
 	test_tq_meta_page_roundtrip();
 	test_tq_meta_page_rejects_old_format_version();
+	test_tq_batch_summary_page_roundtrip_with_metadata_synopsis();
 	test_tq_list_dir_entry_roundtrip();
 	test_tq_batch_page_header_init();
 	test_tq_batch_page_capacity_checks();

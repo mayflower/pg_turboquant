@@ -24,7 +24,13 @@ class RagLiveConfigContractTest(unittest.TestCase):
         self.assertEqual(config.dataset.name, "popqa_small_live")
         self.assertEqual(config.embedding.model, "BAAI/bge-small-en-v1.5")
         self.assertEqual(config.embedding.dimension, 384)
+        self.assertTrue(config.embedding.normalized)
         self.assertEqual(config.schema["passages_table"], "rag_passages")
+        self.assertEqual(config.backends[0]["kind"], "pg_turboquant")
+        self.assertEqual(config.backends[0]["options"]["lists"], 64)
+        self.assertEqual(config.backends[0]["options"]["router_restarts"], 3)
+        self.assertEqual(config.backends[0]["ann"]["probes"], 8)
+        self.assertEqual(config.backends[0]["ann"]["oversampling"], 4)
         self.assertEqual(len(config.backends), 3)
 
     def test_kilt_nq_small_live_config_parses(self):
@@ -33,7 +39,13 @@ class RagLiveConfigContractTest(unittest.TestCase):
         self.assertEqual(config.dataset.name, "kilt_nq_small_live")
         self.assertEqual(config.embedding.model, "BAAI/bge-small-en-v1.5")
         self.assertEqual(config.embedding.dimension, 384)
+        self.assertTrue(config.embedding.normalized)
         self.assertEqual(config.schema["passages_table"], "rag_passages")
+        self.assertEqual(config.backends[0]["kind"], "pg_turboquant")
+        self.assertEqual(config.backends[0]["options"]["lists"], 64)
+        self.assertEqual(config.backends[0]["options"]["router_restarts"], 3)
+        self.assertEqual(config.backends[0]["ann"]["probes"], 8)
+        self.assertEqual(config.backends[0]["ann"]["oversampling"], 4)
         self.assertEqual(len(config.backends), 3)
 
     def test_kilt_hotpotqa_small_live_config_parses(self):
@@ -42,7 +54,13 @@ class RagLiveConfigContractTest(unittest.TestCase):
         self.assertEqual(config.dataset.name, "kilt_hotpotqa_small_live")
         self.assertEqual(config.embedding.model, "BAAI/bge-small-en-v1.5")
         self.assertEqual(config.embedding.dimension, 384)
+        self.assertTrue(config.embedding.normalized)
         self.assertEqual(config.schema["passages_table"], "rag_passages")
+        self.assertEqual(config.backends[0]["kind"], "pg_turboquant")
+        self.assertEqual(config.backends[0]["options"]["lists"], 64)
+        self.assertEqual(config.backends[0]["options"]["router_restarts"], 3)
+        self.assertEqual(config.backends[0]["ann"]["probes"], 8)
+        self.assertEqual(config.backends[0]["ann"]["oversampling"], 4)
         self.assertEqual(len(config.backends), 3)
 
     def test_kilt_hotpotqa_ivf_live_config_parses(self):

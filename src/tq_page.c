@@ -108,6 +108,10 @@
 #define TQ_EXACT_KEY_ENTRY_COUNT_OFFSET 14
 #define TQ_EXACT_KEY_NEXT_BLOCK_OFFSET 16
 
+#define TQ_BATCH_SUMMARY_MASK_BYTES ((size_t) (3 * sizeof(uint16_t)))
+#define TQ_BATCH_SUMMARY_VALUE_BLOCK_BYTES ((size_t) TQ_MAX_STORED_METADATA_ATTRIBUTES * (size_t) TQ_METADATA_SLOT_BYTES)
+#define TQ_BATCH_SUMMARY_SYNOPSIS_BYTES (TQ_BATCH_SUMMARY_MASK_BYTES + (size_t) 3 * TQ_BATCH_SUMMARY_VALUE_BLOCK_BYTES)
+
 static void
 tq_set_error(char *errmsg, size_t errmsg_len, const char *message)
 {
@@ -561,7 +565,7 @@ tq_centroid_validate_header(const uint8_t *page,
 static size_t
 tq_batch_summary_entry_bytes(uint32_t code_bytes)
 {
-	return (size_t) 12 + (size_t) code_bytes;
+	return (size_t) 12 + TQ_BATCH_SUMMARY_SYNOPSIS_BYTES + (size_t) code_bytes;
 }
 
 static size_t
@@ -1543,7 +1547,19 @@ tq_batch_summary_page_set_entry(void *page,
 	tq_write_u16(bytes, offset + 4, summary->representative_lane);
 	tq_write_u16(bytes, offset + 6, 0);
 	tq_write_float32(bytes, offset + 8, summary->residual_radius);
-	memcpy(bytes + offset + 12, representative_code, code_len);
+	tq_write_u16(bytes, offset + 12, summary->null_any_mask);
+	tq_write_u16(bytes, offset + 14, summary->null_all_mask);
+	tq_write_u16(bytes, offset + 16, summary->all_same_mask);
+	memcpy(bytes + offset + 18,
+		   summary->same_values,
+		   TQ_BATCH_SUMMARY_VALUE_BLOCK_BYTES);
+	memcpy(bytes + offset + 18 + TQ_BATCH_SUMMARY_VALUE_BLOCK_BYTES,
+		   summary->min_values,
+		   TQ_BATCH_SUMMARY_VALUE_BLOCK_BYTES);
+	memcpy(bytes + offset + 18 + (2 * TQ_BATCH_SUMMARY_VALUE_BLOCK_BYTES),
+		   summary->max_values,
+		   TQ_BATCH_SUMMARY_VALUE_BLOCK_BYTES);
+	memcpy(bytes + offset + 12 + TQ_BATCH_SUMMARY_SYNOPSIS_BYTES, representative_code, code_len);
 
 	entry_count = tq_read_u16(bytes, TQ_BATCH_SUMMARY_ENTRY_COUNT_OFFSET);
 	if (index >= entry_count)
@@ -1595,7 +1611,21 @@ tq_batch_summary_page_get_entry(const void *page,
 	*block_number = tq_read_u32(bytes, offset + 0);
 	summary->representative_lane = tq_read_u16(bytes, offset + 4);
 	summary->residual_radius = tq_read_float32(bytes, offset + 8);
-	memcpy(representative_code, bytes + offset + 12, (size_t) code_bytes);
+	summary->null_any_mask = tq_read_u16(bytes, offset + 12);
+	summary->null_all_mask = tq_read_u16(bytes, offset + 14);
+	summary->all_same_mask = tq_read_u16(bytes, offset + 16);
+	memcpy(summary->same_values,
+		   bytes + offset + 18,
+		   TQ_BATCH_SUMMARY_VALUE_BLOCK_BYTES);
+	memcpy(summary->min_values,
+		   bytes + offset + 18 + TQ_BATCH_SUMMARY_VALUE_BLOCK_BYTES,
+		   TQ_BATCH_SUMMARY_VALUE_BLOCK_BYTES);
+	memcpy(summary->max_values,
+		   bytes + offset + 18 + (2 * TQ_BATCH_SUMMARY_VALUE_BLOCK_BYTES),
+		   TQ_BATCH_SUMMARY_VALUE_BLOCK_BYTES);
+	memcpy(representative_code,
+		   bytes + offset + 12 + TQ_BATCH_SUMMARY_SYNOPSIS_BYTES,
+		   (size_t) code_bytes);
 	return true;
 }
 

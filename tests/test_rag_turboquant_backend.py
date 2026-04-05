@@ -79,16 +79,18 @@ class PgTurboquantBackendContractTest(unittest.TestCase):
         self.assertEqual(
             plan.session_statements,
             [
+                ("SET LOCAL enable_seqscan = off", ()),
+                ("SET LOCAL enable_bitmapscan = off", ()),
                 ("SET LOCAL turboquant.probes = %s", (4,)),
                 ("SET LOCAL turboquant.oversample_factor = %s", (2.0,)),
             ],
         )
-        self.assertIn("WITH query_vector AS", plan.sql)
         self.assertIn("FROM rag_docs AS p", plan.sql)
-        self.assertIn("ORDER BY p.embedding <=> query_vector.embedding ASC", plan.sql)
+        self.assertIn("p.embedding <=> %s::vector AS score", plan.sql)
+        self.assertIn("ORDER BY p.embedding <=> %s::vector ASC", plan.sql)
         self.assertNotIn("tq_approx_candidates", plan.sql)
         self.assertNotIn("tq_rerank_candidates", plan.sql)
-        self.assertEqual(plan.params[-1], 3)
+        self.assertEqual(plan.params, ("[1.0,0.0,0.0]", "[1.0,0.0,0.0]", 3))
 
         metadata = backend.serialize_run_metadata(plan)
         self.assertEqual(metadata["index_kind"], "pg_turboquant")
@@ -120,9 +122,25 @@ class PgTurboquantBackendContractTest(unittest.TestCase):
             ),
         )
 
-        self.assertIn("approx_candidates", plan.sql)
-        self.assertIn("ORDER BY", plan.sql)
-        self.assertEqual(plan.params[-2:], (25, 5))
+        self.assertIn("approx_candidates AS MATERIALIZED", plan.sql)
+        self.assertIn("exact_scores AS MATERIALIZED", plan.sql)
+        self.assertIn("SELECT p.doc_id AS id", plan.sql)
+        self.assertNotIn("p.embedding AS embedding", plan.sql)
+        self.assertNotIn("WITH query_vector AS", plan.sql)
+        self.assertIn("ORDER BY p.embedding <-> %s::vector ASC", plan.sql)
+        self.assertIn("text_source.embedding <-> %s::vector AS score", plan.sql)
+        self.assertIn("FROM exact_scores", plan.sql)
+        self.assertIn("ORDER BY exact_scores.score ASC", plan.sql)
+        self.assertEqual(plan.params, ("[0.25,-0.25]", 25, "[0.25,-0.25]", 5))
+        self.assertEqual(
+            plan.session_statements[:4],
+            [
+                ("SET LOCAL enable_seqscan = off", ()),
+                ("SET LOCAL enable_bitmapscan = off", ()),
+                ("SET LOCAL turboquant.probes = %s", (2,)),
+                ("SET LOCAL turboquant.oversample_factor = %s", (3.0,)),
+            ],
+        )
 
         metadata = backend.serialize_run_metadata(plan)
         self.assertEqual(metadata["mode"], "approx_rerank")
@@ -166,15 +184,21 @@ class PgTurboquantBackendContractTest(unittest.TestCase):
         self.assertIn("stage1_candidates AS", plan.sql)
         self.assertIn("source_id = ANY", plan.sql)
         self.assertIn(
-            "SELECT p.passage_id AS id, p.embedding <=> query_vector.embedding AS ann_score, p.doc_id, p.chunk_id, p.tenant_id, p.doc_version",
+            "SELECT p.passage_id AS id, p.embedding <=> %s::vector AS ann_score, p.doc_id, p.chunk_id, p.tenant_id, p.doc_version",
             plan.sql,
         )
+        self.assertIn("ORDER BY p.embedding <=> %s::vector ASC", plan.sql)
         self.assertNotIn("JOIN rag_docs AS text_source", plan.sql)
         self.assertNotIn("passage_text", plan.sql)
-        self.assertEqual(plan.session_statements[:2], [
-            ("SET LOCAL turboquant.probes = %s", (2,)),
-            ("SET LOCAL turboquant.oversample_factor = %s", (2.0,)),
-        ])
+        self.assertEqual(
+            plan.session_statements[:4],
+            [
+                ("SET LOCAL enable_seqscan = off", ()),
+                ("SET LOCAL enable_bitmapscan = off", ()),
+                ("SET LOCAL turboquant.probes = %s", (2,)),
+                ("SET LOCAL turboquant.oversample_factor = %s", (2.0,)),
+            ],
+        )
 
         metadata = backend.serialize_run_metadata(plan)
         self.assertEqual(metadata["filters"], {"tenant_id": 7, "source_id": [10, 11], "lang_id": 1})
@@ -217,6 +241,7 @@ class PgTurboquantBackendContractTest(unittest.TestCase):
         self.assertIn("FROM rag_docs AS p", plan.sql)
         self.assertIn("FROM rag_docs_delta AS p", plan.sql)
         self.assertIn("UNION ALL", plan.sql)
+        self.assertIn("ORDER BY p.embedding <=> %s::vector ASC", plan.sql)
         self.assertNotIn("JOIN rag_docs AS text_source", plan.sql)
         metadata = backend.serialize_run_metadata(plan)
         self.assertEqual(metadata["delta_mode"], "union")
@@ -247,6 +272,7 @@ class PgTurboquantBackendContractTest(unittest.TestCase):
 
         self.assertIn("stage1_candidates AS", plan.sql)
         self.assertNotIn("UNION ALL", plan.sql)
+        self.assertIn("ORDER BY p.embedding <=> %s::vector ASC", plan.sql)
         metadata = backend.serialize_run_metadata(plan)
         self.assertEqual(metadata["delta_mode"], "native")
         self.assertIsNone(metadata["delta_table_name"])
@@ -274,9 +300,13 @@ class PgTurboquantBackendContractTest(unittest.TestCase):
             ),
         )
 
-        self.assertIn("stage1_candidates AS", plan.sql)
+        self.assertIn("stage1_candidates AS MATERIALIZED", plan.sql)
+        self.assertIn("exact_scores AS MATERIALIZED", plan.sql)
         self.assertIn("JOIN rag_docs AS text_source ON text_source.doc_id = stage1_candidates.id", plan.sql)
+        self.assertIn("text_source.embedding <=> %s::vector AS score", plan.sql)
         self.assertNotIn("text_source.passage_text AS text", plan.sql)
+        self.assertIn("FROM exact_scores", plan.sql)
+        self.assertIn("ORDER BY exact_scores.score ASC", plan.sql)
 
         metadata = backend.serialize_run_metadata(plan)
         self.assertEqual(metadata["retrieval_execution_mode"], "approx_exact_rerank")
@@ -361,7 +391,10 @@ class PgTurboquantBackendContractTest(unittest.TestCase):
         self.assertIsNone(approx_results[0]["text"])
         self.assertIsNone(rerank_results[0]["text"])
         self.assertEqual(rerank_results[0]["id"], "doc-1")
-        self.assertIn("ORDER BY p.embedding <=> query_vector.embedding ASC", approx_connection.cursors[0].executed[-1][0])
+        self.assertIn(
+            "ORDER BY p.embedding <=> %s::vector ASC",
+            approx_connection.cursors[0].executed[-1][0],
+        )
         self.assertNotIn("tq_approx_candidates", approx_connection.cursors[0].executed[-1][0])
         self.assertIn("approx_candidates", rerank_connection.cursors[0].executed[-1][0])
 

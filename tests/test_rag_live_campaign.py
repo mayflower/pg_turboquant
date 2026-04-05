@@ -7,10 +7,14 @@ from unittest import mock
 from benchmarks.rag.ingestion_pipeline import CampaignConfig, ChunkingConfig, DatasetConfig, EmbeddingConfig
 from benchmarks.rag.bergen_adapter import PassageTable
 from benchmarks.rag.live_campaign import (
+    LIVE_CONFIG_PATHS,
     QuerySample,
     _build_default_generator_runner,
     _isolated_relation_name,
+    _prepare_backend_isolated_layout,
     _prepare_dataset_source_layout,
+    _provided_dataset_source_layout,
+    _resolve_method_rerank_top_k,
     _run_retrieval_scenario,
     _rewrite_indexdef_for_clone,
     build_live_campaign_runtime,
@@ -84,6 +88,61 @@ class FakeConnection:
 
 
 class RagLiveCampaignContractTest(unittest.TestCase):
+    def test_default_live_campaign_uses_normal_hotpotqa_config(self):
+        self.assertEqual(LIVE_CONFIG_PATHS["kilt_hotpotqa"].name, "kilt_hotpotqa_small_live.json")
+
+    def test_turboquant_rerank_candidate_pool_scales_above_dataset_default(self):
+        rerank_top_k = _resolve_method_rerank_top_k(
+            method_id="pg_turboquant_rerank",
+            dataset_top_k=20,
+            dataset_rerank_top_k=100,
+            source_live_count=2474,
+        )
+
+        self.assertEqual(rerank_top_k, 1280)
+
+    def test_turboquant_rerank_candidate_pool_caps_at_live_count(self):
+        rerank_top_k = _resolve_method_rerank_top_k(
+            method_id="pg_turboquant_rerank",
+            dataset_top_k=20,
+            dataset_rerank_top_k=100,
+            source_live_count=600,
+        )
+
+        self.assertEqual(rerank_top_k, 600)
+
+    def test_non_turboquant_rerank_candidate_pool_uses_dataset_default(self):
+        rerank_top_k = _resolve_method_rerank_top_k(
+            method_id="pgvector_hnsw_rerank",
+            dataset_top_k=20,
+            dataset_rerank_top_k=100,
+            source_live_count=2474,
+        )
+
+        self.assertEqual(rerank_top_k, 100)
+
+    def test_provided_dataset_source_layout_uses_explicit_live_relations(self):
+        layout = _provided_dataset_source_layout(
+            passage_table=PassageTable(
+                table_name="public.rag_passages_normcmp",
+                id_column="passage_id",
+                text_column="passage_text",
+                embedding_column="embedding",
+                query_vector_cast="vector",
+            ),
+            turboquant_index_name="public.rag_passages_normcmp_tq_idx",
+            hnsw_index_name="public.rag_passages_normcmp_hnsw_idx",
+            ivfflat_index_name="public.rag_passages_normcmp_ivf_idx",
+        )
+
+        self.assertEqual(layout["passage_table"].table_name, "public.rag_passages_normcmp")
+        self.assertEqual(layout["index_names"]["pg_turboquant"], "public.rag_passages_normcmp_tq_idx")
+        self.assertEqual(layout["index_names"]["pgvector_hnsw"], "public.rag_passages_normcmp_hnsw_idx")
+        self.assertEqual(layout["index_names"]["pgvector_ivfflat"], "public.rag_passages_normcmp_ivf_idx")
+        self.assertEqual(layout["manifest"]["source_mode"], "provided")
+        self.assertEqual(layout["manifest"]["table_name"], "public.rag_passages_normcmp")
+        self.assertEqual(layout["backend_ann_defaults"], {})
+
     def test_prepare_dataset_source_layout_rebuilds_a_dataset_specific_live_corpus(self):
         fake_config = CampaignConfig(
             dataset=DatasetConfig(
@@ -226,7 +285,7 @@ class RagLiveCampaignContractTest(unittest.TestCase):
                     ],
                     method_id="pg_turboquant_approx",
                     metric="cosine",
-                    query_encoder=lambda texts: [[1.0, 0.0] for _ in texts],
+                    query_encoder=lambda texts: [[3.0, 4.0] for _ in texts],
                     dataset_top_k=5,
                     rerank_top_k=10,
                     eval_ks=(1, 5),
@@ -252,6 +311,8 @@ class RagLiveCampaignContractTest(unittest.TestCase):
                 )
 
         self.assertEqual(len(recording_backend.requests), 1)
+        self.assertAlmostEqual(recording_backend.requests[0].query_vector[0], 0.6)
+        self.assertAlmostEqual(recording_backend.requests[0].query_vector[1], 0.8)
         self.assertEqual(recording_backend.requests[0].ann["probes"], 8)
         self.assertEqual(recording_backend.requests[0].ann["filters"], {"tenant_id": 1, "lang_id": 1})
         self.assertEqual(
@@ -387,6 +448,77 @@ class RagLiveCampaignContractTest(unittest.TestCase):
             "CREATE INDEX rag_passages__cmp__hnsw_idx ON rag_passages__cmp__hnsw USING hnsw (embedding vector_cosine_ops) WITH (m='16', ef_construction='64')",
         )
 
+    def test_backend_isolation_accepts_schema_qualified_source_index_names(self):
+        class IndexLookupCursor(FakeCursor):
+            def execute(self, sql, params=()):
+                self.executed.append((sql, params))
+                if "SELECT indexdef FROM pg_indexes" in sql:
+                    if params == ("public", "rag_normcmp_tq_idx"):
+                        self.rows = [
+                            (
+                                "CREATE INDEX rag_normcmp_tq_idx "
+                                "ON public.rag_passages_normcmp USING turboquant (embedding tq_cosine_ops)",
+                            )
+                        ]
+                    elif params == ("public", "rag_normcmp_hnsw_idx"):
+                        self.rows = [
+                            (
+                                "CREATE INDEX rag_normcmp_hnsw_idx "
+                                "ON public.rag_passages_normcmp USING hnsw (embedding vector_cosine_ops)",
+                            )
+                        ]
+                    elif params == ("public", "rag_normcmp_ivf_idx"):
+                        self.rows = [
+                            (
+                                "CREATE INDEX rag_normcmp_ivf_idx "
+                                "ON public.rag_passages_normcmp USING ivfflat (embedding vector_cosine_ops)",
+                            )
+                        ]
+                    else:
+                        self.rows = []
+                    return
+                self.rows = []
+
+        class IndexLookupConnection(FakeConnection):
+            def cursor(self):
+                cursor = IndexLookupCursor()
+                self.cursors.append(cursor)
+                return cursor
+
+            def commit(self):
+                pass
+
+        connection = IndexLookupConnection()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            layout = _prepare_backend_isolated_layout(
+                dsn="postgresql://fake",
+                connect_fn=lambda _dsn: connection,
+                source_table=PassageTable(
+                    table_name="public.rag_passages_normcmp",
+                    id_column="passage_id",
+                    text_column="passage_text",
+                    embedding_column="embedding",
+                    query_vector_cast="vector",
+                ),
+                output_dir=Path(tmpdir),
+                turboquant_index_name="public.rag_normcmp_tq_idx",
+                hnsw_index_name="public.rag_normcmp_hnsw_idx",
+                ivfflat_index_name="public.rag_normcmp_ivf_idx",
+            )
+
+        self.assertIn("pg_turboquant", layout)
+        lookup_calls = [
+            params[-1]
+            for cursor in connection.cursors
+            for sql, params in cursor.executed
+            if "SELECT indexdef FROM pg_indexes" in sql
+        ]
+        self.assertEqual(
+            lookup_calls,
+            ["rag_normcmp_tq_idx", "rag_normcmp_hnsw_idx", "rag_normcmp_ivf_idx"],
+        )
+
     def test_isolated_relation_name_stays_unique_when_long_inputs_truncate(self):
         source_name = _isolated_relation_name(
             "rag_passages_tq_idx__live_rag_e2e_20260330_fair__kilt_nq_source",
@@ -437,28 +569,10 @@ class RagLiveCampaignContractTest(unittest.TestCase):
                 "answer": query_sample.answers[0],
             }
 
-        def fake_prepare_dataset_source_layout(**kwargs):
-            self.assertEqual(kwargs["dataset_id"], "kilt_nq")
-            return {
-                "passage_table": kwargs["passage_table"].__class__(
-                    table_name="rag_passages__kilt_nq_source",
-                    id_column="passage_id",
-                    text_column="passage_text",
-                    embedding_column="embedding",
-                    query_vector_cast="vector",
-                ),
-                "index_names": {
-                    "pg_turboquant": "rag_passages__kilt_nq_tq_idx",
-                    "pgvector_hnsw": "rag_passages__kilt_nq_hnsw_idx",
-                    "pgvector_ivfflat": "rag_passages__kilt_nq_ivf_idx",
-                },
-                "manifest": {"dataset_name": "kilt_nq_small_live"},
-            }
-
         with tempfile.TemporaryDirectory() as tmpdir:
             with mock.patch(
                 "benchmarks.rag.live_campaign._prepare_dataset_source_layout",
-                side_effect=fake_prepare_dataset_source_layout,
+                side_effect=AssertionError("run_live_campaign should use the provided live source layout"),
             ):
                 result = run_live_campaign(
                     output_dir=Path(tmpdir),
@@ -469,9 +583,9 @@ class RagLiveCampaignContractTest(unittest.TestCase):
                     text_column="passage_text",
                     embedding_column="embedding",
                     metric="cosine",
-                    turboquant_index_name="rag_passages_tq_idx",
-                    hnsw_index_name="rag_passages_hnsw_idx",
-                    ivfflat_index_name="rag_passages_ivf_idx",
+                    turboquant_index_name="rag_passages_shared_idx",
+                    hnsw_index_name="rag_passages_shared_idx",
+                    ivfflat_index_name="rag_passages_shared_idx",
                     query_limit=1,
                     generation_top_k=1,
                     backend_isolation=False,
@@ -528,12 +642,38 @@ class RagLiveCampaignContractTest(unittest.TestCase):
             run_config = json.loads(run_config_path.read_text(encoding="utf-8"))
             self.assertEqual(
                 run_config["dataset_source_layouts"]["kilt_nq"]["passage_table"]["table_name"],
-                "rag_passages__kilt_nq_source",
+                "rag_passages",
             )
             self.assertEqual(
-                run_config["dataset_source_layouts"]["kilt_nq"]["manifest"]["dataset_name"],
-                "kilt_nq_small_live",
+                run_config["dataset_source_layouts"]["kilt_nq"]["manifest"]["source_mode"],
+                "provided",
             )
+
+    def test_live_runner_rejects_shared_table_mode_for_distinct_backend_indexes(self):
+        runtime = build_live_campaign_runtime(
+            dataset_ids=["kilt_nq"],
+            generator_name="oracle_answer",
+            retriever_name="bge-small-en-v1.5",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.assertRaisesRegex(ValueError, "backend_isolation=False is unsafe"):
+                run_live_campaign(
+                    output_dir=Path(tmpdir),
+                    runtime=runtime,
+                    dsn="postgresql://fake",
+                    table_name="rag_passages",
+                    id_column="passage_id",
+                    text_column="passage_text",
+                    embedding_column="embedding",
+                    metric="cosine",
+                    turboquant_index_name="rag_passages_tq_idx",
+                    hnsw_index_name="rag_passages_hnsw_idx",
+                    ivfflat_index_name="rag_passages_ivf_idx",
+                    backend_isolation=False,
+                    connect_fn=lambda _dsn: FakeConnection(),
+                    dataset_loader=lambda *_args: [],
+                )
 
 
 if __name__ == "__main__":

@@ -42,8 +42,60 @@ class PostgresBackend(Protocol):
         ...
 
 
+def build_materialized_exact_rerank_sql(
+    *,
+    candidate_ctes: Sequence[str],
+    candidate_relation: str,
+    table: PassageTable,
+    operator: str,
+    query_expr: str,
+    join_column: str,
+    payload_columns: Sequence[str] = (),
+) -> str:
+    exact_projection = [
+        f"{candidate_relation}.id AS id",
+        f"text_source.{table.embedding_column} {operator} {query_expr} AS score",
+    ]
+    for column in payload_columns:
+        exact_projection.append(f"{candidate_relation}.{column}")
+
+    final_projection = ["exact_scores.id", "exact_scores.score"]
+    for column in payload_columns:
+        final_projection.append(f"exact_scores.{column}")
+
+    exact_scores_cte = (
+        "exact_scores AS MATERIALIZED ("
+        "SELECT "
+        + ", ".join(exact_projection)
+        + " "
+        + f"FROM {candidate_relation} "
+        + f"JOIN {table.table_name} AS text_source "
+        + f"ON text_source.{join_column} = {candidate_relation}.id"
+        + ")"
+    )
+
+    return (
+        "WITH "
+        + ", ".join([*candidate_ctes, exact_scores_cte])
+        + " "
+        + "SELECT "
+        + ", ".join(final_projection)
+        + " "
+        + "FROM exact_scores "
+        + "ORDER BY exact_scores.score ASC "
+        + "LIMIT %s"
+    )
+
+
 def vector_literal(values: Sequence[float]) -> str:
     return "[" + ",".join(str(value) for value in values) + "]"
+
+
+def ann_benchmark_session_statements(*, disable_bitmapscan: bool = False) -> list[tuple[str, tuple[Any, ...]]]:
+    statements: list[tuple[str, tuple[Any, ...]]] = [("SET LOCAL enable_seqscan = off", ())]
+    if disable_bitmapscan:
+        statements.append(("SET LOCAL enable_bitmapscan = off", ()))
+    return statements
 
 
 def render_session_statement(sql: str, params: Sequence[Any]) -> str:

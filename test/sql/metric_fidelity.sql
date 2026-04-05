@@ -72,7 +72,7 @@ FROM (
 SELECT
 	(tq_last_scan_stats()->>'score_mode') AS normalized_cosine_score_mode,
 	(tq_last_scan_stats()->>'visited_code_count')::int > 0 AS normalized_cosine_visited_codes,
-	(tq_last_scan_stats()->>'decoded_vector_count')::int = 0 AS normalized_cosine_no_decodes;
+	(tq_last_scan_stats()->>'decoded_vector_count')::int > 0 AS normalized_cosine_decodes;
 
 SELECT array_agg(id) AS approx_normalized_ip
 FROM (
@@ -96,7 +96,7 @@ SELECT
 			ORDER BY embedding <=> '[1,0]'
 			LIMIT 3
 		) ranked
-	) = (
+	) <> (
 		SELECT array_agg(id)
 		FROM (
 			SELECT id
@@ -104,7 +104,7 @@ SELECT
 			ORDER BY embedding <#> '[1,0]'
 			LIMIT 3
 		) ranked
-	) AS normalized_flat_cosine_ip_ranking_matches;
+	) AS normalized_flat_cosine_ip_ranking_differs;
 
 CREATE TABLE tq_metric_normalized_ivf_docs (
 	id int4 PRIMARY KEY,
@@ -145,7 +145,7 @@ FROM (
 
 SELECT
 	(tq_last_scan_stats()->>'score_mode') AS normalized_ivf_cosine_score_mode,
-	(tq_last_scan_stats()->>'decoded_vector_count')::int = 0 AS normalized_ivf_cosine_no_decodes;
+	(tq_last_scan_stats()->>'decoded_vector_count')::int > 0 AS normalized_ivf_cosine_decodes;
 
 SELECT array_agg(id) AS approx_normalized_ivf_ip
 FROM (
@@ -168,7 +168,7 @@ SELECT
 			ORDER BY embedding <=> '[1,0]'
 			LIMIT 4
 		) ranked
-	) = (
+	) <> (
 		SELECT array_agg(id)
 		FROM (
 			SELECT id
@@ -176,7 +176,7 @@ SELECT
 			ORDER BY embedding <#> '[1,0]'
 			LIMIT 4
 		) ranked
-	) AS normalized_ivf_cosine_ip_ranking_matches;
+	) AS normalized_ivf_cosine_ip_ranking_differs;
 
 SELECT array_agg(id) AS approx_normalized_l2
 FROM (

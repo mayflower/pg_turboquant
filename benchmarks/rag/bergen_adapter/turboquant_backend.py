@@ -11,6 +11,8 @@ from .adapter import (
     PassageTable,
     RetrievalPlan,
     RetrievalRequest,
+    ann_benchmark_session_statements,
+    build_materialized_exact_rerank_sql,
     validate_ann_backend_request,
     vector_literal,
 )
@@ -52,7 +54,7 @@ class PgTurboquantBackend:
         if request_metric == "inner_product" and not self.normalized:
             raise ValueError("pg_turboquant inner_product backend requires normalized vectors")
 
-        session_statements = []
+        session_statements = ann_benchmark_session_statements(disable_bitmapscan=True)
         probes = request.ann.get("probes")
         if probes is not None:
             session_statements.append((f"SET LOCAL {self.probes_guc} = %s", (probes,)))
@@ -101,15 +103,13 @@ class PgTurboquantBackend:
                 )
             else:
                 sql = (
-                    f"WITH query_vector AS (SELECT %s::{table.query_vector_cast} AS embedding) "
                     f"SELECT p.{table.id_column} AS id, "
-                    f"p.{table.embedding_column} {operator} query_vector.embedding AS score "
+                    f"p.{table.embedding_column} {operator} %s::{table.query_vector_cast} AS score "
                     f"FROM {table.table_name} AS p "
-                    f"CROSS JOIN query_vector "
-                    f"ORDER BY p.{table.embedding_column} {operator} query_vector.embedding ASC "
+                    f"ORDER BY p.{table.embedding_column} {operator} %s::{table.query_vector_cast} ASC "
                     f"LIMIT %s"
                 )
-                params = (query_literal, request.top_k)
+                params = (query_literal, query_literal, request.top_k)
         elif filters or stage1_payload_columns or delta_table_name or native_delta:
             sql, params = self._build_filtered_stage1_plan(
                 table=table,
@@ -126,24 +126,21 @@ class PgTurboquantBackend:
                 exact_rerank=True,
             )
         else:
-            sql = (
-                f"WITH query_vector AS (SELECT %s::{table.query_vector_cast} AS embedding), "
-                f"approx_candidates AS ("
-                f"SELECT p.{table.id_column} AS id, p.{table.embedding_column} AS embedding "
-                f"FROM {table.table_name} AS p "
-                f"CROSS JOIN query_vector "
-                f"ORDER BY p.{table.embedding_column} {operator} query_vector.embedding ASC "
-                f"LIMIT %s"
-                f") "
-                f"SELECT approx_candidates.id AS id, "
-                f"text_source.{table.embedding_column} {operator} query_vector.embedding AS score "
-                f"FROM approx_candidates "
-                f"JOIN {table.table_name} AS text_source ON text_source.{table.id_column} = approx_candidates.id "
-                f"CROSS JOIN query_vector "
-                f"ORDER BY score ASC "
-                f"LIMIT %s"
+            sql = build_materialized_exact_rerank_sql(
+                candidate_ctes=[
+                    "approx_candidates AS MATERIALIZED ("
+                    f"SELECT p.{table.id_column} AS id "
+                    f"FROM {table.table_name} AS p "
+                    f"ORDER BY p.{table.embedding_column} {operator} %s::{table.query_vector_cast} ASC "
+                    "LIMIT %s)"
+                ],
+                candidate_relation="approx_candidates",
+                table=table,
+                operator=operator,
+                query_expr=f"%s::{table.query_vector_cast}",
+                join_column=table.id_column,
             )
-            params = (query_literal, self.rerank_k, request.top_k)
+            params = (query_literal, self.rerank_k, query_literal, request.top_k)
 
         return RetrievalPlan(
             sql=sql,
@@ -167,30 +164,31 @@ class PgTurboquantBackend:
         stage1_limit: int,
         exact_rerank: bool,
     ) -> tuple[str, tuple[Any, ...]]:
-        params: list[Any] = [query_literal]
         where_sql, where_params = _render_filter_clause("p", filters)
-        params.extend(where_params)
+        query_expr = f"%s::{table.query_vector_cast}"
 
         stage1_projection = [
             f"p.{text_join_column} AS id",
-            f"p.{table.embedding_column} {operator} query_vector.embedding AS ann_score",
+            f"p.{table.embedding_column} {operator} {query_expr} AS ann_score",
         ]
         for column in stage1_payload_columns:
             stage1_projection.append(f"p.{column}")
         projection_sql = ", ".join(stage1_projection)
 
+        params: list[Any] = []
         stage1_ctes = [
-            "query_vector AS (SELECT %s::%s AS embedding)" % ( "%s", table.query_vector_cast),
             (
                 "base_stage1 AS ("
                 f"SELECT {projection_sql} "
                 f"FROM {table.table_name} AS p "
-                "CROSS JOIN query_vector "
                 f"{where_sql} "
-                f"ORDER BY p.{table.embedding_column} {operator} query_vector.embedding ASC "
+                f"ORDER BY p.{table.embedding_column} {operator} {query_expr} ASC "
                 "LIMIT %s)"
             ),
         ]
+        params.append(query_literal)
+        params.extend(where_params)
+        params.append(query_literal)
         params.append(stage1_limit)
 
         union_source = "SELECT * FROM base_stage1"
@@ -200,57 +198,58 @@ class PgTurboquantBackend:
                 "delta_stage1 AS ("
                 f"SELECT {projection_sql} "
                 f"FROM {delta_table_name} AS p "
-                "CROSS JOIN query_vector "
                 f"{delta_where_sql} "
-                f"ORDER BY p.{table.embedding_column} {operator} query_vector.embedding ASC "
+                f"ORDER BY p.{table.embedding_column} {operator} {query_expr} ASC "
                 "LIMIT %s)"
             )
+            params.append(query_literal)
             params.extend(delta_where_params)
+            params.append(query_literal)
             params.append(delta_candidate_limit)
             union_source = "SELECT * FROM base_stage1 UNION ALL SELECT * FROM delta_stage1"
 
-        stage1_ctes.append(
-            "stage1_candidates AS ("
-            f"{union_source}"
-            ")"
-        )
+        stage1_ctes.append("stage1_candidates AS MATERIALIZED (" f"{union_source}" ")")
 
         final_projection = ["stage1_candidates.id"]
         for column in stage1_payload_columns:
             final_projection.append(f"stage1_candidates.{column}")
 
         if exact_rerank:
-            final_projection.insert(
-                1,
-                f"text_source.{table.embedding_column} {operator} query_vector.embedding AS score",
+            sql = (
+                f"/* tq_filters: {json.dumps(filters, sort_keys=True)} */ "
+                f"/* tq_stage1_payload_columns: {json.dumps(list(stage1_payload_columns))} */ "
+                f"/* tq_delta_table_name: {json.dumps(delta_table_name)} */ "
+                f"/* tq_delta_mode: {json.dumps('native' if native_delta else ('union' if delta_table_name else None))} */ "
+                f"/* tq_delta_candidate_limit: {json.dumps(delta_candidate_limit if delta_table_name else None)} */ "
+                + build_materialized_exact_rerank_sql(
+                    candidate_ctes=stage1_ctes,
+                    candidate_relation="stage1_candidates",
+                    table=table,
+                    operator=operator,
+                    query_expr=query_expr,
+                    join_column=text_join_column,
+                    payload_columns=stage1_payload_columns,
+                )
             )
+            params.append(query_literal)
         else:
             final_projection.insert(1, "stage1_candidates.ann_score AS score")
-
-        final_from = "FROM stage1_candidates "
-        if exact_rerank:
-            final_from += (
-                f"JOIN {table.table_name} AS text_source "
-                f"ON text_source.{text_join_column} = stage1_candidates.id "
+            sql = (
+                f"/* tq_filters: {json.dumps(filters, sort_keys=True)} */ "
+                f"/* tq_stage1_payload_columns: {json.dumps(list(stage1_payload_columns))} */ "
+                f"/* tq_delta_table_name: {json.dumps(delta_table_name)} */ "
+                f"/* tq_delta_mode: {json.dumps('native' if native_delta else ('union' if delta_table_name else None))} */ "
+                f"/* tq_delta_candidate_limit: {json.dumps(delta_candidate_limit if delta_table_name else None)} */ "
+                "WITH "
+                + ", ".join(stage1_ctes)
+                + " "
+                + "SELECT "
+                + ", ".join(final_projection)
+                + " "
+                + "FROM stage1_candidates "
+                + "ORDER BY score ASC "
+                + "LIMIT %s"
             )
-        final_from += "CROSS JOIN query_vector "
-
-        sql = (
-            f"/* tq_filters: {json.dumps(filters, sort_keys=True)} */ "
-            f"/* tq_stage1_payload_columns: {json.dumps(list(stage1_payload_columns))} */ "
-            f"/* tq_delta_table_name: {json.dumps(delta_table_name)} */ "
-            f"/* tq_delta_mode: {json.dumps('native' if native_delta else ('union' if delta_table_name else None))} */ "
-            f"/* tq_delta_candidate_limit: {json.dumps(delta_candidate_limit if delta_table_name else None)} */ "
-            "WITH "
-            + ", ".join(stage1_ctes)
-            + " "
-            + "SELECT "
-            + ", ".join(final_projection)
-            + " "
-            + final_from
-            + "ORDER BY score ASC "
-            + "LIMIT %s"
-        )
         params.append(request_top_k)
         return sql, tuple(params)
 

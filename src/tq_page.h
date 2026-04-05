@@ -10,7 +10,7 @@
 #include "src/tq_transform.h"
 
 #define TQ_PAGE_MAGIC UINT32_C(0x54515047)
-#define TQ_PAGE_FORMAT_VERSION 17
+#define TQ_PAGE_FORMAT_VERSION 18
 #define TQ_INVALID_BLOCK_NUMBER UINT32_MAX
 #define TQ_DETACHED_FREE_LIST_ID UINT32_MAX
 #define TQ_DELTA_LIST_ID (UINT32_MAX - 1u)
@@ -144,6 +144,12 @@ typedef struct TqBatchPageSummary
 {
 	uint16_t	representative_lane;
 	float		residual_radius;
+	uint16_t	null_any_mask;
+	uint16_t	null_all_mask;
+	uint16_t	all_same_mask;
+	uint8_t		same_values[TQ_MAX_STORED_METADATA_ATTRIBUTES][TQ_METADATA_SLOT_BYTES];
+	uint8_t		min_values[TQ_MAX_STORED_METADATA_ATTRIBUTES][TQ_METADATA_SLOT_BYTES];
+	uint8_t		max_values[TQ_MAX_STORED_METADATA_ATTRIBUTES][TQ_METADATA_SLOT_BYTES];
 } TqBatchPageSummary;
 
 typedef struct TqCentroidPageHeaderView

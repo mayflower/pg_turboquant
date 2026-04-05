@@ -4,6 +4,7 @@ import ast
 import hashlib
 import importlib
 import json
+import math
 import os
 import re
 import sys
@@ -41,13 +42,15 @@ DEFAULT_TURBOQUANT_PROBES = 8
 DEFAULT_TURBOQUANT_OVERSAMPLING = 4
 DEFAULT_TURBOQUANT_MAX_VISITED_CODES = 4096
 DEFAULT_TURBOQUANT_MAX_VISITED_PAGES = 0
+DEFAULT_TURBOQUANT_RERANK_TOP_K_MULTIPLIER = 64
+DEFAULT_TURBOQUANT_RERANK_MIN_CANDIDATES = 1024
 DEFAULT_HNSW_EF_SEARCH = 80
 DEFAULT_IVFFLAT_PROBES = 8
 DEFAULT_GENERATION_TOP_K = 5
 BACKEND_FAMILIES = ("pg_turboquant", "pgvector_hnsw", "pgvector_ivfflat")
 LIVE_CONFIG_PATHS = {
     "kilt_nq": Path(__file__).resolve().parent / "configs" / "live" / "kilt_nq_small_live.json",
-    "kilt_hotpotqa": Path(__file__).resolve().parent / "configs" / "live" / "kilt_hotpotqa_ivf_live.json",
+    "kilt_hotpotqa": Path(__file__).resolve().parent / "configs" / "live" / "kilt_hotpotqa_small_live.json",
     "popqa": Path(__file__).resolve().parent / "configs" / "live" / "popqa_small_live.json",
 }
 
@@ -129,6 +132,13 @@ def run_live_campaign(
     }
     resolved_prompt_name = prompt_name or str(runtime["prompt_name"])
 
+    _validate_live_campaign_isolation_contract(
+        backend_isolation=backend_isolation,
+        turboquant_index_name=turboquant_index_name,
+        hnsw_index_name=hnsw_index_name,
+        ivfflat_index_name=ivfflat_index_name,
+    )
+
     if connect_fn is None:
         connect_fn = _default_connect_fn()
     if dataset_loader is None:
@@ -180,6 +190,7 @@ def run_live_campaign(
         "generation_top_k": generation_top_k,
         "dataset_configs": dataset_configs,
     }
+
     (output_dir / "live-campaign-config.json").write_text(
         json.dumps(run_config, indent=2, sort_keys=True),
         encoding="utf-8",
@@ -191,6 +202,12 @@ def run_live_campaign(
         text_column=text_column,
         embedding_column=embedding_column,
         query_vector_cast=query_vector_cast,
+    )
+    provided_source_layout = _provided_dataset_source_layout(
+        passage_table=passage_table,
+        turboquant_index_name=turboquant_index_name,
+        hnsw_index_name=hnsw_index_name,
+        ivfflat_index_name=ivfflat_index_name,
     )
 
     answer_metrics_fn = _build_answer_metrics_computer(bergen_root)
@@ -204,15 +221,7 @@ def run_live_campaign(
         if not dataset_samples:
             raise ValueError(f"dataset loader returned no queries for dataset: {dataset_id}")
 
-        dataset_layout = _prepare_dataset_source_layout(
-            dataset_id=dataset_id,
-            output_dir=output_dir,
-            dsn=dsn,
-            connect_fn=connect_fn,
-            metric=metric,
-            query_vector_cast=query_vector_cast,
-            passage_table=passage_table,
-        )
+        dataset_layout = provided_source_layout
         dataset_source_layouts[dataset_id] = _serialize_dataset_source_layout(dataset_layout)
         isolation_layout = (
             _prepare_backend_isolated_layout(
@@ -229,12 +238,25 @@ def run_live_campaign(
         )
 
         dataset_top_k = int(dataset_config["retrieval_profile"]["top_k_default"])
-        rerank_top_k = int(dataset_config["retrieval_profile"].get("rerank_top_k_default") or dataset_top_k)
+        dataset_rerank_top_k = int(
+            dataset_config["retrieval_profile"].get("rerank_top_k_default") or dataset_top_k
+        )
+        dataset_live_count = _fetch_relation_row_count(
+            dsn=dsn,
+            connect_fn=connect_fn,
+            relation_name=dataset_layout["passage_table"].table_name,
+        )
         eval_ks = _metric_ks(dataset_top_k)
 
         for variant in plan["system_variants"]:
             method_id = str(variant["system_id"])
             backend_family = str(variant["retriever_backend"])
+            rerank_top_k = _resolve_method_rerank_top_k(
+                method_id=method_id,
+                dataset_top_k=dataset_top_k,
+                dataset_rerank_top_k=dataset_rerank_top_k,
+                source_live_count=dataset_live_count,
+            )
             scenario_table = _resolve_scenario_passage_table(
                 dataset_layout["passage_table"], isolation_layout, backend_family
             )
@@ -309,6 +331,30 @@ def run_live_campaign(
         ],
     )
     return {"plan": plan, "artifacts": artifacts, "config_path": "live-campaign-config.json"}
+
+
+def _validate_live_campaign_isolation_contract(
+    *,
+    backend_isolation: bool,
+    turboquant_index_name: str,
+    hnsw_index_name: str,
+    ivfflat_index_name: str,
+) -> None:
+    if backend_isolation:
+        return
+
+    distinct_index_names = {
+        turboquant_index_name,
+        hnsw_index_name,
+        ivfflat_index_name,
+    }
+    if len(distinct_index_names) <= 1:
+        return
+
+    raise ValueError(
+        "backend_isolation=False is unsafe for comparative live runs with multiple ANN indexes on the same table; "
+        "the planner is free to choose a different index than the benchmark backend requested"
+    )
 
 
 def _resolve_scenario_passage_table(
@@ -416,6 +462,28 @@ def _prepare_dataset_source_layout(
     }
 
 
+def _provided_dataset_source_layout(
+    *,
+    passage_table: PassageTable,
+    turboquant_index_name: str,
+    hnsw_index_name: str,
+    ivfflat_index_name: str,
+) -> dict[str, object]:
+    return {
+        "passage_table": passage_table,
+        "index_names": {
+            "pg_turboquant": turboquant_index_name,
+            "pgvector_hnsw": hnsw_index_name,
+            "pgvector_ivfflat": ivfflat_index_name,
+        },
+        "manifest": {
+            "source_mode": "provided",
+            "table_name": passage_table.table_name,
+        },
+        "backend_ann_defaults": {},
+    }
+
+
 def _serialize_dataset_source_layout(layout: dict[str, object]) -> dict[str, object]:
     passage_table = layout["passage_table"]
     if isinstance(passage_table, PassageTable):
@@ -464,10 +532,17 @@ def _prepare_backend_isolated_layout(
                 cursor.execute(f"DROP TABLE IF EXISTS {entry['table_name']} CASCADE")
                 cursor.execute(f"CREATE TABLE {entry['table_name']} AS TABLE {source_table.table_name} WITH NO DATA")
                 cursor.execute(f"INSERT INTO {entry['table_name']} SELECT * FROM {source_table.table_name}")
-                cursor.execute(
-                    "SELECT indexdef FROM pg_indexes WHERE indexname = %s",
-                    (entry["source_index_name"],),
-                )
+                index_schema_name, index_base_name = _split_qualified_relation_name(entry["source_index_name"])
+                if index_schema_name is None:
+                    cursor.execute(
+                        "SELECT indexdef FROM pg_indexes WHERE indexname = %s",
+                        (index_base_name,),
+                    )
+                else:
+                    cursor.execute(
+                        "SELECT indexdef FROM pg_indexes WHERE schemaname = %s AND indexname = %s",
+                        (index_schema_name, index_base_name),
+                    )
                 row = cursor.fetchone()
                 if row is None:
                     raise ValueError(f"missing source index definition for backend isolation: {entry['source_index_name']}")
@@ -491,6 +566,13 @@ def _isolated_relation_name(base_name: str, backend_family: str, suffix: str) ->
     digest = hashlib.sha1(sanitized.encode("utf-8")).hexdigest()[:8]
     head = sanitized[: 63 - len(digest) - 2].rstrip("_")
     return f"{head}__{digest}"
+
+
+def _split_qualified_relation_name(name: str) -> tuple[str | None, str]:
+    if "." not in name:
+        return None, name
+    schema_name, relation_name = name.rsplit(".", 1)
+    return schema_name, relation_name
 
 
 def _rewrite_indexdef_for_clone(indexdef: str, *, new_table_name: str, new_index_name: str) -> str:
@@ -526,6 +608,16 @@ def _run_retrieval_scenario(
     hnsw_ef_search: int,
     ivfflat_probes: int,
 ) -> dict[str, object]:
+    effective_rerank_top_k = _resolve_method_rerank_top_k(
+        method_id=method_id,
+        dataset_top_k=dataset_top_k,
+        dataset_rerank_top_k=rerank_top_k,
+        source_live_count=_fetch_relation_row_count(
+            dsn=dsn,
+            connect_fn=connect_fn,
+            relation_name=passage_table.table_name,
+        ),
+    )
     backend = _make_backend(
         method_id=method_id,
         metric=metric,
@@ -533,7 +625,7 @@ def _run_retrieval_scenario(
         hnsw_index_name=hnsw_index_name,
         ivfflat_index_name=ivfflat_index_name,
         dataset_top_k=dataset_top_k,
-        rerank_top_k=rerank_top_k,
+        rerank_top_k=effective_rerank_top_k,
     )
     approx_backend = (
         _make_backend(
@@ -542,8 +634,8 @@ def _run_retrieval_scenario(
             turboquant_index_name=turboquant_index_name,
             hnsw_index_name=hnsw_index_name,
             ivfflat_index_name=ivfflat_index_name,
-            dataset_top_k=rerank_top_k,
-            rerank_top_k=rerank_top_k,
+            dataset_top_k=effective_rerank_top_k,
+            rerank_top_k=effective_rerank_top_k,
         )
         if method_id.endswith("_rerank")
         else None
@@ -588,12 +680,15 @@ def _run_retrieval_scenario(
     final_plan = None
 
     for sample in dataset_samples:
-        query_vector = list(query_encoder([sample.question])[0])
+        query_vector = _normalize_query_vector(
+            list(query_encoder([sample.question])[0]),
+            metric=metric,
+        )
 
         if approx_adapter is not None:
             approx_request = RetrievalRequest(
                 query_vector=query_vector,
-                top_k=rerank_top_k,
+                top_k=effective_rerank_top_k,
                 metric=metric,
                 ann=ann,
             )
@@ -898,6 +993,25 @@ def _fetch_relation_size_bytes(
         return None
 
 
+def _fetch_relation_row_count(
+    *,
+    dsn: str,
+    connect_fn: Callable[[str], Any],
+    relation_name: str,
+) -> int | None:
+    try:
+        with connect_fn(dsn) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT GREATEST(reltuples::bigint, 0) FROM pg_class WHERE oid = %s::regclass",
+                    (relation_name,),
+                )
+                row = cursor.fetchone()
+                return int(row[0]) if row else None
+    except Exception:
+        return None
+
+
 def _fetch_turboquant_index_metadata(
     *,
     dsn: str,
@@ -921,6 +1035,17 @@ def _fetch_turboquant_index_metadata(
 
 def _metric_ks(top_k: int) -> tuple[int, ...]:
     return tuple(sorted({1, 5, 10, int(top_k)}))
+
+
+def _normalize_query_vector(query_vector: Sequence[float], *, metric: str) -> list[float]:
+    vector = [float(value) for value in query_vector]
+    if metric not in ("cosine", "inner_product"):
+        return vector
+    squared_norm = sum(value * value for value in vector)
+    if squared_norm <= 0.0:
+        return vector
+    inverse_norm = 1.0 / math.sqrt(squared_norm)
+    return [value * inverse_norm for value in vector]
 
 
 def _ann_settings_for_method(
@@ -949,6 +1074,26 @@ def _merge_ann_settings(base: dict[str, Any], extras: dict[str, Any]) -> dict[st
     merged = dict(base)
     merged.update(extras)
     return merged
+
+
+def _resolve_method_rerank_top_k(
+    *,
+    method_id: str,
+    dataset_top_k: int,
+    dataset_rerank_top_k: int,
+    source_live_count: int | None,
+) -> int:
+    if method_id != "pg_turboquant_rerank":
+        return dataset_rerank_top_k
+
+    rerank_top_k = max(
+        dataset_rerank_top_k,
+        dataset_top_k * DEFAULT_TURBOQUANT_RERANK_TOP_K_MULTIPLIER,
+        DEFAULT_TURBOQUANT_RERANK_MIN_CANDIDATES,
+    )
+    if source_live_count is not None and source_live_count > 0:
+        return min(source_live_count, rerank_top_k)
+    return rerank_top_k
 
 
 def _make_backend(

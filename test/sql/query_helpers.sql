@@ -41,6 +41,12 @@ CREATE INDEX tq_query_helper_docs_idx
 	);
 
 SELECT * FROM tq_recommended_query_knobs(24, 10);
+SELECT
+	probes > 0 AS indexed_probes_positive,
+	oversample_factor >= 8 AS indexed_oversample_not_reduced,
+	max_visited_codes > 0 AS indexed_codes_positive_for_flat,
+	max_visited_pages = 0 AS flat_pages_stay_disabled
+FROM tq_recommended_query_knobs('tq_query_helper_docs_idx'::regclass, 24, 10, 0.25);
 SELECT * FROM tq_resolve_query_knobs(24, 10, 6, 4);
 
 SELECT *
@@ -117,6 +123,7 @@ RESET turboquant.decode_rescore_extra_candidates;
 
 SELECT * FROM tq_recommended_query_knobs(0, 1);
 SELECT * FROM tq_recommended_query_knobs(4, 8);
+SELECT * FROM tq_recommended_query_knobs('tq_query_helper_docs_idx'::regclass, 24, 10, 1.5);
 
 SELECT *
 FROM tq_approx_candidates(

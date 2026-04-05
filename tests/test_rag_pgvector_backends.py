@@ -77,11 +77,19 @@ class PgvectorBackendContractTest(unittest.TestCase):
             ),
         )
 
-        self.assertEqual(plan.session_statements, [("SET LOCAL hnsw.ef_search = %s", (80,))])
+        self.assertEqual(
+            plan.session_statements,
+            [
+                ("SET LOCAL enable_seqscan = off", ()),
+                ("SET LOCAL hnsw.ef_search = %s", (80,)),
+            ],
+        )
         self.assertIn("FROM rag_docs AS p", plan.sql)
-        self.assertIn("ORDER BY p.embedding <=> query_vector.embedding ASC", plan.sql)
+        self.assertIn("p.embedding <=> %s::vector AS score", plan.sql)
+        self.assertIn("ORDER BY p.embedding <=> %s::vector ASC", plan.sql)
         self.assertNotIn("approx_candidates", plan.sql)
         self.assertNotIn("passage_text", plan.sql)
+        self.assertEqual(plan.params, ("[1.0,0.0,0.0]", "[1.0,0.0,0.0]", 4))
 
         metadata = backend.serialize_run_metadata(plan)
         self.assertEqual(metadata["index_kind"], "pgvector_hnsw")
@@ -110,14 +118,25 @@ class PgvectorBackendContractTest(unittest.TestCase):
             ),
         )
 
-        self.assertEqual(plan.session_statements, [("SET LOCAL ivfflat.probes = %s", (6,))])
-        self.assertIn("WITH query_vector AS", plan.sql)
-        self.assertIn("approx_candidates AS", plan.sql)
-        self.assertIn("SELECT p.doc_id AS id, p.embedding AS embedding", plan.sql)
+        self.assertEqual(
+            plan.session_statements,
+            [
+                ("SET LOCAL enable_seqscan = off", ()),
+                ("SET LOCAL ivfflat.probes = %s", (6,)),
+            ],
+        )
+        self.assertNotIn("WITH query_vector AS", plan.sql)
+        self.assertIn("approx_candidates AS MATERIALIZED", plan.sql)
+        self.assertIn("exact_scores AS MATERIALIZED", plan.sql)
+        self.assertIn("SELECT p.doc_id AS id", plan.sql)
+        self.assertNotIn("p.embedding AS embedding", plan.sql)
         self.assertIn("JOIN rag_docs AS text_source ON text_source.doc_id = approx_candidates.id", plan.sql)
+        self.assertIn("ORDER BY p.embedding <-> %s::vector ASC", plan.sql)
+        self.assertIn("text_source.embedding <-> %s::vector AS score", plan.sql)
         self.assertNotIn("passage_text AS text", plan.sql)
-        self.assertIn("ORDER BY score ASC", plan.sql)
-        self.assertEqual(plan.params[-2:], (20, 5))
+        self.assertIn("FROM exact_scores", plan.sql)
+        self.assertIn("ORDER BY exact_scores.score ASC", plan.sql)
+        self.assertEqual(plan.params, ("[0.5,-0.25]", 20, "[0.5,-0.25]", 5))
 
         metadata = backend.serialize_run_metadata(plan)
         self.assertEqual(metadata["index_kind"], "pgvector_ivfflat")
@@ -208,10 +227,12 @@ class PgvectorBackendContractTest(unittest.TestCase):
         self.assertEqual(ivfflat_results[0]["id"], "doc-3")
         self.assertIsNone(hnsw_results[0]["text"])
         self.assertIsNone(ivfflat_results[0]["text"])
-        self.assertIn("hnsw.ef_search", hnsw_connection.cursors[0].executed[0][0])
-        self.assertIn("ivfflat.probes", ivfflat_connection.cursors[0].executed[0][0])
+        self.assertIn("enable_seqscan", hnsw_connection.cursors[0].executed[0][0])
+        self.assertIn("hnsw.ef_search", hnsw_connection.cursors[0].executed[1][0])
+        self.assertIn("enable_seqscan", ivfflat_connection.cursors[0].executed[0][0])
+        self.assertIn("ivfflat.probes", ivfflat_connection.cursors[0].executed[1][0])
         self.assertIn(
-            "ORDER BY p.embedding <#> query_vector.embedding ASC",
+            "ORDER BY p.embedding <#> %s::vector ASC",
             hnsw_connection.cursors[0].executed[-1][0],
         )
         self.assertIn("approx_candidates AS", ivfflat_connection.cursors[0].executed[-1][0])

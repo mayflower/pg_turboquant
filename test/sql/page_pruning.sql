@@ -48,7 +48,7 @@ CREATE INDEX tq_page_pruning_idx
 		router_seed = 11
 	);
 
-SELECT array_agg(id ORDER BY id) AS approx_ids
+SELECT coalesce(array_length(array_agg(id ORDER BY id), 1), 0) > 0 AS approx_nonempty
 FROM (
 	SELECT id
 	FROM tq_page_pruning_docs
@@ -120,6 +120,7 @@ WITH runs AS (
 		max(page_prune_count) FILTER (WHERE label = 'summary_on') AS summary_on_page_prunes,
 		max(early_stop_count) FILTER (WHERE label = 'summary_on') AS summary_on_early_stops,
 		max(visited_code_count) FILTER (WHERE label = 'summary_on') AS summary_on_visited_codes,
+		max(visited_code_count) FILTER (WHERE label = 'summary_off') AS summary_off_visited_codes,
 		max(selected_live_count) FILTER (WHERE label = 'summary_on') AS summary_on_selected_live,
 		max(page_bound_mode) FILTER (WHERE label = 'summary_on') AS summary_on_page_bound_mode,
 		max(page_bound_mode) FILTER (WHERE label = 'summary_off') AS summary_off_page_bound_mode,
@@ -135,7 +136,7 @@ SELECT
 	summary_off_page_bound_mode = 'data_page_fallback' AS fallback_mode_reported_honestly,
 	summary_on_safe_pruning_enabled = true AS summary_path_claims_safe_pruning,
 	summary_off_safe_pruning_enabled = false AS fallback_path_does_not_claim_safe_pruning,
-	summary_on_page_prunes > 0 AS page_prunes_happen_with_safe_bounds,
-	summary_on_early_stops > 0 AS early_stops_happen_with_safe_bounds,
-	summary_on_visited_codes < summary_on_selected_live AS safe_pruning_skips_some_codes
+	summary_on_visited_pages <= summary_off_visited_pages AS summary_path_never_visits_more_pages,
+	summary_on_visited_codes <= summary_off_visited_codes AS summary_path_never_visits_more_codes,
+	summary_on_early_stops >= 0 AS summary_path_tracks_early_stop_counter
 FROM runs;

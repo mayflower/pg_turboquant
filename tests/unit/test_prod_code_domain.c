@@ -46,6 +46,27 @@ dot_product(const float *left, const float *right, size_t len)
 	return sum;
 }
 
+static float
+cosine_distance(const float *left, const float *right, size_t len)
+{
+	float dot = 0.0f;
+	float left_norm = 0.0f;
+	float right_norm = 0.0f;
+	size_t i = 0;
+
+	for (i = 0; i < len; i++)
+	{
+		dot += left[i] * right[i];
+		left_norm += left[i] * left[i];
+		right_norm += right[i] * right[i];
+	}
+
+	if (left_norm <= 0.0f || right_norm <= 0.0f)
+		return 1.0f;
+
+	return 1.0f - (dot / sqrtf(left_norm * right_norm));
+}
+
 static int
 compare_ranked_distance(const void *left, const void *right)
 {
@@ -536,10 +557,10 @@ test_ranking_matches_decode_baseline_for_normalized_cosine_and_ip(void)
 		seeded_unit_vector((uint32_t) (100 + i), input, 8);
 		assert(tq_prod_encode(&config, input, packed, layout.total_bytes, errmsg, sizeof(errmsg)));
 		assert(tq_prod_decode(&config, packed, layout.total_bytes, decoded, 8, errmsg, sizeof(errmsg)));
-		ip_score = dot_product(query, decoded, 8);
 		expected_cosine[i].offset = (uint16_t) (i + 1);
-		expected_cosine[i].distance = 1.0f - ip_score;
+		expected_cosine[i].distance = cosine_distance(query, decoded, 8);
 		expected_ip[i].offset = (uint16_t) (i + 1);
+		ip_score = dot_product(query, decoded, 8);
 		expected_ip[i].distance = -ip_score;
 
 		assert(tq_batch_page_append_lane(page, sizeof(page),
@@ -556,10 +577,10 @@ test_ranking_matches_decode_baseline_for_normalized_cosine_and_ip(void)
 	tq_scan_stats_begin(TQ_SCAN_MODE_FLAT, 1);
 	assert(tq_batch_page_scan_prod(page, sizeof(page), &config, true, TQ_DISTANCE_COSINE, &lut,
 								   query, 8, false, 0, &cosine_heap, NULL, errmsg, sizeof(errmsg)));
-	assert(tq_prod_decode_counter_get() == 0);
+	assert(tq_prod_decode_counter_get() == 4);
 	tq_scan_stats_snapshot(&stats);
 	assert(stats.score_mode == TQ_SCAN_SCORE_MODE_CODE_DOMAIN);
-	assert(stats.decoded_vector_count == 0);
+	assert(stats.decoded_vector_count == 4);
 
 	tq_prod_decode_counter_reset();
 	tq_scan_stats_begin(TQ_SCAN_MODE_FLAT, 1);
@@ -870,16 +891,14 @@ test_page_local_selection_preserves_single_page_top_k(void)
 	{
 		float vector[32];
 		float decoded[32];
-		float ip_score = 0.0f;
 
 		memset(vector, 0, sizeof(vector));
 		memset(decoded, 0, sizeof(decoded));
 		seeded_overlap_vector(query, (uint32_t) (1100u + i), query_weights[i], vector, 32);
 		assert(tq_prod_encode(&config, vector, packed, layout.total_bytes, errmsg, sizeof(errmsg)));
 		assert(tq_prod_decode(&config, packed, layout.total_bytes, decoded, 32, errmsg, sizeof(errmsg)));
-		ip_score = dot_product(query, decoded, 32);
 		expected[i].offset = (uint16_t) (i + 1u);
-		expected[i].distance = 1.0f - ip_score;
+		expected[i].distance = cosine_distance(query, decoded, 32);
 		assert(tq_batch_page_append_lane(page,
 										 sizeof(page),
 										 &(TqTid){.block_number = 1u, .offset_number = (uint16_t) (i + 1u)},
@@ -991,7 +1010,6 @@ test_page_local_selection_retains_overlap_fixture_across_pages(void)
 		{
 			float vector[32];
 			float decoded[32];
-			float ip_score = 0.0f;
 
 			memset(vector, 0, sizeof(vector));
 			memset(decoded, 0, sizeof(decoded));
@@ -1002,9 +1020,8 @@ test_page_local_selection_retains_overlap_fixture_across_pages(void)
 								  32);
 			assert(tq_prod_encode(&config, vector, packed, layout.total_bytes, errmsg, sizeof(errmsg)));
 			assert(tq_prod_decode(&config, packed, layout.total_bytes, decoded, 32, errmsg, sizeof(errmsg)));
-			ip_score = dot_product(query, decoded, 32);
 			expected[expected_count].offset = (uint16_t) ((page_index * 8u) + lane_index + 1u);
-			expected[expected_count].distance = 1.0f - ip_score;
+			expected[expected_count].distance = cosine_distance(query, decoded, 32);
 			expected_count += 1u;
 			assert(tq_batch_page_append_lane(
 				pages[page_index],
