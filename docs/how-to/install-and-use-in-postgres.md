@@ -155,6 +155,12 @@ Normal PostgreSQL maintenance still applies:
 VACUUM ANALYZE docs;
 ```
 
+TurboQuant also exposes a lightweight maintenance entrypoint for the built-in delta tier and maintenance counters:
+
+```sql
+SELECT tq_maintain_index('docs_embedding_tq_idx'::regclass);
+```
+
 If you need a full rebuild after heavy churn or configuration changes, rebuild with:
 
 ```sql
@@ -165,4 +171,5 @@ REINDEX INDEX docs_embedding_tq_idx;
 
 - Use `tq_cosine_ops`, `tq_ip_ops`, or `tq_l2_ops` to match the metric you query with.
 - Use the `tq_halfvec_*_ops` opclasses when the column type is `halfvec`.
-- Index-only scans, multicolumn indexes, and internal heap reranking are outside the current release scope.
+- Fixed-width metadata and payload columns are supported on multicolumn TurboQuant indexes; varlena / text metadata predicates are still outside the ANN fast path.
+- Internal heap reranking remains outside the access method.

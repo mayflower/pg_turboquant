@@ -12,6 +12,10 @@ INSTALL_SCRIPT = SQL_DIR / "pg_turboquant--0.1.0.sql"
 COMPATIBILITY_DOC = ROOT / "docs" / "reference" / "compatibility.md"
 SUPPORT_CONTROL = ROOT / "pg_turboquant_test_support.control"
 SUPPORT_INSTALL_SCRIPT = SQL_DIR / "pg_turboquant_test_support--0.1.0.sql"
+README = ROOT / "README.md"
+SQL_API_DOC = ROOT / "docs" / "reference" / "sql-api.md"
+ARCHITECTURE_DOC = ROOT / "docs" / "explanation" / "architecture.md"
+INSTALL_USE_DOC = ROOT / "docs" / "how-to" / "install-and-use-in-postgres.md"
 
 
 class PackagingContractTest(unittest.TestCase):
@@ -167,6 +171,40 @@ class PackagingContractTest(unittest.TestCase):
         self.assertIn("PostgreSQL 17", compatibility_doc)
         self.assertIn("pgvector v0.8.1", compatibility_doc)
         self.assertIn("REINDEX", compatibility_doc)
+
+    def test_public_docs_match_current_capability_boundary(self):
+        readme = README.read_text(encoding="utf-8")
+        sql_api_doc = SQL_API_DOC.read_text(encoding="utf-8")
+        architecture_doc = ARCHITECTURE_DOC.read_text(encoding="utf-8")
+        install_use_doc = INSTALL_USE_DOC.read_text(encoding="utf-8")
+
+        self.assertIn("bool", readme)
+        self.assertIn("int2", readme)
+        self.assertIn("int4", readme)
+        self.assertIn("int8", readme)
+        self.assertIn("date", readme)
+        self.assertIn("timestamptz", readme)
+        self.assertIn("uuid", readme)
+        self.assertIn("tq_maintain_index(...)", readme)
+        self.assertNotIn("up to eight stored `int4` metadata attributes", readme)
+
+        self.assertIn("Index Only Scan", sql_api_doc)
+        self.assertIn("multicolumn TurboQuant indexes", sql_api_doc)
+        self.assertIn("`INCLUDE`-style fixed-width payload columns", sql_api_doc)
+        self.assertNotIn("- index-only scans", sql_api_doc)
+        self.assertNotIn("- multicolumn turboquant indexes", sql_api_doc)
+        self.assertNotIn("- `INCLUDE` columns", sql_api_doc)
+
+        self.assertNotIn("- no index-only scans", architecture_doc)
+        self.assertNotIn("- no multicolumn support", architecture_doc)
+        self.assertNotIn("- no `INCLUDE` support", architecture_doc)
+        self.assertIn("fixed-width metadata", architecture_doc)
+
+        self.assertNotIn(
+            "Index-only scans, multicolumn indexes, and internal heap reranking are outside the current release scope.",
+            install_use_doc,
+        )
+        self.assertIn("tq_maintain_index", install_use_doc)
 
 
 if __name__ == "__main__":

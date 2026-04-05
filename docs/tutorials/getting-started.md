@@ -76,7 +76,7 @@ This keeps approximate retrieval inside the index and exact reranking in SQL, wh
 SELECT tq_index_metadata('docs_embedding_tq_idx'::regclass);
 ```
 
-That JSON payload exposes format version, codec, transform metadata, list counts, live/dead counts, and capability flags.
+That JSON payload exposes format version, codec, transform metadata, list counts, live/dead counts, capability flags, and maintenance recommendations.
 
 ## What just happened
 

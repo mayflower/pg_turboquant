@@ -22,6 +22,16 @@ USING turboquant
 - `tq_halfvec_ip_ops`
 - `tq_halfvec_l2_ops`
 
+### Fixed-width metadata / filter columns
+
+- `tq_bool_filter_ops`
+- `tq_int2_filter_ops`
+- `tq_int4_filter_ops`
+- `tq_int8_filter_ops`
+- `tq_date_filter_ops`
+- `tq_timestamptz_filter_ops`
+- `tq_uuid_filter_ops`
+
 ## Helper functions
 
 ### `tq_rerank_candidates(...)`
@@ -83,6 +93,12 @@ Returns exact heap statistics for a TurboQuant index.
 
 This helper is intentionally expensive. Use it when you want an exact heap row count and do not want that cost hidden behind the normal metadata API.
 
+### `tq_maintain_index(regclass)`
+
+Runs lightweight TurboQuant maintenance and returns JSON counters for delta merge / compaction work.
+
+Use this when you want to drain the built-in delta tier or apply lightweight maintenance without forcing a full `REINDEX`.
+
 ### `tq_runtime_simd_features()`
 
 Returns the compiled and runtime-visible SIMD surface and selected score kernel.
@@ -120,11 +136,12 @@ This is an expert diagnostic used by the benchmark harness. The raw `_core` help
 ## Supported plan shapes
 
 - ordered ANN index scans
+- ordered vector-key `Index Only Scan` for covered queries
 - bitmap support with explicit heap recheck semantics
+- multicolumn TurboQuant indexes with fixed-width metadata attributes
+- `INCLUDE`-style fixed-width payload columns returned through index tuples
 
 ## Explicitly unsupported in the current release
 
-- index-only scans
-- multicolumn turboquant indexes
-- `INCLUDE` columns
 - internal heap reranking inside the access method
+- varlena / text metadata predicates inside the ANN path

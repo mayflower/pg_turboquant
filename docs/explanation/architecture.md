@@ -34,8 +34,9 @@ That is why the design lives under `USING turboquant` instead of trying to fit a
 - storage is page-budget driven, so lane count is derived rather than assumed
 - structured transforms are persisted as compact metadata, not dense matrices
 - the primary packed path is faithful TurboQuant `v2` for normalized cosine/IP
+- fixed-width metadata and covering payloads live beside the ANN key instead of forcing stage-1 heap visits
 - exact reranking is a SQL concern, not an access-method concern
-- v1 mutation rules are append-only plus dead-bit cleanup
+- write churn is absorbed by a built-in delta tier plus lightweight maintenance / merge helpers
 - v1 uses generic WAL, localized behind helper code
 
 ## Codec
@@ -96,15 +97,15 @@ IVF scans additionally select a scan orchestration:
 - `ivf_bounded_pages`: page-visit budget limits work; page summaries enable safe pruning of pages whose bounds cannot beat the current candidate heap threshold
 - `ivf_near_exhaustive`: when the selected probe set covers more than ~70% of the index, the scan switches to a near-exhaustive strategy
 
-Filtered workloads can also use the bitmap path with `tq_bitmap_cosine_filter()`, but ordered ANN scans remain the main retrieval surface.
+Filtered workloads can also use the bitmap path with `tq_bitmap_cosine_filter()`, but ordered ANN scans remain the main retrieval surface. The current fixed-width metadata plane supports exact filters over `bool`, `int2`, `int4`, `int8`, `date`, `timestamptz`, and `uuid`, with the narrow int4 fast lane also supporting `ANY(int4[])` inside the ordered ANN path.
 
 ## Operational boundary
 
 The extension is intentionally honest about what it does not support yet:
 
-- no index-only scans
-- no multicolumn support
-- no `INCLUDE` support
 - no internal heap reranking
+- no varlena / text metadata predicates inside the ANN path
+- no parallel scan or parallel vacuum path
+- no maintenance-work-mem-aware build / maintenance contract yet
 
 Those boundaries are surfaced in `tq_index_metadata(...)` and in the benchmark suite output instead of being left implicit.

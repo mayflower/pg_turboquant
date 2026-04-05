@@ -38,6 +38,7 @@ It is designed around PostgreSQL's storage and executor constraints rather than 
   - `tq_approx_candidates(...)`
   - `tq_recommended_query_knobs(...)`
   - `tq_index_metadata(...)`
+  - `tq_maintain_index(...)`
   - `tq_last_scan_stats()`
 
 ## Quick start
@@ -139,9 +140,11 @@ The docs hub lives at [docs/README.md](docs/README.md).
 - pgvector: required for `vector` and `halfvec`
 - Tested pgvector contract: pinned development and CI reference `v0.8.1`
 - Current support boundary:
-  - one `vector`/`halfvec` ANN key plus up to eight stored `int4` metadata attributes
-  - exact `int4` filter keys support equality and `ANY(int4[])` predicates inside the ordered scan
-  - `INCLUDE`-style `int4` payload columns are returned through index tuples for stage-1/index-only-style retrieval
+  - one `vector`/`halfvec` ANN key plus up to eight fixed-width metadata / payload attributes
+  - metadata keys currently support `bool`, `int2`, `int4`, `int8`, `date`, `timestamptz`, and `uuid`
+  - ordered multicolumn scans support exact metadata filtering inside the ANN path, including equality and `ANY(int4[])` on the current int4 fast-lane filter contract
+  - `INCLUDE`-style fixed-width payload columns are returned through index tuples, and covered ordered vector-key queries can be observed as true `Index Only Scan`
+  - built-in maintenance includes a physical delta tier plus `tq_maintain_index(...)` for lightweight merge / compaction work
   - the production fast lane still assumes normalized cosine/IP, `transform = 'hadamard'`, and `lanes = auto`
   - exact reranking stays outside the access method
 
@@ -159,4 +162,4 @@ make tapcheck
 
 The benchmark harness lives in `scripts/benchmark_suite.py`. The RAG evaluation harness lives under `benchmarks/rag/`.
 
-For scan observability, `tq_last_scan_stats()` exposes backend-local JSON for the most recent TurboQuant scan, including score mode, SIMD kernel, scan orchestration, and page pruning counters. `tq_index_metadata(...)` reports the algorithm version, quantizer family, residual sketch kind, and whether the index is eligible for the faithful fast path. It now carries only cheap heap estimates; use `tq_index_heap_stats(...)` when you intentionally want an exact heap row count.
+For scan observability, `tq_last_scan_stats()` exposes backend-local JSON for the most recent TurboQuant scan, including score mode, SIMD kernel, scan orchestration, and page pruning counters. `tq_index_metadata(...)` reports the algorithm version, quantizer family, residual sketch kind, fast-path eligibility, capability flags, and delta / maintenance recommendations. It now carries only cheap heap estimates; use `tq_index_heap_stats(...)` when you intentionally want an exact heap row count. The benchmark suite also records ordered-IOS evidence, raw `EXPLAIN ... FORMAT JSON` payloads, and visibility-map context in `ordered_ios_observation`.

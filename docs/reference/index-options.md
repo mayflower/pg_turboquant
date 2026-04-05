@@ -39,6 +39,20 @@ IVF code-visit budget. The scan stops adding lower-ranked lists once the cumulat
 
 IVF page-visit budget. Parallel to `max_visited_codes` but counted in pages rather than codes. Set to `0` to disable.
 
+### `turboquant.iterative_scan`
+
+Filtered ordered-scan completion policy. Accepted values:
+
+- `off`
+- `strict_order`
+- `relaxed_order`
+
+When enabled for filtered IVF scans, TurboQuant keeps expanding lower-ranked lists until enough rows survive the metadata filters or the configured work budget is exhausted.
+
+### `turboquant.min_rows_after_filter`
+
+Minimum surviving-row target for filtered IVF scans when `turboquant.iterative_scan` is enabled.
+
 ### `turboquant.enable_summary_bounds`
 
 Use persisted per-page summary structures for safe page pruning in IVF mode. Default: `true`.
@@ -59,11 +73,23 @@ When enabled, keeps a parallel decode-scored candidate heap for diagnostic compa
 
 When enabled, uses decode-scored ranking instead of code-domain even on code-domain-capable scans. Development/debugging only.
 
+### Maintenance recommendation GUCs
+
+TurboQuant also exposes recommendation thresholds through session GUCs:
+
+- `turboquant.delta_merge_live_count_threshold`
+- `turboquant.delta_merge_page_count_threshold`
+- `turboquant.delta_merge_live_percent_threshold`
+- `turboquant.maintenance_dead_tuple_percent_threshold`
+- `turboquant.maintenance_reclaimable_page_threshold`
+
+These do not force maintenance directly; they drive the recommendation surface reported by `tq_index_metadata(...)`.
+
 ## Important semantics
 
 - lane count is derived from the real page budget, not a fixed batch assumption
 - exact reranking stays outside the access method
-- flat mode uses `lists = 0`; IVF mode uses immutable routing after build
+- flat mode uses `lists = 0`; IVF mode uses immutable routing after build plus a built-in delta tier for mutable churn
 - normalized cosine/IP use the code-domain fast path; L2 and non-normalized use decode-score fallback
 - older indexes without per-vector `gamma` must be rebuilt with `REINDEX`
 
