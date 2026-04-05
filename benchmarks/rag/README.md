@@ -77,6 +77,14 @@ The PostgreSQL benchmark path now also supports an explicit two-stage rerank con
 
 This stays outside the access method and is recorded as a separate benchmark stage so pre-rerank and post-rerank retrieval metrics can be compared directly.
 
+The live benchmark/control plane now keeps three concerns separate instead of conflating them:
+
+1. approximate stage-1 retrieval
+2. optional exact SQL rerank over the candidate set
+3. post-limit passage text fetch for generation
+
+That means retrieval benchmarks measure IDs, scores, and small payload columns first. Passage text is fetched only after `LIMIT k` when the end-to-end generator step actually needs it.
+
 ## Primary dataset pack
 
 The repository now carries a declarative primary dataset pack for:
@@ -140,20 +148,22 @@ Use the RAG harnesses with this split:
 
 The BEIR regression path is intentionally separate from BERGEN orchestration. It reuses the PostgreSQL retriever adapter for retrieval-only checks, while LoTTE remains an optional extension point so future support can land without rewriting the BEIR gate.
 
-## Comparative campaign reporting
+## Benchmark reporting
 
-The repository now also carries a comparative campaign/report layer for the first serious `pg_turboquant` versus `pgvector` RAG pass:
+The repository now carries a normal RAG benchmark/report layer for evaluating `pg_turboquant` and `pgvector` as retrieval systems under one shared contract:
 
-- campaign plans enumerate the six core method variants:
+- benchmark plans enumerate six retrieval systems:
   `pg_turboquant` approx, `pg_turboquant` approx + rerank, `pgvector` HNSW, `pgvector` HNSW + rerank, `pgvector` IVFFlat, and `pgvector` IVFFlat + rerank
-- retrieval-only and end-to-end tables are emitted separately
+- primary artifacts are split into retrieval benchmark rows, end-to-end benchmark rows, and retriever diagnostics
 - JSON plus CSV artifacts remain the reproducible source of truth for every table in the Markdown report
-- Hotpot-focused reports now include average selected-list/live counts, average visited page/code counts, average effective probes, average page-prune counts, score mode, and derived visited-work fractions
+- the main benchmark tables stay generic: retrieval quality, answer quality, latency, and footprint
+- backend-specific scan-work counters are emitted in a separate diagnostics table instead of polluting the main benchmark table
+- retrieval rows record whether the system executed pure approximate stage 1 or approximate + exact rerank, and whether context text was fetched post-limit
+- `pg_turboquant` diagnostics now surface delta-tier and exact-key counters plus maintenance recommendations, so write-churn economics are visible in the same report as recall/latency
 - a Hotpot regression gate can be attached to the report and is evaluated on recall plus visited scan work, not on wall-clock latency
-- narrative findings stay split across retrieval quality, answer quality, latency, and footprint
 - metric-validity caveats are called out explicitly in the generated report
 
-The repo now also includes a local comparative campaign entrypoint for fixture-backed smoke runs:
+The repo also includes a local fixture-backed benchmark entrypoint for smoke runs:
 
 ```sh
 uv run python benchmarks/rag/run_comparative_campaign.py \
@@ -161,11 +171,11 @@ uv run python benchmarks/rag/run_comparative_campaign.py \
   --output-dir benchmarks/rag/results/toy-campaign
 ```
 
-This path is intentionally local and reproducible. It uses saved fixture payloads rather than BERGEN live execution, so the report layer can be exercised in-repo before a full live runner is added.
+This path is intentionally local and reproducible. It uses saved fixture payloads rather than BERGEN live execution, so the benchmark/report layer can be exercised in-repo before a full live run.
 
-## Live comparative campaign
+## Live RAG benchmark
 
-The repository now also carries a BERGEN-backed live comparative runner for real PostgreSQL retrieval and end-to-end runs:
+The repository also carries a BERGEN-backed live runner for real PostgreSQL retrieval and end-to-end benchmark runs:
 
 ```sh
 uv run python benchmarks/rag/run_live_campaign.py \
@@ -174,7 +184,7 @@ uv run python benchmarks/rag/run_live_campaign.py \
   --datasets kilt_nq kilt_hotpotqa popqa
 ```
 
-The dry-run resolves the comparative plan, dataset configs, BERGEN retriever/generator names, and the six required backend variants without touching PostgreSQL or importing heavy BERGEN runtime dependencies.
+The dry-run resolves the benchmark plan, dataset configs, BERGEN retriever/generator names, and the six required retrieval systems without touching PostgreSQL or importing heavy BERGEN runtime dependencies.
 
 For a real run, point the CLI at an existing PostgreSQL corpus plus the three index families:
 
@@ -224,10 +234,18 @@ uv run python benchmarks/rag/run_live_campaign.py \
 
 The live runner writes:
 
-- root-level aggregated comparative artifacts through `benchmarks/rag/campaign_report.py`
+- root-level aggregated benchmark artifacts through `benchmarks/rag/campaign_report.py`
 - per-scenario retrieval artifacts under `scenarios/<dataset>/<method>/retrieval/`
 - per-scenario end-to-end artifacts under `scenarios/<dataset>/<method>/end_to_end/`
 - a saved `live-campaign-config.json` with the resolved dataset pack, backend knobs, and redacted DSN metadata
+
+For covering stage-1 runs, retrieval artifacts now contain rows shaped like:
+
+- `id`
+- `score`
+- optional fixed-width payload columns
+
+They do not require `passage_text` to be present in the retrieval result itself. The end-to-end runner fetches passage text after `LIMIT` when needed for prompt construction.
 
 The existing fixture-backed smoke path remains available as the fallback contract:
 
@@ -243,21 +261,21 @@ uv run python benchmarks/rag/run_comparative_campaign.py \
 - `benchmarks/rag/bergen_adapter/` — backend-neutral PostgreSQL retriever adapter used by later BERGEN integrations
   Current concrete backend coverage includes `pg_turboquant`, `pgvector_hnsw`, and `pgvector_ivfflat`, each behind the same adapter contract.
 - `benchmarks/rag/configs/datasets/` — declarative primary dataset configs for BERGEN-facing runs
-- `benchmarks/rag/configs/comparative/` — local comparative campaign configs and fixture payloads
+- `benchmarks/rag/configs/comparative/` — local fixture-backed benchmark configs and payloads
 - `benchmarks/rag/configs/regression/` — local BEIR smoke configs and fixtures for retrieval-only regression gating
-- `benchmarks/rag/campaign_report.py` — comparative campaign planning, artifact emission, and narrative report generation
-- `benchmarks/rag/live_campaign.py` — testable BERGEN-backed live campaign orchestration helpers
+- `benchmarks/rag/campaign_report.py` — benchmark planning, artifact emission, and narrative report generation
+- `benchmarks/rag/live_campaign.py` — testable BERGEN-backed live benchmark orchestration helpers
 - `benchmarks/rag/configs/live/kilt_hotpotqa_ivf_live.json` — live Hotpot IVF config with recall and scan-work regression thresholds
 - `benchmarks/rag/dataset_pack.py` — schema validation and benchmark-plan resolution for the primary dataset pack
 - `benchmarks/rag/end_to_end.py` — fixed-generator prompt building, cache consumption, and end-to-end exports
 - `benchmarks/rag/ingestion_pipeline.py` — shared ingestion, manifest, embedding, and backend index-build helpers
 - `benchmarks/rag/multihop_eval.py` — optional HotpotQA-style multihop support-coverage metrics and machine-readable diagnostics
 - `benchmarks/rag/operational_metrics.py` — deterministic token-budget estimation plus stage-latency and cost-summary aggregation
-- `benchmarks/rag/regression_gate.py` — retrieval-only regression helpers for BEIR fixtures plus the Hotpot recall-and-scan-work gate used by comparative reports
+- `benchmarks/rag/regression_gate.py` — retrieval-only regression helpers for BEIR fixtures plus the Hotpot recall-and-scan-work gate used by live benchmark reports
 - `benchmarks/rag/rerank_eval.py` — explicit exact SQL rerank planning and dual-stage export helpers
 - `benchmarks/rag/retrieval_eval.py` — reusable retrieval-only metrics and export helpers
-- `benchmarks/rag/run_comparative_campaign.py` — CLI entrypoint for local fixture-backed comparative RAG campaign runs
-- `benchmarks/rag/run_live_campaign.py` — CLI entrypoint for BERGEN-backed live comparative RAG campaign runs
+- `benchmarks/rag/run_comparative_campaign.py` — CLI entrypoint for local fixture-backed RAG benchmark runs
+- `benchmarks/rag/run_live_campaign.py` — CLI entrypoint for BERGEN-backed live RAG benchmark runs
 - `benchmarks/rag/run_ingestion_pipeline.py` — small CLI entrypoint for campaign config inspection and future ingestion runs
 - `benchmarks/rag/requirements-bergen.txt` — local requirements entrypoint that delegates to the vendored BERGEN checkout
 - `benchmarks/rag/vendor/` — pinned upstream checkouts created by the bootstrap script

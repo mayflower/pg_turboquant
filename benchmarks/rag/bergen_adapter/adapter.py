@@ -142,25 +142,40 @@ class PostgresRetrieverAdapter:
     def normalize_rows(self, rows: Sequence[Any]) -> list[dict[str, Any]]:
         normalized = []
         for row in rows:
+            extra_fields: dict[str, Any] = {}
             if isinstance(row, Mapping):
-                doc_id = row["doc_id"]
-                score = row["score"]
-                text = row["passage_text"]
+                mapping = dict(row)
+                if "id" in mapping:
+                    doc_id = mapping.pop("id")
+                else:
+                    doc_id = mapping.pop("doc_id")
+                score = mapping.pop("score")
+                text = mapping.pop("text", mapping.pop("passage_text", None))
+                extra_fields = mapping
             else:
-                doc_id, score, text = row
+                if len(row) == 2:
+                    doc_id, score = row
+                    text = None
+                elif len(row) == 3:
+                    doc_id, score, text = row
+                else:
+                    raise ValueError(f"unsupported retrieval row shape: {len(row)}")
 
             if isinstance(doc_id, bytes):
                 doc_id = doc_id.decode("utf-8")
             if isinstance(text, bytes):
                 text = text.decode("utf-8")
 
-            normalized.append(
-                {
-                    "id": str(doc_id),
-                    "score": float(score),
-                    "text": str(text),
-                }
-            )
+            normalized_row = {
+                "id": str(doc_id),
+                "score": float(score),
+                "text": None if text is None else str(text),
+            }
+            for key, value in extra_fields.items():
+                if isinstance(value, bytes):
+                    value = value.decode("utf-8")
+                normalized_row[str(key)] = value
+            normalized.append(normalized_row)
         return normalized
 
     def retrieve(self, request: RetrievalRequest) -> list[dict[str, Any]]:
@@ -170,12 +185,16 @@ class PostgresRetrieverAdapter:
     def retrieve_with_metadata(
         self, request: RetrievalRequest
     ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
-        rows = self._execute_retrieval(request)
+        plan = self.build_plan(request)
+        rows = self._execute_plan(plan)
         scan_stats = self._fetch_scan_stats()
         return rows, scan_stats
 
     def _execute_retrieval(self, request: RetrievalRequest) -> list[dict[str, Any]]:
         plan = self.build_plan(request)
+        return self._execute_plan(plan)
+
+    def _execute_plan(self, plan: RetrievalPlan) -> list[dict[str, Any]]:
         connection = self._get_connection()
         try:
             with connection.cursor() as cursor:

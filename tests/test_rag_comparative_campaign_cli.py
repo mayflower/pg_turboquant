@@ -1,5 +1,6 @@
 import json
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,9 +16,7 @@ class RagComparativeCampaignCliContractTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             result = subprocess.run(
                 [
-                    "uv",
-                    "run",
-                    "python",
+                    sys.executable,
                     str(SCRIPT),
                     "--config",
                     str(CONFIG),
@@ -30,7 +29,7 @@ class RagComparativeCampaignCliContractTest(unittest.TestCase):
             )
 
             payload = json.loads(result.stdout)
-            self.assertEqual(payload["campaign_kind"], "comparative_rag")
+            self.assertEqual(payload["campaign_kind"], "rag_benchmark")
             self.assertIn("campaign_json", payload["artifacts"])
             self.assertIn("report_markdown", payload["artifacts"])
             self.assertIn("report_html", payload["artifacts"])
@@ -46,9 +45,10 @@ class RagComparativeCampaignCliContractTest(unittest.TestCase):
             report_payload = json.loads(campaign_json.read_text(encoding="utf-8"))
             self.assertIn("tables", report_payload)
             self.assertIn("report", report_payload)
-            self.assertGreater(len(report_payload["tables"]["retrieval_only"]), 0)
-            self.assertGreater(len(report_payload["tables"]["end_to_end"]), 0)
-            self.assertIn("TurboQuant Outcome", report_html.read_text(encoding="utf-8"))
+            self.assertGreater(len(report_payload["tables"]["retrieval_benchmark"]), 0)
+            self.assertGreater(len(report_payload["tables"]["end_to_end_benchmark"]), 0)
+            self.assertGreater(len(report_payload["tables"]["retrieval_diagnostics"]), 0)
+            self.assertIn("RAG Benchmark Outcome", report_html.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

@@ -232,9 +232,9 @@ def run_live_campaign(
         rerank_top_k = int(dataset_config["retrieval_profile"].get("rerank_top_k_default") or dataset_top_k)
         eval_ks = _metric_ks(dataset_top_k)
 
-        for variant in plan["method_variants"]:
-            method_id = str(variant["method_id"])
-            backend_family = str(variant["backend_family"])
+        for variant in plan["system_variants"]:
+            method_id = str(variant["system_id"])
+            backend_family = str(variant["retriever_backend"])
             scenario_table = _resolve_scenario_passage_table(
                 dataset_layout["passage_table"], isolation_layout, backend_family
             )
@@ -287,6 +287,9 @@ def run_live_campaign(
                 generator_runner=generator_runner,
                 answer_metrics_fn=answer_metrics_fn,
                 clock_fn=clock_fn,
+                dsn=dsn,
+                connect_fn=connect_fn,
+                passage_table=scenario_table,
             )
             end_to_end_payloads[(dataset_id, method_id)] = end_to_end_result
 
@@ -300,9 +303,9 @@ def run_live_campaign(
     artifacts = run_comparative_campaign(
         output_dir=output_dir,
         plan=plan,
-        retrieval_runner=lambda scenario: retrieval_payloads[(scenario["dataset_id"], scenario["method_id"])],
+        retrieval_runner=lambda scenario: retrieval_payloads[(scenario["dataset_id"], scenario["system_id"])],
         end_to_end_runner=lambda scenario, _retrieval: end_to_end_payloads[
-            (scenario["dataset_id"], scenario["method_id"])
+            (scenario["dataset_id"], scenario["system_id"])
         ],
     )
     return {"plan": plan, "artifacts": artifacts, "config_path": "live-campaign-config.json"}
@@ -582,6 +585,7 @@ def _run_retrieval_scenario(
     pre_rerank_evaluations: list[QueryEvaluation] = []
     post_rerank_evaluations: list[QueryEvaluation] = []
     operational_metrics: list[QueryOperationalMetrics] = []
+    final_plan = None
 
     for sample in dataset_samples:
         query_vector = list(query_encoder([sample.question])[0])
@@ -593,8 +597,9 @@ def _run_retrieval_scenario(
                 metric=metric,
                 ann=ann,
             )
+            approx_plan = approx_adapter.build_plan(approx_request)
             started_at = clock_fn()
-            approx_rows = approx_adapter._execute_retrieval(approx_request)
+            approx_rows = approx_adapter._execute_plan(approx_plan)
             approx_latency_ms = (clock_fn() - started_at) * 1000.0
             approx_scan_stats = approx_adapter._fetch_scan_stats()
             pre_rerank_evaluations.append(
@@ -617,8 +622,9 @@ def _run_retrieval_scenario(
             metric=metric,
             ann=ann,
         )
+        final_plan = adapter.build_plan(final_request)
         started_at = clock_fn()
-        final_rows = adapter._execute_retrieval(final_request)
+        final_rows = adapter._execute_plan(final_plan)
         retrieval_latency_ms = (clock_fn() - started_at) * 1000.0
         final_scan_stats = adapter._fetch_scan_stats()
         final_ids = _canonicalize_ids(dataset_config, [row["id"] for row in final_rows])
@@ -672,8 +678,8 @@ def _run_retrieval_scenario(
         "rerank_enabled": method_id.endswith("_rerank"),
         "footprint_bytes": footprint_bytes,
     }
-    if hasattr(backend, "serialize_run_metadata"):
-        run_metadata.update(backend.serialize_run_metadata(adapter.build_plan(_request_stub(metric, dataset_top_k, ann))))
+    if hasattr(backend, "serialize_run_metadata") and final_plan is not None:
+        run_metadata.update(backend.serialize_run_metadata(final_plan))
     if method_id.startswith("pg_turboquant_"):
         run_metadata["index_metadata"] = _fetch_turboquant_index_metadata(
             dsn=dsn,
@@ -726,6 +732,9 @@ def _run_end_to_end_scenario(
     generator_runner: Callable[[QuerySample, list[dict[str, str]], dict[str, Any]], dict[str, str]],
     answer_metrics_fn: Callable[[Sequence[str], Sequence[Sequence[str]], Sequence[str]], dict[str, float]],
     clock_fn: Callable[[], float],
+    dsn: str,
+    connect_fn: Callable[[str], Any],
+    passage_table: PassageTable,
 ) -> dict[str, object]:
     generation_results: list[dict[str, object]] = []
     predictions: list[str] = []
@@ -734,10 +743,13 @@ def _run_end_to_end_scenario(
 
     raw_queries = list(retrieval_result["query_results"])
     for sample, query_result in zip(dataset_samples, raw_queries):
-        contexts = [
-            {"id": str(row["id"]), "text": str(row["text"])}
-            for row in query_result["retrieved_rows"][:generation_top_k]
-        ]
+        contexts, context_fetch_latency_ms = _resolve_generation_contexts(
+            dsn=dsn,
+            connect_fn=connect_fn,
+            passage_table=passage_table,
+            retrieved_rows=query_result["retrieved_rows"][:generation_top_k],
+            clock_fn=clock_fn,
+        )
         started_at = clock_fn()
         generation = generator_runner(sample, contexts, dataset_config)
         generator_latency_ms = (clock_fn() - started_at) * 1000.0
@@ -751,6 +763,7 @@ def _run_end_to_end_scenario(
                 "reference_answer": sample.answers[0] if sample.answers else "",
                 "operational_metrics": QueryOperationalMetrics(
                     retrieval_latency_ms=float(query_result.get("retrieval_latency_ms", 0.0)),
+                    context_fetch_latency_ms=context_fetch_latency_ms,
                     generator_latency_ms=generator_latency_ms,
                 ).to_dict(),
             }
@@ -792,8 +805,67 @@ def _run_end_to_end_scenario(
     }
 
 
-def _request_stub(metric: str, top_k: int, ann: dict[str, Any]) -> RetrievalRequest:
-    return RetrievalRequest(query_vector=[0.0], top_k=top_k, metric=metric, ann=ann)
+def _resolve_generation_contexts(
+    *,
+    dsn: str,
+    connect_fn: Callable[[str], Any],
+    passage_table: PassageTable,
+    retrieved_rows: Sequence[dict[str, object]],
+    clock_fn: Callable[[], float],
+) -> tuple[list[dict[str, str]], float]:
+    rows = list(retrieved_rows)
+    missing_ids = [str(row["id"]) for row in rows if row.get("text") is None]
+    text_by_id: dict[str, str] = {}
+    context_fetch_latency_ms = 0.0
+    if missing_ids:
+        started_at = clock_fn()
+        text_by_id = _fetch_passage_texts_by_id(
+            dsn=dsn,
+            connect_fn=connect_fn,
+            passage_table=passage_table,
+            passage_ids=missing_ids,
+        )
+        context_fetch_latency_ms = (clock_fn() - started_at) * 1000.0
+
+    contexts: list[dict[str, str]] = []
+    for row in rows:
+        text = row.get("text")
+        if text is None:
+            text = text_by_id.get(str(row["id"]), "")
+        contexts.append({"id": str(row["id"]), "text": str(text)})
+    return contexts, context_fetch_latency_ms
+
+
+def _fetch_passage_texts_by_id(
+    *,
+    dsn: str,
+    connect_fn: Callable[[str], Any],
+    passage_table: PassageTable,
+    passage_ids: Sequence[str],
+) -> dict[str, str]:
+    if not passage_ids:
+        return {}
+    try:
+        with connect_fn(dsn) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"SELECT p.{passage_table.id_column} AS id, p.{passage_table.text_column} AS text "
+                    f"FROM {passage_table.table_name} AS p "
+                    f"WHERE p.{passage_table.id_column} = ANY (%s)",
+                    (list(passage_ids),),
+                )
+                rows = cursor.fetchall()
+    except Exception:
+        return {}
+
+    payload: dict[str, str] = {}
+    for doc_id, text in rows:
+        if isinstance(doc_id, bytes):
+            doc_id = doc_id.decode("utf-8")
+        if isinstance(text, bytes):
+            text = text.decode("utf-8")
+        payload[str(doc_id)] = str(text)
+    return payload
 
 
 def _relation_name_for_method(

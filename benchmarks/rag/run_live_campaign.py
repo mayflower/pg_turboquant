@@ -29,7 +29,7 @@ else:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run a BERGEN-backed comparative RAG campaign against PostgreSQL")
+    parser = argparse.ArgumentParser(description="Run a BERGEN-backed live RAG benchmark against PostgreSQL")
     parser.add_argument("--output-dir", required=True, help="Directory for generated campaign artifacts")
     parser.add_argument(
         "--datasets",

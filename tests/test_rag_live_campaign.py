@@ -28,6 +28,18 @@ class FakeCursor:
         if "pg_relation_size" in sql:
             self.rows = [(4096,)]
             return
+        if "FROM rag_passages AS p" in sql and "ORDER BY p.embedding" in sql:
+            self.rows = [
+                ("wiki-1:0", 0.10),
+                ("wiki-2:0", 0.20),
+            ]
+            return
+        if "FROM rag_passages" in sql and "passage_text" in sql:
+            self.rows = [
+                ("wiki-1:0", "Alpha is the first letter."),
+                ("wiki-2:0", "Beta follows alpha."),
+            ]
+            return
 
         self.rows = [
             ("wiki-1:0", 0.10, "Alpha is the first letter."),
@@ -164,10 +176,17 @@ class RagLiveCampaignContractTest(unittest.TestCase):
 
                 self.requests.append(request)
                 return RetrievalPlan(
-                    sql="SELECT %s::text AS doc_id, %s::float8 AS score, %s::text AS passage_text",
-                    params=("wiki-1:0", 0.1, "Alpha"),
+                    sql="SELECT %s::text AS doc_id, %s::float8 AS score",
+                    params=("wiki-1:0", 0.1),
                     session_statements=[],
                 )
+
+            def serialize_run_metadata(self, plan):
+                return {
+                    "retrieval_execution_mode": "approx_stage1_only",
+                    "context_fetch_mode": "post_limit_text_fetch",
+                    "stage1_covering": True,
+                }
 
         recording_backend = RecordingBackend()
 
@@ -242,6 +261,67 @@ class RagLiveCampaignContractTest(unittest.TestCase):
         self.assertEqual(recording_backend.requests[0].ann["iterative_scan"], "strict_order")
         self.assertEqual(recording_backend.requests[0].ann["min_rows_after_filter"], 12)
 
+    def test_end_to_end_fetches_text_after_limit_for_covering_stage1_rows(self):
+        retrieval_result = {
+            "metrics": {"recall@10": 1.0},
+            "query_results": [
+                {
+                    "query_id": "q1",
+                    "question": "What is alpha?",
+                    "retrieved_rows": [
+                        {"id": "wiki-1:0", "score": 0.1, "text": None},
+                        {"id": "wiki-2:0", "score": 0.2, "text": None},
+                    ],
+                    "retrieval_latency_ms": 3.0,
+                }
+            ],
+            "run_metadata": {
+                "retrieval_execution_mode": "approx_stage1_only",
+                "context_fetch_mode": "post_limit_text_fetch",
+            },
+        }
+
+        captured_contexts = []
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = run_live_campaign.__globals__["_run_end_to_end_scenario"](
+                dataset_config={"dataset_id": "kilt_nq"},
+                dataset_samples=[
+                    QuerySample(
+                        query_id="q1",
+                        question="What is alpha?",
+                        answers=["Alpha"],
+                        relevant_ids=["wiki-1"],
+                        evidence_ids=["wiki-1"],
+                    )
+                ],
+                method_id="pg_turboquant_approx",
+                generation_top_k=2,
+                retrieval_result=retrieval_result,
+                end_to_end_root=Path(tmpdir),
+                generator_runner=lambda sample, contexts, _config: (
+                    captured_contexts.append(contexts) or {"prompt": "P", "answer": "Alpha"}
+                ),
+                answer_metrics_fn=lambda preds, refs, questions: {"answer_exact_match": 1.0},
+                clock_fn=lambda: 0.0,
+                dsn="postgresql://fake",
+                connect_fn=lambda _dsn: FakeConnection(),
+                passage_table=PassageTable(
+                    table_name="rag_passages",
+                    id_column="passage_id",
+                    text_column="passage_text",
+                    embedding_column="embedding",
+                    query_vector_cast="vector",
+                ),
+            )
+
+        self.assertEqual(captured_contexts[0][0]["text"], "Alpha is the first letter.")
+        self.assertEqual(captured_contexts[0][1]["text"], "Beta follows alpha.")
+        self.assertEqual(
+            result["operational_summary"]["latency_ms"]["context_fetch"]["p50"],
+            0.0,
+        )
+
     def test_default_generator_runner_supports_oracle_answer_without_hitting_abstract_base(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             bergen_root = Path(tmpdir)
@@ -287,9 +367,9 @@ class RagLiveCampaignContractTest(unittest.TestCase):
             retriever_name="bge-small-en-v1.5",
         )
 
-        self.assertEqual(runtime["plan"]["campaign_kind"], "comparative_rag")
+        self.assertEqual(runtime["plan"]["campaign_kind"], "rag_benchmark")
         self.assertEqual(runtime["plan"]["datasets"], ["kilt_nq", "kilt_hotpotqa", "popqa"])
-        self.assertEqual(len(runtime["plan"]["method_variants"]), 6)
+        self.assertEqual(len(runtime["plan"]["system_variants"]), 6)
         self.assertEqual(
             sorted(runtime["dataset_configs"].keys()),
             ["kilt_hotpotqa", "kilt_nq", "popqa"],
@@ -409,9 +489,10 @@ class RagLiveCampaignContractTest(unittest.TestCase):
 
             payload = json.loads(campaign_json.read_text(encoding="utf-8"))
             self.assertEqual(payload["plan"]["datasets"], ["kilt_nq"])
-            self.assertEqual(len(payload["tables"]["retrieval_only"]), 6)
-            self.assertEqual(len(payload["tables"]["end_to_end"]), 6)
-            self.assertIn("TurboQuant Outcome", report_html_path.read_text(encoding="utf-8"))
+            self.assertEqual(len(payload["tables"]["retrieval_benchmark"]), 6)
+            self.assertEqual(len(payload["tables"]["end_to_end_benchmark"]), 6)
+            self.assertEqual(len(payload["tables"]["retrieval_diagnostics"]), 6)
+            self.assertIn("RAG Benchmark Outcome", report_html_path.read_text(encoding="utf-8"))
 
             retrieval_path = (
                 Path(tmpdir)

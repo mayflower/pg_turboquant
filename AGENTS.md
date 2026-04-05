@@ -160,6 +160,18 @@ As of `2026-04-03`, the prompt-pack sequence is no longer the only useful priori
 
 This lane is intentionally narrower than “support every embedding setup.” Do not dilute it with dense persisted transforms, broad metric generalization, or another SIMD-only pass before the filtering/payload/lifecycle gaps are closed.
 
+Benchmark contract note as of `2026-04-05`:
+
+- The RAG harness now uses a generic `rag_benchmark` campaign surface rather than a TurboQuant-shaped comparative report.
+- Plans enumerate retrieval systems, primary artifacts are split into retrieval benchmark, end-to-end benchmark, and retriever diagnostics tables, and the generated outcome summary is backend-neutral across `pg_turboquant` and `pgvector`.
+- The live benchmark control plane now keeps approximate stage 1, optional exact SQL rerank, and post-limit text fetch as separate measured steps.
+- Retrieval rows are covering by default (`id`, `score`, and optional small payload columns), while passage text is fetched later only for generator-facing end-to-end runs.
+- TurboQuant retrieval diagnostics now include delta-tier / exact-key counters and maintenance recommendations pulled from `tq_index_metadata(...)`.
+- Commands run for this slice:
+  `python3 -m unittest tests.test_rag_turboquant_backend tests.test_rag_pgvector_backends tests.test_rag_live_campaign tests.test_rag_campaign_report`
+  `python3 -m unittest discover -s tests -p 'test_rag_*.py'`
+  `make installcheck REGRESS='ordered_ios_measurement'`
+
 ## Implementation tracker
 
 | ID | Prompt file | Scope | Tests to add first | Status | Last update | Evidence / commands | Notes |

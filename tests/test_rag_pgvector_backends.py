@@ -81,12 +81,15 @@ class PgvectorBackendContractTest(unittest.TestCase):
         self.assertIn("FROM rag_docs AS p", plan.sql)
         self.assertIn("ORDER BY p.embedding <=> query_vector.embedding ASC", plan.sql)
         self.assertNotIn("approx_candidates", plan.sql)
+        self.assertNotIn("passage_text", plan.sql)
 
         metadata = backend.serialize_run_metadata(plan)
         self.assertEqual(metadata["index_kind"], "pgvector_hnsw")
         self.assertEqual(metadata["metric"], "cosine")
         self.assertEqual(metadata["ef_search"], 80)
         self.assertIsNone(metadata["rerank_k"])
+        self.assertEqual(metadata["retrieval_execution_mode"], "approx_stage1_only")
+        self.assertEqual(metadata["context_fetch_mode"], "post_limit_text_fetch")
         self.assertEqual(len(metadata["sql_template_hash"]), 64)
 
     def test_ivfflat_rerank_sql_generation_and_metadata(self):
@@ -110,8 +113,9 @@ class PgvectorBackendContractTest(unittest.TestCase):
         self.assertEqual(plan.session_statements, [("SET LOCAL ivfflat.probes = %s", (6,))])
         self.assertIn("WITH query_vector AS", plan.sql)
         self.assertIn("approx_candidates AS", plan.sql)
-        self.assertIn("SELECT p.doc_id AS id, p.passage_text AS text, p.embedding AS embedding", plan.sql)
-        self.assertIn("SELECT id, approx_candidates.embedding <-> query_vector.embedding AS score, text", plan.sql)
+        self.assertIn("SELECT p.doc_id AS id, p.embedding AS embedding", plan.sql)
+        self.assertIn("JOIN rag_docs AS text_source ON text_source.doc_id = approx_candidates.id", plan.sql)
+        self.assertNotIn("passage_text AS text", plan.sql)
         self.assertIn("ORDER BY score ASC", plan.sql)
         self.assertEqual(plan.params[-2:], (20, 5))
 
@@ -119,6 +123,8 @@ class PgvectorBackendContractTest(unittest.TestCase):
         self.assertEqual(metadata["index_kind"], "pgvector_ivfflat")
         self.assertEqual(metadata["probes"], 6)
         self.assertEqual(metadata["rerank_k"], 20)
+        self.assertEqual(metadata["retrieval_execution_mode"], "approx_exact_rerank")
+        self.assertEqual(metadata["context_fetch_mode"], "post_limit_text_fetch")
 
     def test_invalid_metric_or_rerank_configuration_fails_early(self):
         backend = PgvectorHnswBackend(
@@ -163,11 +169,9 @@ class PgvectorBackendContractTest(unittest.TestCase):
             rerank_k=8,
         )
 
-        hnsw_connection = FakeConnection(
-            [("doc-1", 0.25, "HNSW result"), ("doc-2", 0.5, "HNSW result 2")]
-        )
+        hnsw_connection = FakeConnection([("doc-1", 0.25), ("doc-2", 0.5)])
         ivfflat_connection = FakeConnection(
-            [("doc-3", 0.1, "IVFFlat result"), ("doc-1", 0.2, "IVFFlat result 2")]
+            [("doc-3", 0.1), ("doc-1", 0.2)]
         )
 
         hnsw_adapter = PostgresRetrieverAdapter(
@@ -202,6 +206,8 @@ class PgvectorBackendContractTest(unittest.TestCase):
 
         self.assertEqual(hnsw_results[0]["id"], "doc-1")
         self.assertEqual(ivfflat_results[0]["id"], "doc-3")
+        self.assertIsNone(hnsw_results[0]["text"])
+        self.assertIsNone(ivfflat_results[0]["text"])
         self.assertIn("hnsw.ef_search", hnsw_connection.cursors[0].executed[0][0])
         self.assertIn("ivfflat.probes", ivfflat_connection.cursors[0].executed[0][0])
         self.assertIn(

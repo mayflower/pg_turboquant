@@ -80,9 +80,9 @@ class RagLiveCampaignCliContractTest(unittest.TestCase):
             )
 
             payload = json.loads(result.stdout)
-            self.assertEqual(payload["plan"]["campaign_kind"], "comparative_rag")
+            self.assertEqual(payload["plan"]["campaign_kind"], "rag_benchmark")
             self.assertEqual(payload["plan"]["datasets"], ["kilt_nq", "kilt_hotpotqa", "popqa"])
-            self.assertEqual(len(payload["plan"]["method_variants"]), 6)
+            self.assertEqual(len(payload["plan"]["system_variants"]), 6)
             self.assertEqual(payload["generator_name"], "oracle_answer")
             self.assertEqual(payload["retriever_name"], "bge-small-en-v1.5")
 

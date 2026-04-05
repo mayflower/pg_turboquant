@@ -97,13 +97,13 @@ class PgTurboquantBackend:
                     native_delta=native_delta,
                     delta_candidate_limit=delta_candidate_limit,
                     stage1_limit=stage1_limit,
+                    exact_rerank=False,
                 )
             else:
                 sql = (
                     f"WITH query_vector AS (SELECT %s::{table.query_vector_cast} AS embedding) "
                     f"SELECT p.{table.id_column} AS id, "
-                    f"p.{table.embedding_column} {operator} query_vector.embedding AS score, "
-                    f"p.{table.text_column} AS text "
+                    f"p.{table.embedding_column} {operator} query_vector.embedding AS score "
                     f"FROM {table.table_name} AS p "
                     f"CROSS JOIN query_vector "
                     f"ORDER BY p.{table.embedding_column} {operator} query_vector.embedding ASC "
@@ -123,20 +123,22 @@ class PgTurboquantBackend:
                 native_delta=native_delta,
                 delta_candidate_limit=delta_candidate_limit,
                 stage1_limit=self.rerank_k or stage1_limit,
+                exact_rerank=True,
             )
         else:
             sql = (
                 f"WITH query_vector AS (SELECT %s::{table.query_vector_cast} AS embedding), "
                 f"approx_candidates AS ("
-                f"SELECT p.{table.id_column} AS id, p.{table.text_column} AS text, "
-                f"p.{table.embedding_column} AS embedding "
+                f"SELECT p.{table.id_column} AS id, p.{table.embedding_column} AS embedding "
                 f"FROM {table.table_name} AS p "
                 f"CROSS JOIN query_vector "
                 f"ORDER BY p.{table.embedding_column} {operator} query_vector.embedding ASC "
                 f"LIMIT %s"
                 f") "
-                f"SELECT id, approx_candidates.embedding {operator} query_vector.embedding AS score, text "
+                f"SELECT approx_candidates.id AS id, "
+                f"text_source.{table.embedding_column} {operator} query_vector.embedding AS score "
                 f"FROM approx_candidates "
+                f"JOIN {table.table_name} AS text_source ON text_source.{table.id_column} = approx_candidates.id "
                 f"CROSS JOIN query_vector "
                 f"ORDER BY score ASC "
                 f"LIMIT %s"
@@ -163,12 +165,16 @@ class PgTurboquantBackend:
         native_delta: bool,
         delta_candidate_limit: int,
         stage1_limit: int,
+        exact_rerank: bool,
     ) -> tuple[str, tuple[Any, ...]]:
         params: list[Any] = [query_literal]
         where_sql, where_params = _render_filter_clause("p", filters)
         params.extend(where_params)
 
-        stage1_projection = [f"p.{text_join_column} AS id"]
+        stage1_projection = [
+            f"p.{text_join_column} AS id",
+            f"p.{table.embedding_column} {operator} query_vector.embedding AS ann_score",
+        ]
         for column in stage1_payload_columns:
             stage1_projection.append(f"p.{column}")
         projection_sql = ", ".join(stage1_projection)
@@ -209,6 +215,26 @@ class PgTurboquantBackend:
             ")"
         )
 
+        final_projection = ["stage1_candidates.id"]
+        for column in stage1_payload_columns:
+            final_projection.append(f"stage1_candidates.{column}")
+
+        if exact_rerank:
+            final_projection.insert(
+                1,
+                f"text_source.{table.embedding_column} {operator} query_vector.embedding AS score",
+            )
+        else:
+            final_projection.insert(1, "stage1_candidates.ann_score AS score")
+
+        final_from = "FROM stage1_candidates "
+        if exact_rerank:
+            final_from += (
+                f"JOIN {table.table_name} AS text_source "
+                f"ON text_source.{text_join_column} = stage1_candidates.id "
+            )
+        final_from += "CROSS JOIN query_vector "
+
         sql = (
             f"/* tq_filters: {json.dumps(filters, sort_keys=True)} */ "
             f"/* tq_stage1_payload_columns: {json.dumps(list(stage1_payload_columns))} */ "
@@ -218,13 +244,11 @@ class PgTurboquantBackend:
             "WITH "
             + ", ".join(stage1_ctes)
             + " "
-            + "SELECT stage1_candidates.id, "
-            + f"text_source.{table.embedding_column} {operator} query_vector.embedding AS score, "
-            + f"text_source.{table.text_column} AS text "
-            + "FROM stage1_candidates "
-            + f"JOIN {table.table_name} AS text_source ON text_source.{text_join_column} = stage1_candidates.id "
-            + "CROSS JOIN query_vector "
-            + f"ORDER BY text_source.{table.embedding_column} {operator} query_vector.embedding ASC "
+            + "SELECT "
+            + ", ".join(final_projection)
+            + " "
+            + final_from
+            + "ORDER BY score ASC "
             + "LIMIT %s"
         )
         params.append(request_top_k)
@@ -268,6 +292,12 @@ class PgTurboquantBackend:
             "metric": self.metric,
             "normalized": self.normalized,
             "mode": self.mode,
+            "retrieval_execution_mode": (
+                "approx_exact_rerank" if self.mode == MODE_APPROX_RERANK else "approx_stage1_only"
+            ),
+            "context_fetch_mode": "post_limit_text_fetch",
+            "exact_rerank_enabled": self.mode == MODE_APPROX_RERANK,
+            "stage1_covering": bool(stage1_payload_columns) and self.mode == MODE_APPROX,
             "probes": probes,
             "oversample_factor": oversample_factor,
             "max_visited_codes": max_visited_codes,

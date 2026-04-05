@@ -7,59 +7,39 @@ from pathlib import Path
 from typing import Sequence
 
 
-TURBOQUANT_METHOD_ID = "pg_turboquant_approx"
-BASELINE_METHOD_IDS = ("pgvector_hnsw_approx", "pgvector_ivfflat_approx")
-
-
 def load_campaign_payload(path: str | Path) -> dict[str, object]:
     payload_path = Path(path)
     return json.loads(payload_path.read_text(encoding="utf-8"))
 
 
 def build_outcome_summary(campaign_payloads: Sequence[dict[str, object]]) -> dict[str, object]:
-    comparisons: list[dict[str, object]] = []
-    datasets: list[str] = []
-    method_rows: list[dict[str, object]] = []
+    retrieval_rows: list[dict[str, object]] = []
+    diagnostics_by_key: dict[tuple[str, str], dict[str, object]] = {}
 
     for payload in campaign_payloads:
-        retrieval_rows = list(payload.get("tables", {}).get("retrieval_only", []))
-        rows_by_dataset: dict[str, dict[str, dict[str, object]]] = {}
-        for row in retrieval_rows:
-            dataset_id = str(row["dataset_id"])
-            datasets.append(dataset_id)
-            method_rows.append(_method_row(row))
-            rows_by_dataset.setdefault(dataset_id, {})[str(row["method_id"])] = row
+        for row in payload.get("tables", {}).get("retrieval_benchmark", []):
+            retrieval_rows.append(dict(row))
+        for row in payload.get("tables", {}).get("retrieval_diagnostics", []):
+            diagnostics_by_key[(str(row["dataset_id"]), str(row["system_id"]))] = dict(row)
 
-        for dataset_id, dataset_methods in rows_by_dataset.items():
-            turboquant_row = dataset_methods.get(TURBOQUANT_METHOD_ID)
-            if turboquant_row is None:
-                continue
-            for baseline_method_id in BASELINE_METHOD_IDS:
-                baseline_row = dataset_methods.get(baseline_method_id)
-                if baseline_row is None:
-                    continue
-                comparisons.append(_comparison_row(dataset_id, turboquant_row, baseline_row))
+    datasets = sorted({str(row["dataset_id"]) for row in retrieval_rows})
+    systems = sorted({str(row["system_id"]) for row in retrieval_rows})
+    system_rows = [_system_row(row, diagnostics_by_key.get((str(row["dataset_id"]), str(row["system_id"])))) for row in retrieval_rows]
 
-    unique_datasets = sorted(set(datasets))
-    footprint_pass_count = sum(1 for item in comparisons if item["smaller_footprint"])
-    latency_pass_count = sum(1 for item in comparisons if item["lower_p95"])
-    overall_pass_count = sum(1 for item in comparisons if item["smaller_and_faster"])
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "dataset_count": len(unique_datasets),
-        "datasets": unique_datasets,
-        "comparison_count": len(comparisons),
-        "smaller_footprint_count": footprint_pass_count,
-        "lower_p95_count": latency_pass_count,
-        "smaller_and_faster_count": overall_pass_count,
-        "method_rows": method_rows,
-        "comparisons": comparisons,
+        "dataset_count": len(datasets),
+        "datasets": datasets,
+        "system_count": len(systems),
+        "systems": systems,
+        "system_rows": system_rows,
+        "retrieval_leaders": _leader_rows(retrieval_rows, metric_name="recall@10", higher_is_better=True),
+        "latency_leaders": _leader_rows(retrieval_rows, metric_name="latency_p95_ms", higher_is_better=False),
+        "footprint_leaders": _leader_rows(retrieval_rows, metric_name="footprint_bytes", higher_is_better=False),
         "measured_scope": {
-            "scope": "approximate retrieval only",
-            "turboquant_method_id": TURBOQUANT_METHOD_ID,
-            "baseline_method_ids": list(BASELINE_METHOD_IDS),
-            "comparison_basis": "This report lists measured retrieval results for pg_turboquant against approximate pgvector baselines under the included source campaigns.",
-            "fairness_note": "It reports the current measurement contract only and does not infer unmeasured prior benchmark inflation.",
+            "scope": "retrieval and end-to-end rag benchmark results",
+            "comparison_basis": "This report summarizes measured benchmark rows for each retrieval system under the included campaign payloads.",
+            "fairness_note": "Quality, latency, and footprint remain separate dimensions and should be compared within the same dataset and generator contract.",
         },
     }
 
@@ -78,48 +58,62 @@ def write_outcome_html(
     return {"output_html": target_path.name}
 
 
-def _comparison_row(
-    dataset_id: str,
-    turboquant_row: dict[str, object],
-    baseline_row: dict[str, object],
-) -> dict[str, object]:
-    tq_footprint = _as_float(turboquant_row.get("footprint_bytes"))
-    baseline_footprint = _as_float(baseline_row.get("footprint_bytes"))
-    tq_latency = _as_float(turboquant_row.get("latency_p95_ms"))
-    baseline_latency = _as_float(baseline_row.get("latency_p95_ms"))
-    tq_recall = _as_float(turboquant_row.get("recall@10"))
-    baseline_recall = _as_float(baseline_row.get("recall@10"))
+def _leader_rows(
+    retrieval_rows: Sequence[dict[str, object]],
+    *,
+    metric_name: str,
+    higher_is_better: bool,
+) -> list[dict[str, object]]:
+    grouped: dict[str, list[dict[str, object]]] = {}
+    for row in retrieval_rows:
+        grouped.setdefault(str(row["dataset_id"]), []).append(row)
 
-    smaller_footprint = (
-        tq_footprint is not None and baseline_footprint is not None and tq_footprint < baseline_footprint
-    )
-    lower_p95 = (
-        tq_latency is not None and baseline_latency is not None and tq_latency <= baseline_latency
-    )
-    footprint_ratio = (
-        baseline_footprint / tq_footprint
-        if tq_footprint not in (None, 0.0) and baseline_footprint is not None
-        else None
-    )
-    latency_ratio = (
-        baseline_latency / tq_latency if tq_latency not in (None, 0.0) and baseline_latency is not None else None
-    )
+    leaders: list[dict[str, object]] = []
+    for dataset_id, dataset_rows in grouped.items():
+        comparable = [row for row in dataset_rows if row.get(metric_name) is not None]
+        if not comparable:
+            continue
+        best = sorted(
+            comparable,
+            key=lambda row: (
+                -float(row[metric_name]) if higher_is_better else float(row[metric_name]),
+                str(row["system_id"]),
+            ),
+        )[0]
+        leaders.append(
+            {
+                "dataset_id": dataset_id,
+                "system_id": str(best["system_id"]),
+                "system_label": str(best.get("system_label", best["system_id"])),
+                "metric": metric_name,
+                "value": best[metric_name],
+            }
+        )
+    return leaders
+
+
+def _system_row(row: dict[str, object], diagnostics: dict[str, object] | None) -> dict[str, object]:
     return {
-        "dataset_id": dataset_id,
-        "turboquant_method_id": str(turboquant_row["method_id"]),
-        "baseline_method_id": str(baseline_row["method_id"]),
-        "turboquant_recall@10": tq_recall,
-        "baseline_recall@10": baseline_recall,
-        "recall_delta": None if tq_recall is None or baseline_recall is None else tq_recall - baseline_recall,
-        "turboquant_latency_p95_ms": tq_latency,
-        "baseline_latency_p95_ms": baseline_latency,
-        "latency_ratio_vs_turboquant": latency_ratio,
-        "lower_p95": lower_p95,
-        "turboquant_footprint_bytes": tq_footprint,
-        "baseline_footprint_bytes": baseline_footprint,
-        "footprint_ratio_vs_turboquant": footprint_ratio,
-        "smaller_footprint": smaller_footprint,
-        "smaller_and_faster": smaller_footprint and lower_p95,
+        "dataset_id": str(row["dataset_id"]),
+        "system_id": str(row["system_id"]),
+        "system_label": str(row.get("system_label", row["system_id"])),
+        "retriever_backend": str(row.get("retriever_backend", "")),
+        "retrieval_mode": str(row.get("retrieval_mode", "")),
+        "recall@10": _as_float(row.get("recall@10")),
+        "mrr@10": _as_float(row.get("mrr@10")),
+        "ndcg@10": _as_float(row.get("ndcg@10")),
+        "hit_rate@10": _as_float(row.get("hit_rate@10")),
+        "evidence_coverage@10": _as_float(row.get("evidence_coverage@10")),
+        "latency_p50_ms": _as_float(row.get("latency_p50_ms")),
+        "latency_p95_ms": _as_float(row.get("latency_p95_ms")),
+        "footprint_bytes": _as_float(row.get("footprint_bytes")),
+        "diagnostics": {
+            "score_mode": None if diagnostics is None else diagnostics.get("score_mode"),
+            "avg_selected_list_count": None if diagnostics is None else _as_float(diagnostics.get("avg_selected_list_count")),
+            "avg_selected_live_count": None if diagnostics is None else _as_float(diagnostics.get("avg_selected_live_count")),
+            "avg_visited_page_count": None if diagnostics is None else _as_float(diagnostics.get("avg_visited_page_count")),
+            "avg_visited_code_count": None if diagnostics is None else _as_float(diagnostics.get("avg_visited_code_count")),
+        },
     }
 
 
@@ -130,14 +124,14 @@ def _render_html(summary: dict[str, object], source_labels: Sequence[str]) -> st
         if source_items
         else ""
     )
-    method_rows = "".join(_render_method_row(row) for row in summary["method_rows"])
-    comparison_rows = "".join(_render_comparison_row(row) for row in summary["comparisons"])
+    system_rows = "".join(_render_system_row(row) for row in summary["system_rows"])
+    leader_rows = "".join(_render_leader_row(row) for row in _flatten_leaders(summary))
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>TurboQuant Outcome</title>
+  <title>RAG Benchmark Outcome</title>
   <style>
     :root {{
       --bg: #f5f1e8;
@@ -145,9 +139,6 @@ def _render_html(summary: dict[str, object], source_labels: Sequence[str]) -> st
       --ink: #14231a;
       --muted: #5a6b5f;
       --line: #d7cfbf;
-      --pass: #1f7a4d;
-      --fail: #9f2d2d;
-      --accent: #c55a11;
     }}
     body {{
       margin: 0;
@@ -159,13 +150,6 @@ def _render_html(summary: dict[str, object], source_labels: Sequence[str]) -> st
       max-width: 1120px;
       margin: 0 auto;
       padding: 40px 24px 80px;
-    }}
-    h1, h2 {{
-      margin-bottom: 12px;
-    }}
-    p, li {{
-      color: var(--muted);
-      line-height: 1.45;
     }}
     .hero {{
       background: linear-gradient(135deg, rgba(197, 90, 17, 0.12), rgba(20, 35, 26, 0.04));
@@ -203,14 +187,6 @@ def _render_html(summary: dict[str, object], source_labels: Sequence[str]) -> st
     th {{
       background: rgba(20, 35, 26, 0.04);
     }}
-    .pass {{
-      color: var(--pass);
-      font-weight: 700;
-    }}
-    .fail {{
-      color: var(--fail);
-      font-weight: 700;
-    }}
     .mono {{
       font-family: "SFMono-Regular", "Menlo", monospace;
       font-size: 0.95em;
@@ -220,63 +196,58 @@ def _render_html(summary: dict[str, object], source_labels: Sequence[str]) -> st
 <body>
   <main>
     <section class="hero">
-      <h1>TurboQuant Outcome</h1>
-      <p>This report aggregates measured retrieval-only results for the included campaigns. It lists footprint, p50/p95 latency, scan-work fields, and measured pg_turboquant versus pgvector comparisons for the exact dataset/method matrix below.</p>
+      <h1>RAG Benchmark Outcome</h1>
+      <p>This report summarizes benchmarked retrieval systems across the included campaigns. It keeps retrieval quality, latency, footprint, and retriever diagnostics visible as separate dimensions.</p>
       <div class="grid">
         <div class="card"><strong>Datasets</strong><br>{summary["dataset_count"]}</div>
-        <div class="card"><strong>Comparisons</strong><br>{summary["comparison_count"]}</div>
-        <div class="card"><strong>Smaller Footprint</strong><br>{summary["smaller_footprint_count"]}/{summary["comparison_count"]}</div>
-        <div class="card"><strong>Lower p95</strong><br>{summary["lower_p95_count"]}/{summary["comparison_count"]}</div>
-        <div class="card"><strong>Smaller And Faster</strong><br>{summary["smaller_and_faster_count"]}/{summary["comparison_count"]}</div>
+        <div class="card"><strong>Systems</strong><br>{summary["system_count"]}</div>
+        <div class="card"><strong>System Rows</strong><br>{len(summary["system_rows"])}</div>
       </div>
     </section>
     <section>
       <h2>Measured Comparison Scope</h2>
       <p>{html.escape(summary["measured_scope"]["comparison_basis"])}</p>
       <p>{html.escape(summary["measured_scope"]["fairness_note"])}</p>
-      <p class="mono">TurboQuant method: {html.escape(summary["measured_scope"]["turboquant_method_id"])}</p>
     </section>
     {source_section}
     <section>
-      <h2>Method Metrics</h2>
+      <h2>Retrieval Systems</h2>
       <table>
         <thead>
           <tr>
             <th>Dataset</th>
-            <th>Method</th>
+            <th>System</th>
+            <th>Backend</th>
+            <th>Mode</th>
             <th>Recall@10</th>
+            <th>MRR@10</th>
+            <th>NDCG@10</th>
+            <th>Hit Rate@10</th>
+            <th>evidence_coverage@10</th>
             <th>p50</th>
             <th>p95</th>
             <th>Footprint</th>
-            <th>visited_code_count</th>
-            <th>visited_page_count</th>
-            <th>selected_live_count</th>
-            <th>selected_page_count</th>
-            <th>score_kernel</th>
+            <th>score_mode</th>
           </tr>
         </thead>
         <tbody>
-          {method_rows}
+          {system_rows}
         </tbody>
       </table>
     </section>
     <section>
-      <h2>Dataset Comparison</h2>
+      <h2>Dataset Leaders</h2>
       <table>
         <thead>
           <tr>
             <th>Dataset</th>
-            <th>Baseline</th>
-            <th>Recall Delta</th>
-            <th>Footprint</th>
-            <th>Memory Ratio</th>
-            <th>Latency</th>
-            <th>Speed Ratio</th>
-            <th>Status</th>
+            <th>Metric</th>
+            <th>Leader</th>
+            <th>Value</th>
           </tr>
         </thead>
         <tbody>
-          {comparison_rows}
+          {leader_rows}
         </tbody>
       </table>
     </section>
@@ -286,63 +257,41 @@ def _render_html(summary: dict[str, object], source_labels: Sequence[str]) -> st
 """
 
 
-def _render_comparison_row(row: dict[str, object]) -> str:
-    status_parts = []
-    if row["smaller_footprint"]:
-        status_parts.append("smaller")
-    else:
-        status_parts.append("larger")
-    if row["lower_p95"]:
-        status_parts.append("faster")
-    else:
-        status_parts.append("slower")
-    status_label = " / ".join(status_parts)
-    status_class = "pass" if row["smaller_and_faster"] else "fail"
+def _flatten_leaders(summary: dict[str, object]) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for key in ("retrieval_leaders", "latency_leaders", "footprint_leaders"):
+        rows.extend(summary[key])
+    return rows
+
+
+def _render_system_row(row: dict[str, object]) -> str:
+    diagnostics = row["diagnostics"]
     return (
         "<tr>"
         f"<td>{html.escape(str(row['dataset_id']))}</td>"
-        f"<td class=\"mono\">{html.escape(str(row['baseline_method_id']))}</td>"
-        f"<td>{_fmt(row['recall_delta'])}</td>"
-        f"<td>{_fmt(row['turboquant_footprint_bytes'])} vs {_fmt(row['baseline_footprint_bytes'])}</td>"
-        f"<td>{_fmt_ratio(row['footprint_ratio_vs_turboquant'])}</td>"
-        f"<td>{_fmt(row['turboquant_latency_p95_ms'])} ms vs {_fmt(row['baseline_latency_p95_ms'])} ms</td>"
-        f"<td>{_fmt_ratio(row['latency_ratio_vs_turboquant'])}</td>"
-        f"<td class=\"{status_class}\">{status_label}</td>"
+        f"<td class=\"mono\">{html.escape(str(row['system_label']))}</td>"
+        f"<td>{html.escape(str(row['retriever_backend']))}</td>"
+        f"<td>{html.escape(str(row['retrieval_mode']))}</td>"
+        f"<td>{_fmt(row['recall@10'])}</td>"
+        f"<td>{_fmt(row['mrr@10'])}</td>"
+        f"<td>{_fmt(row['ndcg@10'])}</td>"
+        f"<td>{_fmt(row['hit_rate@10'])}</td>"
+        f"<td>{_fmt(row['evidence_coverage@10'])}</td>"
+        f"<td>{_fmt(row['latency_p50_ms'])}</td>"
+        f"<td>{_fmt(row['latency_p95_ms'])}</td>"
+        f"<td>{_fmt(row['footprint_bytes'])}</td>"
+        f"<td>{html.escape(str(diagnostics['score_mode']))}</td>"
         "</tr>"
     )
 
 
-def _method_row(row: dict[str, object]) -> dict[str, object]:
-    return {
-        "dataset_id": str(row["dataset_id"]),
-        "method_id": str(row["method_id"]),
-        "backend_family": str(row["backend_family"]),
-        "recall@10": _as_float(row.get("recall@10")),
-        "latency_p50_ms": _as_float(row.get("latency_p50_ms")),
-        "latency_p95_ms": _as_float(row.get("latency_p95_ms")),
-        "footprint_bytes": _as_float(row.get("footprint_bytes")),
-        "visited_code_count": _as_float(row.get("avg_visited_code_count")),
-        "visited_page_count": _as_float(row.get("avg_visited_page_count")),
-        "selected_live_count": _as_float(row.get("avg_selected_live_count")),
-        "selected_page_count": _as_float(row.get("avg_selected_page_count")),
-        "score_kernel": str(row.get("score_kernel", "none")),
-    }
-
-
-def _render_method_row(row: dict[str, object]) -> str:
+def _render_leader_row(row: dict[str, object]) -> str:
     return (
         "<tr>"
         f"<td>{html.escape(str(row['dataset_id']))}</td>"
-        f"<td class=\"mono\">{html.escape(str(row['method_id']))}</td>"
-        f"<td>{_fmt(row['recall@10'])}</td>"
-        f"<td>{_fmt(row['latency_p50_ms'])}</td>"
-        f"<td>{_fmt(row['latency_p95_ms'])}</td>"
-        f"<td>{_fmt(row['footprint_bytes'])}</td>"
-        f"<td>{_fmt(row['visited_code_count'])}</td>"
-        f"<td>{_fmt(row['visited_page_count'])}</td>"
-        f"<td>{_fmt(row['selected_live_count'])}</td>"
-        f"<td>{_fmt(row['selected_page_count'])}</td>"
-        f"<td>{html.escape(str(row['score_kernel']))}</td>"
+        f"<td>{html.escape(str(row['metric']))}</td>"
+        f"<td class=\"mono\">{html.escape(str(row['system_label']))}</td>"
+        f"<td>{_fmt(row['value'])}</td>"
         "</tr>"
     )
 
@@ -366,9 +315,3 @@ def _fmt(value: object) -> str:
     if numeric.is_integer():
         return f"{int(numeric)}"
     return f"{numeric:.4f}"
-
-
-def _fmt_ratio(value: object) -> str:
-    if value is None:
-        return "-"
-    return f"{float(value):.2f}x"

@@ -28,7 +28,7 @@ def load_campaign_fixture_config(path: str | Path) -> dict[str, object]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run a comparative RAG campaign from local fixtures")
+    parser = argparse.ArgumentParser(description="Run a fixture-backed RAG benchmark from local fixtures")
     parser.add_argument("--config", required=True, help="Path to comparative campaign JSON config")
     parser.add_argument("--output-dir", required=True, help="Directory for generated campaign artifacts")
     parser.add_argument("--dry-run", action="store_true", help="Only print the resolved campaign plan")
@@ -54,12 +54,12 @@ def main() -> int:
     fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
 
     def retrieval_runner(scenario: dict[str, object]) -> dict[str, object]:
-        key = f"{scenario['dataset_id']}:{scenario['method_id']}"
+        key = f"{scenario['dataset_id']}:{scenario['system_id']}"
         payload = fixture["retrieval"][key]
         return {
             "run_metadata": {
                 "dataset_id": scenario["dataset_id"],
-                "method_id": scenario["method_id"],
+                "method_id": scenario["system_id"],
                 "result_kind": "retrieval_only",
                 "footprint_bytes": payload["footprint_bytes"],
             },
@@ -70,12 +70,12 @@ def main() -> int:
         scenario: dict[str, object],
         retrieval_result: dict[str, object],
     ) -> dict[str, object]:
-        key = f"{scenario['dataset_id']}:{scenario['method_id']}"
+        key = f"{scenario['dataset_id']}:{scenario['system_id']}"
         payload = fixture["end_to_end"][key]
         return {
             "run_metadata": {
                 "dataset_id": scenario["dataset_id"],
-                "method_id": scenario["method_id"],
+                "method_id": scenario["system_id"],
                 "result_kind": "end_to_end",
                 "generator_id": config["generator_id"],
             },

@@ -27,6 +27,7 @@ class ApproximateQueryCost:
 class QueryOperationalMetrics:
     retrieval_latency_ms: float | None = None
     rerank_latency_ms: float | None = None
+    context_fetch_latency_ms: float | None = None
     generator_latency_ms: float | None = None
     retrieved_context_tokens: int | None = None
     prompt_tokens: int | None = None
@@ -40,6 +41,7 @@ class QueryOperationalMetrics:
             for latency in (
                 self.retrieval_latency_ms,
                 self.rerank_latency_ms,
+                self.context_fetch_latency_ms,
                 self.generator_latency_ms,
             )
             if latency is not None
@@ -56,6 +58,8 @@ class QueryOperationalMetrics:
             latency_ms["retrieval"] = float(self.retrieval_latency_ms)
         if self.rerank_latency_ms is not None:
             latency_ms["rerank"] = float(self.rerank_latency_ms)
+        if self.context_fetch_latency_ms is not None:
+            latency_ms["context_fetch"] = float(self.context_fetch_latency_ms)
         if self.generator_latency_ms is not None:
             latency_ms["generator"] = float(self.generator_latency_ms)
 
@@ -96,6 +100,7 @@ class QueryOperationalMetrics:
         return cls(
             retrieval_latency_ms=_maybe_float(latency_ms, "retrieval"),
             rerank_latency_ms=_maybe_float(latency_ms, "rerank"),
+            context_fetch_latency_ms=_maybe_float(latency_ms, "context_fetch"),
             generator_latency_ms=_maybe_float(latency_ms, "generator"),
             retrieved_context_tokens=_maybe_int(budgets, "retrieved_context_tokens"),
             prompt_tokens=_maybe_int(budgets, "prompt_tokens"),
@@ -157,6 +162,7 @@ def _summarize_stage_latencies(
     for stage, values in (
         ("retrieval", [m.retrieval_latency_ms for m in metrics if m.retrieval_latency_ms is not None]),
         ("rerank", [m.rerank_latency_ms for m in metrics if m.rerank_latency_ms is not None]),
+        ("context_fetch", [m.context_fetch_latency_ms for m in metrics if m.context_fetch_latency_ms is not None]),
         ("generator", [m.generator_latency_ms for m in metrics if m.generator_latency_ms is not None]),
         ("total", [m.total_latency_ms() for m in metrics if m.total_latency_ms() is not None]),
     ):

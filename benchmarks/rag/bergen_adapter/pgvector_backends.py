@@ -56,8 +56,7 @@ class PgvectorBackendBase:
             sql = (
                 f"WITH query_vector AS (SELECT %s::{table.query_vector_cast} AS embedding) "
                 f"SELECT p.{table.id_column} AS id, "
-                f"p.{table.embedding_column} {operator} query_vector.embedding AS score, "
-                f"p.{table.text_column} AS text "
+                f"p.{table.embedding_column} {operator} query_vector.embedding AS score "
                 f"FROM {table.table_name} AS p "
                 f"CROSS JOIN query_vector "
                 f"ORDER BY p.{table.embedding_column} {operator} query_vector.embedding ASC "
@@ -68,15 +67,16 @@ class PgvectorBackendBase:
             sql = (
                 f"WITH query_vector AS (SELECT %s::{table.query_vector_cast} AS embedding), "
                 f"approx_candidates AS ("
-                f"SELECT p.{table.id_column} AS id, p.{table.text_column} AS text, "
-                f"p.{table.embedding_column} AS embedding "
+                f"SELECT p.{table.id_column} AS id, p.{table.embedding_column} AS embedding "
                 f"FROM {table.table_name} AS p "
                 f"CROSS JOIN query_vector "
                 f"ORDER BY p.{table.embedding_column} {operator} query_vector.embedding ASC "
                 f"LIMIT %s"
                 f") "
-                f"SELECT id, approx_candidates.embedding {operator} query_vector.embedding AS score, text "
+                f"SELECT approx_candidates.id AS id, "
+                f"text_source.{table.embedding_column} {operator} query_vector.embedding AS score "
                 f"FROM approx_candidates "
+                f"JOIN {table.table_name} AS text_source ON text_source.{table.id_column} = approx_candidates.id "
                 f"CROSS JOIN query_vector "
                 f"ORDER BY score ASC "
                 f"LIMIT %s"
@@ -98,6 +98,10 @@ class PgvectorBackendBase:
             "metric": self.metric,
             "mode": self.mode,
             "rerank_k": self.rerank_k if self.mode == MODE_APPROX_RERANK else None,
+            "retrieval_execution_mode": (
+                "approx_exact_rerank" if self.mode == MODE_APPROX_RERANK else "approx_stage1_only"
+            ),
+            "context_fetch_mode": "post_limit_text_fetch",
             "sql_template_hash": hashlib.sha256(plan.sql.encode("utf-8")).hexdigest(),
         }
         if self.ann_key == "ef_search":

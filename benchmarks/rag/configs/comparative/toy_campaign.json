@@ -1,5 +1,5 @@
 {
-  "campaign_kind": "comparative_rag",
+  "campaign_kind": "rag_benchmark",
   "datasets": ["kilt_nq", "kilt_hotpotqa", "popqa"],
   "generator_id": "fixed-debug-generator",
   "execution": {

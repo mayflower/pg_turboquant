@@ -160,6 +160,8 @@ make installcheck
 make tapcheck
 ```
 
-The benchmark harness lives in `scripts/benchmark_suite.py`. The RAG evaluation harness lives under `benchmarks/rag/`.
+The benchmark harness lives in `scripts/benchmark_suite.py`. The RAG evaluation harness lives under `benchmarks/rag/` and now reports `pg_turboquant` and `pgvector` through one generic RAG benchmark contract with separate retrieval, end-to-end, and diagnostics artifacts.
+
+In the RAG harness, retrieval-stage benchmarking now treats stage 1 as a covering retrieval path by default: retrieval queries return IDs, scores, and optional small payload columns, exact rerank is a separate mode, and passage text is fetched only after `LIMIT k` for generator-facing end-to-end runs. TurboQuant benchmark diagnostics also expose delta-tier and exact-key counters plus maintenance recommendations from `tq_index_metadata(...)`.
 
 For scan observability, `tq_last_scan_stats()` exposes backend-local JSON for the most recent TurboQuant scan, including score mode, SIMD kernel, scan orchestration, and page pruning counters. `tq_index_metadata(...)` reports the algorithm version, quantizer family, residual sketch kind, fast-path eligibility, capability flags, and delta / maintenance recommendations. It now carries only cheap heap estimates; use `tq_index_heap_stats(...)` when you intentionally want an exact heap row count. The benchmark suite also records ordered-IOS evidence, raw `EXPLAIN ... FORMAT JSON` payloads, and visibility-map context in `ordered_ios_observation`.

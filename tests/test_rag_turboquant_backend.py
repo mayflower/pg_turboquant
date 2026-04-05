@@ -165,8 +165,12 @@ class PgTurboquantBackendContractTest(unittest.TestCase):
 
         self.assertIn("stage1_candidates AS", plan.sql)
         self.assertIn("source_id = ANY", plan.sql)
-        self.assertIn("SELECT p.passage_id AS id, p.doc_id, p.chunk_id, p.tenant_id, p.doc_version", plan.sql)
-        self.assertIn("JOIN rag_docs AS text_source ON text_source.passage_id = stage1_candidates.id", plan.sql)
+        self.assertIn(
+            "SELECT p.passage_id AS id, p.embedding <=> query_vector.embedding AS ann_score, p.doc_id, p.chunk_id, p.tenant_id, p.doc_version",
+            plan.sql,
+        )
+        self.assertNotIn("JOIN rag_docs AS text_source", plan.sql)
+        self.assertNotIn("passage_text", plan.sql)
         self.assertEqual(plan.session_statements[:2], [
             ("SET LOCAL turboquant.probes = %s", (2,)),
             ("SET LOCAL turboquant.oversample_factor = %s", (2.0,)),
@@ -178,6 +182,9 @@ class PgTurboquantBackendContractTest(unittest.TestCase):
             metadata["stage1_payload_columns"],
             ["doc_id", "chunk_id", "tenant_id", "doc_version"],
         )
+        self.assertEqual(metadata["retrieval_execution_mode"], "approx_stage1_only")
+        self.assertEqual(metadata["context_fetch_mode"], "post_limit_text_fetch")
+        self.assertTrue(metadata["stage1_covering"])
 
     def test_delta_union_plan_queries_base_and_delta_indexes(self):
         backend = PgTurboquantBackend(
@@ -210,6 +217,7 @@ class PgTurboquantBackendContractTest(unittest.TestCase):
         self.assertIn("FROM rag_docs AS p", plan.sql)
         self.assertIn("FROM rag_docs_delta AS p", plan.sql)
         self.assertIn("UNION ALL", plan.sql)
+        self.assertNotIn("JOIN rag_docs AS text_source", plan.sql)
         metadata = backend.serialize_run_metadata(plan)
         self.assertEqual(metadata["delta_mode"], "union")
         self.assertEqual(metadata["delta_table_name"], "rag_docs_delta")
@@ -242,6 +250,38 @@ class PgTurboquantBackendContractTest(unittest.TestCase):
         metadata = backend.serialize_run_metadata(plan)
         self.assertEqual(metadata["delta_mode"], "native")
         self.assertIsNone(metadata["delta_table_name"])
+
+    def test_filtered_rerank_plan_keeps_exact_rerank_and_text_fetch_separate(self):
+        backend = PgTurboquantBackend(
+            index_name="rag_docs_embedding_tq_idx",
+            metric="cosine",
+            normalized=True,
+            mode="approx_rerank",
+            rerank_k=12,
+        )
+
+        plan = backend.build_plan(
+            self.table,
+            RetrievalRequest(
+                query_vector=[1.0, 0.0, 0.0],
+                top_k=3,
+                metric="cosine",
+                ann={
+                    "filters": {"tenant_id": 7},
+                    "stage1_payload_columns": ["doc_id", "tenant_id"],
+                    "text_join_column": "doc_id",
+                },
+            ),
+        )
+
+        self.assertIn("stage1_candidates AS", plan.sql)
+        self.assertIn("JOIN rag_docs AS text_source ON text_source.doc_id = stage1_candidates.id", plan.sql)
+        self.assertNotIn("text_source.passage_text AS text", plan.sql)
+
+        metadata = backend.serialize_run_metadata(plan)
+        self.assertEqual(metadata["retrieval_execution_mode"], "approx_exact_rerank")
+        self.assertEqual(metadata["context_fetch_mode"], "post_limit_text_fetch")
+        self.assertTrue(metadata["exact_rerank_enabled"])
 
     def test_inner_product_requires_normalized_vectors(self):
         backend = PgTurboquantBackend(
@@ -279,10 +319,10 @@ class PgTurboquantBackendContractTest(unittest.TestCase):
         )
 
         approx_connection = FakeConnection(
-            [("doc-1", 0.125, "Approx result"), ("doc-2", 0.250, "Approx result 2")]
+            [("doc-1", 0.125), ("doc-2", 0.250)]
         )
         rerank_connection = FakeConnection(
-            [("doc-1", 0.010, "Reranked result"), ("doc-3", 0.040, "Reranked result 2")]
+            [("doc-1", 0.010), ("doc-3", 0.040)]
         )
 
         approx_adapter = PostgresRetrieverAdapter(
@@ -318,6 +358,8 @@ class PgTurboquantBackendContractTest(unittest.TestCase):
         self.assertEqual(len(approx_results), 2)
         self.assertEqual(len(rerank_results), 2)
         self.assertEqual(approx_results[0]["id"], "doc-1")
+        self.assertIsNone(approx_results[0]["text"])
+        self.assertIsNone(rerank_results[0]["text"])
         self.assertEqual(rerank_results[0]["id"], "doc-1")
         self.assertIn("ORDER BY p.embedding <=> query_vector.embedding ASC", approx_connection.cursors[0].executed[-1][0])
         self.assertNotIn("tq_approx_candidates", approx_connection.cursors[0].executed[-1][0])
