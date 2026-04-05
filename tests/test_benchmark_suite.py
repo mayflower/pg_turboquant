@@ -84,6 +84,7 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
         self.assertIn("query_knobs", scenario)
         self.assertIn("query_api", scenario)
         self.assertIn("index_metadata", scenario)
+        self.assertIn("ordered_ios_observation", scenario)
         self.assertIn("simd", scenario)
         self.assertIn("scan_stats", scenario)
         if scenario["query_mode"] == "ordered_rerank" and scenario["method"].startswith("turboquant_"):
@@ -127,6 +128,41 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
         self.assertIn("maintenance_work_mem_aware", scenario["index_metadata"]["operability"])
         self.assertIn("mode", scenario["index_metadata"]["page_summary"])
         self.assertIn("safe_pruning", scenario["index_metadata"]["page_summary"])
+        self.assertIn("capability_claimed", scenario["ordered_ios_observation"])
+        self.assertIn("explain_analyze_buffers_captured", scenario["ordered_ios_observation"])
+        self.assertIn("observed_plan_node_type", scenario["ordered_ios_observation"])
+        self.assertIn("observed_index_only_scan", scenario["ordered_ios_observation"])
+        self.assertIn("heap_fetches", scenario["ordered_ios_observation"])
+        self.assertIn("sample_count", scenario["ordered_ios_observation"])
+        self.assertIn("query_sample_count", scenario["ordered_ios_observation"])
+        self.assertIn("query_sample_indexes", scenario["ordered_ios_observation"])
+        self.assertIn("samples", scenario["ordered_ios_observation"])
+        self.assertIn("plan_json_samples", scenario["ordered_ios_observation"])
+        self.assertIn("heap_fetch_samples", scenario["ordered_ios_observation"])
+        self.assertIn("visibility_map_context", scenario["ordered_ios_observation"])
+        self.assertIn("vm_all_visible_pages", scenario["ordered_ios_observation"]["visibility_map_context"])
+        self.assertIn("vm_all_frozen_pages", scenario["ordered_ios_observation"]["visibility_map_context"])
+        self.assertIn("vm_pages", scenario["ordered_ios_observation"]["visibility_map_context"])
+        self.assertIn("filtered_query", scenario["ordered_ios_observation"])
+        self.assertIn("observed_index_only_scan", scenario["ordered_ios_observation"]["filtered_query"])
+        self.assertIn("query_sample_count", scenario["ordered_ios_observation"]["filtered_query"])
+        self.assertIn("query_sample_indexes", scenario["ordered_ios_observation"]["filtered_query"])
+        self.assertIn("samples", scenario["ordered_ios_observation"]["filtered_query"])
+        self.assertIn("plan_json_samples", scenario["ordered_ios_observation"]["filtered_query"])
+        self.assertIn("heap_fetch_samples", scenario["ordered_ios_observation"]["filtered_query"])
+        self.assertIn("visibility_map_context", scenario["ordered_ios_observation"]["filtered_query"])
+        self.assertIn(
+            "vm_all_visible_pages",
+            scenario["ordered_ios_observation"]["filtered_query"]["visibility_map_context"],
+        )
+        self.assertIn(
+            "vm_all_frozen_pages",
+            scenario["ordered_ios_observation"]["filtered_query"]["visibility_map_context"],
+        )
+        self.assertIn(
+            "vm_pages",
+            scenario["ordered_ios_observation"]["filtered_query"]["visibility_map_context"],
+        )
         if scenario["method"].startswith("turboquant_"):
             self.assertIn("residual_sketch", scenario["index_metadata"])
             self.assertIn("projected_dimension", scenario["index_metadata"]["residual_sketch"])
@@ -252,6 +288,15 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
         self.assertIn("selected_live_count", method_row)
         self.assertIn("selected_page_count", method_row)
         self.assertIn("score_kernel", method_row)
+        self.assertIn("ordered_ios_plan_node_type", method_row)
+        self.assertIn("ordered_ios_observed", method_row)
+        self.assertIn("ordered_ios_heap_fetches", method_row)
+        self.assertIn("ordered_ios_sample_count", method_row)
+        self.assertIn("ordered_ios_query_sample_count", method_row)
+        self.assertIn("ordered_ios_heap_fetch_max", method_row)
+        self.assertIn("filtered_ordered_ios_observed", method_row)
+        self.assertIn("filtered_ordered_ios_query_sample_count", method_row)
+        self.assertIn("filtered_ordered_ios_heap_fetch_max", method_row)
         self.assertIn("query_helper", method_row)
         self.assertIn("qjl_sketch_dimension", method_row)
         self.assertIn("distance_error_bias", method_row)
@@ -768,6 +813,87 @@ class BenchmarkSuiteContractTest(unittest.TestCase):
         self.assertTrue(scenario["index_metadata"]["capabilities"]["vector_key_returnable"])
         self.assertTrue(scenario["index_metadata"]["capabilities"]["multicolumn"])
         self.assertTrue(scenario["index_metadata"]["capabilities"]["include_columns"])
+        self.assertTrue(scenario["ordered_ios_observation"]["capability_claimed"])
+        self.assertFalse(scenario["ordered_ios_observation"]["explain_analyze_buffers_captured"])
+        self.assertIsNone(scenario["ordered_ios_observation"]["observed_index_only_scan"])
+        self.assertEqual(scenario["ordered_ios_observation"]["observed_plan_node_type"], "not_executed")
+        self.assertEqual(scenario["ordered_ios_observation"]["sample_count"], 0)
+        self.assertEqual(scenario["ordered_ios_observation"]["query_sample_count"], 0)
+        self.assertEqual(scenario["ordered_ios_observation"]["query_sample_indexes"], [])
+        self.assertEqual(scenario["ordered_ios_observation"]["samples"], [])
+        self.assertEqual(scenario["ordered_ios_observation"]["plan_json_samples"], [])
+        self.assertEqual(scenario["ordered_ios_observation"]["heap_fetch_samples"], [])
+        self.assertEqual(
+            scenario["ordered_ios_observation"]["visibility_map_context"],
+            {
+                "captured": False,
+                "source": None,
+                "heap_relation": None,
+                "heap_relpages": None,
+                "heap_relallvisible": None,
+                "heap_all_visible_fraction": None,
+                "vm_all_visible_pages": None,
+                "vm_all_frozen_pages": None,
+                "vm_pages": [],
+            },
+        )
+        self.assertIn("filtered_query", scenario["ordered_ios_observation"])
+        self.assertEqual(scenario["ordered_ios_observation"]["filtered_query"]["sample_count"], 0)
+        self.assertEqual(scenario["ordered_ios_observation"]["filtered_query"]["query_sample_count"], 0)
+        self.assertEqual(scenario["ordered_ios_observation"]["filtered_query"]["query_sample_indexes"], [])
+        self.assertEqual(scenario["ordered_ios_observation"]["filtered_query"]["samples"], [])
+        self.assertEqual(scenario["ordered_ios_observation"]["filtered_query"]["plan_json_samples"], [])
+        self.assertEqual(scenario["ordered_ios_observation"]["filtered_query"]["heap_fetch_samples"], [])
+        self.assertEqual(
+            scenario["ordered_ios_observation"]["filtered_query"]["visibility_map_context"],
+            {
+                "captured": False,
+                "source": None,
+                "heap_relation": None,
+                "heap_relpages": None,
+                "heap_relallvisible": None,
+                "heap_all_visible_fraction": None,
+                "vm_all_visible_pages": None,
+                "vm_all_frozen_pages": None,
+                "vm_pages": [],
+            },
+        )
+
+    def test_capture_visibility_map_context_prefers_pg_visibility_pages(self):
+        with mock.patch.object(
+            BENCHMARK_SUITE,
+            "query_psql",
+            side_effect=[
+                (
+                    '{"heap_relation":"benchmark_items","heap_relpages":12,'
+                    '"heap_relallvisible":9,"heap_all_visible_fraction":0.75}'
+                ),
+                "t",
+                (
+                    '[{"blkno":0,"all_visible":true,"all_frozen":false},'
+                    '{"blkno":1,"all_visible":true,"all_frozen":true}]'
+                ),
+                "t",
+                '{"vm_all_visible_pages":10,"vm_all_frozen_pages":4}',
+            ],
+        ):
+            context = BENCHMARK_SUITE.capture_visibility_map_context(["psql"], "benchmark_items")
+
+        self.assertEqual(context["source"], "pg_visibility")
+        self.assertTrue(context["captured"])
+        self.assertEqual(context["heap_relation"], "benchmark_items")
+        self.assertEqual(context["heap_relpages"], 12)
+        self.assertEqual(context["heap_relallvisible"], 9)
+        self.assertEqual(context["heap_all_visible_fraction"], 0.75)
+        self.assertEqual(context["vm_all_visible_pages"], 10)
+        self.assertEqual(context["vm_all_frozen_pages"], 4)
+        self.assertEqual(
+            context["vm_pages"],
+            [
+                {"blkno": 0, "all_visible": True, "all_frozen": False},
+                {"blkno": 1, "all_visible": True, "all_frozen": True},
+            ],
+        )
 
     def test_hotpot_skewed_profile_surfaces_scan_stats(self):
         payload = self.run_suite(

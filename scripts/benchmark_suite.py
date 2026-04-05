@@ -202,6 +202,52 @@ def capability_metadata(spec: dict) -> dict:
     }
 
 
+def default_ordered_ios_query_observation(
+    capability_claimed: bool,
+    captured: bool = False,
+) -> dict:
+    return {
+        "capability_claimed": capability_claimed,
+        "explain_analyze_buffers_captured": captured,
+        "observed_plan_node_type": "not_executed" if capability_claimed else "not_applicable",
+        "observed_index_only_scan": None,
+        "heap_fetches": None,
+        "sample_count": 0,
+        "query_sample_count": 0,
+        "query_sample_indexes": [],
+        "samples": [],
+        "plan_json_samples": [],
+        "heap_fetch_samples": [],
+        "heap_fetch_min": None,
+        "heap_fetch_max": None,
+        "shared_hit_blocks": None,
+        "shared_read_blocks": None,
+        "visibility_map_context": {
+            "captured": False,
+            "source": None,
+            "heap_relation": None,
+            "heap_relpages": None,
+            "heap_relallvisible": None,
+            "heap_all_visible_fraction": None,
+            "vm_all_visible_pages": None,
+            "vm_all_frozen_pages": None,
+            "vm_pages": [],
+        },
+    }
+
+
+def default_ordered_ios_observation(
+    capability_claimed: bool,
+    captured: bool = False,
+) -> dict:
+    observation = default_ordered_ios_query_observation(capability_claimed, captured=captured)
+    observation["filtered_query"] = default_ordered_ios_query_observation(
+        capability_claimed,
+        captured=False,
+    )
+    return observation
+
+
 def operability_metadata(spec: dict) -> dict:
     turboquant = spec["index_method"] == "turboquant"
     return {
@@ -1228,6 +1274,124 @@ def query_psql_commands(base_cmd: list[str], *commands: str) -> list[str]:
     return [line for line in result.stdout.splitlines() if line.strip()]
 
 
+def capture_visibility_map_context(base_cmd: list[str], table_name: str) -> dict:
+    relation_sql = (
+        "SELECT json_build_object("
+        "'heap_relation', c.oid::regclass::text, "
+        "'heap_relpages', c.relpages, "
+        "'heap_relallvisible', c.relallvisible, "
+        "'heap_all_visible_fraction', "
+        "CASE WHEN c.relpages > 0 "
+        "THEN round((c.relallvisible::numeric / c.relpages::numeric), 6)::double precision "
+        "ELSE NULL END"
+        ")::text "
+        "FROM pg_class AS c "
+        f"WHERE c.oid = '{table_name}'::regclass"
+    )
+    default_context = default_ordered_ios_query_observation(False)["visibility_map_context"]
+    try:
+        raw = query_psql(base_cmd, relation_sql)
+    except subprocess.CalledProcessError:
+        return default_context
+    if not raw:
+        return default_context
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return default_context
+    if not isinstance(payload, dict):
+        return default_context
+    context = {
+        "captured": True,
+        "source": "pg_class",
+        "heap_relation": payload.get("heap_relation"),
+        "heap_relpages": payload.get("heap_relpages"),
+        "heap_relallvisible": payload.get("heap_relallvisible"),
+        "heap_all_visible_fraction": payload.get("heap_all_visible_fraction"),
+        "vm_all_visible_pages": payload.get("heap_relallvisible"),
+        "vm_all_frozen_pages": None,
+        "vm_pages": [],
+    }
+    try:
+        has_pg_visibility_map = query_psql(
+            base_cmd,
+            "SELECT CASE WHEN to_regprocedure('pg_visibility_map(regclass)') IS NOT NULL THEN 't' ELSE 'f' END;",
+        )
+    except subprocess.CalledProcessError:
+        return context
+    if has_pg_visibility_map == "t":
+        map_sql = (
+            "SELECT coalesce(json_agg(json_build_object("
+            "'blkno', blkno, "
+            "'all_visible', all_visible, "
+            "'all_frozen', all_frozen"
+            ") ORDER BY blkno), '[]'::json)::text "
+            f"FROM pg_visibility_map('{table_name}'::regclass)"
+        )
+        try:
+            map_raw = query_psql(base_cmd, map_sql)
+        except subprocess.CalledProcessError:
+            map_raw = ""
+        if map_raw:
+            try:
+                map_payload = json.loads(map_raw)
+            except json.JSONDecodeError:
+                map_payload = None
+            if isinstance(map_payload, list):
+                context["source"] = "pg_visibility"
+                context["vm_pages"] = [
+                    {
+                        "blkno": page.get("blkno"),
+                        "all_visible": page.get("all_visible"),
+                        "all_frozen": page.get("all_frozen"),
+                    }
+                    for page in map_payload
+                    if isinstance(page, dict)
+                ]
+                if context["vm_all_visible_pages"] is None:
+                    context["vm_all_visible_pages"] = sum(
+                        1 for page in context["vm_pages"] if page.get("all_visible") is True
+                    )
+                if context["vm_all_frozen_pages"] is None:
+                    context["vm_all_frozen_pages"] = sum(
+                        1 for page in context["vm_pages"] if page.get("all_frozen") is True
+                    )
+    try:
+        has_pg_visibility = query_psql(
+            base_cmd,
+            "SELECT CASE WHEN to_regprocedure('pg_visibility_map_summary(regclass)') IS NOT NULL THEN 't' ELSE 'f' END;",
+        )
+    except subprocess.CalledProcessError:
+        return context
+    if has_pg_visibility != "t":
+        return context
+
+    summary_sql = (
+        "SELECT json_build_object("
+        "'vm_all_visible_pages', all_visible, "
+        "'vm_all_frozen_pages', all_frozen"
+        ")::text "
+        f"FROM pg_visibility_map_summary('{table_name}'::regclass)"
+    )
+    try:
+        summary_raw = query_psql(base_cmd, summary_sql)
+    except subprocess.CalledProcessError:
+        return context
+    if not summary_raw:
+        return context
+    try:
+        summary_payload = json.loads(summary_raw)
+    except json.JSONDecodeError:
+        return context
+    if not isinstance(summary_payload, dict):
+        return context
+    if context["source"] != "pg_visibility":
+        context["source"] = "pg_visibility_map_summary"
+    context["vm_all_visible_pages"] = summary_payload.get("vm_all_visible_pages")
+    context["vm_all_frozen_pages"] = summary_payload.get("vm_all_frozen_pages")
+    return context
+
+
 def current_wal_lsn(base_cmd: list[str]) -> str:
     return query_psql(base_cmd, "SELECT pg_current_wal_insert_lsn();")
 
@@ -2191,6 +2355,281 @@ def query_bitmap_ids_and_scan_stats(
     return query_ids, scan_stats
 
 
+def _first_scan_plan_node(plan: dict) -> Optional[dict]:
+    node_type = str(plan.get("Node Type", ""))
+
+    if "Scan" in node_type:
+        return plan
+
+    for child in plan.get("Plans", []):
+        scan_node = _first_scan_plan_node(child)
+
+        if scan_node is not None:
+            return scan_node
+
+    return None
+
+
+def summarize_ordered_ios_explain(
+    explain_payload: list[dict],
+    capability_claimed: bool,
+) -> dict:
+    observation = default_ordered_ios_query_observation(capability_claimed, captured=True)
+    observation["plan_json"] = explain_payload
+    observation["plan_json_samples"] = [
+        {
+            "query_index": None,
+            "repetition": None,
+            "plan_json": explain_payload,
+        }
+    ]
+
+    if not explain_payload:
+        return observation
+
+    top_level = explain_payload[0] if explain_payload else {}
+    plan = top_level.get("Plan", {})
+    scan_node = _first_scan_plan_node(plan)
+
+    if scan_node is None:
+        observation["observed_plan_node_type"] = str(plan.get("Node Type", "unknown"))
+        observation["observed_index_only_scan"] = False
+        return observation
+
+    observation["observed_plan_node_type"] = str(scan_node.get("Node Type", "unknown"))
+    observation["observed_index_only_scan"] = observation["observed_plan_node_type"] == "Index Only Scan"
+    if "Heap Fetches" in scan_node:
+        observation["heap_fetches"] = int(scan_node["Heap Fetches"])
+        observation["sample_count"] = 1
+        observation["heap_fetch_samples"] = [observation["heap_fetches"]]
+        observation["heap_fetch_min"] = observation["heap_fetches"]
+        observation["heap_fetch_max"] = observation["heap_fetches"]
+    if "Shared Hit Blocks" in scan_node:
+        observation["shared_hit_blocks"] = int(scan_node["Shared Hit Blocks"])
+    if "Shared Read Blocks" in scan_node:
+        observation["shared_read_blocks"] = int(scan_node["Shared Read Blocks"])
+    return observation
+
+
+def query_ordered_ios_observation(
+    base_cmd: list[str],
+    table_name: str,
+    query_vector: tuple[float, ...],
+    limit: int,
+    query_setup: list[str],
+    benchmark_metric: str,
+    capability_claimed: bool,
+    where_clause: Optional[str] = None,
+) -> dict:
+    order_operator = metric_order_operator(benchmark_metric)
+    select_sql = (
+        f"SELECT embedding FROM {table_name} "
+        + (f"WHERE {where_clause} " if where_clause else "")
+        + f"ORDER BY embedding {order_operator} '{vector_literal(query_vector)}'::vector "
+        + f"LIMIT {limit}"
+    )
+    explain_sql = ";\n".join(
+        ["BEGIN"]
+        + query_setup
+        + [
+            (
+                "EXPLAIN (ANALYZE, BUFFERS, COSTS OFF, TIMING OFF, SUMMARY OFF, FORMAT JSON) "
+                + select_sql
+            ),
+            "COMMIT",
+        ]
+    )
+    raw = query_psql(base_cmd, explain_sql)
+    try:
+        explain_payload = json.loads(raw)
+    except json.JSONDecodeError:
+        observation = default_ordered_ios_query_observation(capability_claimed, captured=False)
+        observation["observed_plan_node_type"] = "unavailable"
+        return observation
+    if not isinstance(explain_payload, list):
+        observation = default_ordered_ios_query_observation(capability_claimed, captured=False)
+        observation["observed_plan_node_type"] = "unavailable"
+        return observation
+    return summarize_ordered_ios_explain(explain_payload, capability_claimed)
+
+
+def aggregate_ordered_ios_samples(samples: list[dict], capability_claimed: bool) -> dict:
+    if not samples:
+        return default_ordered_ios_query_observation(capability_claimed, captured=False)
+
+    captured_samples = [
+        sample
+        for sample in samples
+        if sample.get("explain_analyze_buffers_captured")
+    ]
+    if not captured_samples:
+        observation = default_ordered_ios_query_observation(capability_claimed, captured=False)
+        observation["observed_plan_node_type"] = str(
+            samples[0].get("observed_plan_node_type", observation["observed_plan_node_type"])
+        )
+        observation["observed_index_only_scan"] = samples[0].get("observed_index_only_scan")
+        observation["query_sample_indexes"] = sorted(
+            {
+                int(sample["query_index"])
+                for sample in samples
+                if sample.get("query_index") is not None
+            }
+        )
+        observation["query_sample_count"] = len(observation["query_sample_indexes"])
+        observation["samples"] = [
+            {
+                "query_index": sample.get("query_index"),
+                "repetition": sample.get("repetition"),
+                "observed_plan_node_type": sample.get("observed_plan_node_type"),
+                "observed_index_only_scan": sample.get("observed_index_only_scan"),
+                "heap_fetches": sample.get("heap_fetches"),
+            }
+            for sample in samples
+        ]
+        observation["plan_json_samples"] = [
+            {
+                "query_index": sample.get("query_index"),
+                "repetition": sample.get("repetition"),
+                "plan_json": sample.get("plan_json"),
+            }
+            for sample in samples
+            if sample.get("plan_json") is not None
+        ]
+        return observation
+
+    observation = dict(captured_samples[0])
+    observation.pop("query_index", None)
+    observation.pop("repetition", None)
+    observation.pop("plan_json", None)
+    heap_fetch_samples = [
+        int(sample["heap_fetches"])
+        for sample in captured_samples
+        if sample.get("heap_fetches") is not None
+    ]
+    observation["sample_count"] = len(captured_samples)
+    observation["heap_fetch_samples"] = heap_fetch_samples
+    if heap_fetch_samples:
+        observation["heap_fetches"] = heap_fetch_samples[0]
+        observation["heap_fetch_min"] = min(heap_fetch_samples)
+        observation["heap_fetch_max"] = max(heap_fetch_samples)
+    else:
+        observation["heap_fetches"] = None
+        observation["heap_fetch_min"] = None
+        observation["heap_fetch_max"] = None
+    observation["observed_index_only_scan"] = all(
+        sample.get("observed_index_only_scan") is True for sample in captured_samples
+    )
+    plan_nodes = {
+        str(sample.get("observed_plan_node_type", "unknown"))
+        for sample in captured_samples
+    }
+    if len(plan_nodes) > 1:
+        observation["observed_plan_node_type"] = "mixed"
+    observation["query_sample_indexes"] = sorted(
+        {
+            int(sample["query_index"])
+            for sample in samples
+            if sample.get("query_index") is not None
+        }
+    )
+    observation["query_sample_count"] = len(observation["query_sample_indexes"])
+    observation["samples"] = [
+        {
+            "query_index": sample.get("query_index"),
+            "repetition": sample.get("repetition"),
+            "observed_plan_node_type": sample.get("observed_plan_node_type"),
+            "observed_index_only_scan": sample.get("observed_index_only_scan"),
+            "heap_fetches": sample.get("heap_fetches"),
+        }
+        for sample in samples
+    ]
+    observation["plan_json_samples"] = [
+        {
+            "query_index": sample.get("query_index"),
+            "repetition": sample.get("repetition"),
+            "plan_json": sample.get("plan_json"),
+        }
+        for sample in samples
+        if sample.get("plan_json") is not None
+    ]
+    return observation
+
+
+def representative_query_indexes(
+    queries: list[tuple[float, ...]],
+    max_queries: int = 3,
+) -> list[int]:
+    if not queries or max_queries <= 0:
+        return []
+    if len(queries) <= max_queries:
+        return list(range(len(queries)))
+
+    if max_queries == 1:
+        return [0]
+
+    selected_indexes = []
+    for slot in range(max_queries):
+        candidate = round(slot * (len(queries) - 1) / (max_queries - 1))
+        if candidate not in selected_indexes:
+            selected_indexes.append(int(candidate))
+
+    return selected_indexes
+
+
+def repeated_ordered_ios_observation(
+    base_cmd: list[str],
+    table_name: str,
+    queries: list[tuple[float, ...]],
+    query_indexes: list[int],
+    limit: int,
+    query_setup: list[str],
+    benchmark_metric: str,
+    capability_claimed: bool,
+    repetitions_per_query: int,
+    where_clause: Optional[str] = None,
+) -> dict:
+    observations = [
+        (
+            query_ordered_ios_observation(
+                base_cmd,
+                table_name,
+                queries[query_index],
+                limit,
+                query_setup,
+                benchmark_metric,
+                capability_claimed,
+                where_clause=where_clause,
+            )
+            | {
+                "query_index": query_index,
+                "repetition": repetition + 1,
+            }
+        )
+        for query_index in query_indexes
+        for repetition in range(max(0, repetitions_per_query))
+    ]
+    observation = aggregate_ordered_ios_samples(observations, capability_claimed)
+    observation["visibility_map_context"] = capture_visibility_map_context(base_cmd, table_name)
+    return observation
+
+
+def create_filtered_ios_measurement_index(
+    base_cmd: list[str],
+    table_name: str,
+    spec: dict,
+) -> str:
+    index_name = f"{table_name}_ordered_ios_filtered_idx"
+    run_psql(
+        base_cmd,
+        (
+            f"CREATE INDEX {index_name} ON {table_name} USING turboquant "
+            f"(embedding {spec['opclass']}, category tq_int4_filter_ops) "
+            f"WITH ({render_with_clause(spec['with'])});"
+        ),
+    )
+    return index_name
+
+
 def query_top_ids(
     base_cmd: list[str],
     table_name: str,
@@ -2267,6 +2706,10 @@ def _report_method_row(scenario: dict) -> dict:
     scan_stats = scenario.get("scan_stats", {})
     query_api = scenario.get("query_api", {})
     estimator_quality = scenario.get("estimator_quality", default_estimator_quality())
+    ordered_ios_observation = scenario.get(
+        "ordered_ios_observation",
+        default_ordered_ios_observation(False),
+    )
     return {
         "corpus": scenario["corpus"],
         "method": scenario["method"],
@@ -2283,6 +2726,21 @@ def _report_method_row(scenario: dict) -> dict:
         "selected_live_count": scan_stats.get("selected_live_count"),
         "selected_page_count": scan_stats.get("selected_page_count"),
         "score_kernel": scan_stats.get("score_kernel"),
+        "ordered_ios_plan_node_type": ordered_ios_observation.get("observed_plan_node_type"),
+        "ordered_ios_observed": ordered_ios_observation.get("observed_index_only_scan"),
+        "ordered_ios_heap_fetches": ordered_ios_observation.get("heap_fetches"),
+        "ordered_ios_sample_count": ordered_ios_observation.get("sample_count"),
+        "ordered_ios_query_sample_count": ordered_ios_observation.get("query_sample_count"),
+        "ordered_ios_heap_fetch_max": ordered_ios_observation.get("heap_fetch_max"),
+        "filtered_ordered_ios_observed": ordered_ios_observation.get("filtered_query", {}).get(
+            "observed_index_only_scan"
+        ),
+        "filtered_ordered_ios_query_sample_count": ordered_ios_observation.get("filtered_query", {}).get(
+            "query_sample_count"
+        ),
+        "filtered_ordered_ios_heap_fetch_max": ordered_ios_observation.get("filtered_query", {}).get(
+            "heap_fetch_max"
+        ),
         "distance_error_bias": estimator_quality.get("distance_error_bias"),
         "distance_error_variance": estimator_quality.get("distance_error_variance"),
         "avg_abs_rank_shift": estimator_quality.get("avg_abs_rank_shift"),
@@ -3085,6 +3543,40 @@ def run_scenario(
         simd_metadata["code_domain_kernel"] = aggregated_scan_stats.get("score_kernel", "scalar")
     else:
         simd_metadata["code_domain_kernel"] = "none"
+    ordered_ios_query_indexes = representative_query_indexes(corpus.queries, max_queries=3)
+    ordered_ios_repetitions = max(1, min(repetitions, 3))
+    ordered_ios_observation = default_ordered_ios_observation(
+        bool(index_metadata.get("capabilities", {}).get("ordered_vector_key_index_only_scan")),
+        captured=False,
+    )
+    if spec.get("query_mode", "ordered_rerank") == "ordered_rerank" and ordered_ios_query_indexes:
+        run_psql(base_cmd, f"VACUUM (FREEZE, ANALYZE) {table_name};")
+        ordered_ios_observation = repeated_ordered_ios_observation(
+            base_cmd,
+            table_name,
+            corpus.queries,
+            ordered_ios_query_indexes,
+            TOP_K_VALUES[0],
+            spec["query_setup"],
+            benchmark_metric,
+            bool(index_metadata.get("capabilities", {}).get("ordered_vector_key_index_only_scan")),
+            ordered_ios_repetitions,
+        )
+        if spec["index_method"] == "turboquant":
+            run_psql(base_cmd, f"DROP INDEX IF EXISTS {index_name};")
+            create_filtered_ios_measurement_index(base_cmd, table_name, spec)
+            ordered_ios_observation["filtered_query"] = repeated_ordered_ios_observation(
+                base_cmd,
+                table_name,
+                corpus.queries,
+                ordered_ios_query_indexes,
+                TOP_K_VALUES[0],
+                spec["query_setup"],
+                benchmark_metric,
+                bool(index_metadata.get("capabilities", {}).get("ordered_vector_key_index_only_scan")),
+                ordered_ios_repetitions,
+                where_clause="category = 1",
+            )
 
     scenario = {
         "corpus": corpus.name,
@@ -3106,6 +3598,7 @@ def run_scenario(
         "query_knobs": spec["query_knobs"],
         "index_metadata": index_metadata,
         "benchmark_metadata": scenario_benchmark_metadata(index_metadata),
+        "ordered_ios_observation": ordered_ios_observation,
         "simd": simd_metadata,
         "scan_stats": aggregated_scan_stats,
     }
@@ -3258,6 +3751,10 @@ def dry_run_scenario(
         "query_knobs": spec["query_knobs"],
         "index_metadata": synthetic_index_metadata(method, spec, corpus, benchmark_metric),
         "benchmark_metadata": scenario_benchmark_metadata(synthetic_index_metadata(method, spec, corpus, benchmark_metric)),
+        "ordered_ios_observation": default_ordered_ios_observation(
+            bool(capability_metadata(spec).get("ordered_vector_key_index_only_scan")),
+            captured=False,
+        ),
         "simd": simd_metadata,
         "scan_stats": scan_stats,
     }
