@@ -5,11 +5,15 @@ import json
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
-from .adapter import PassageTable, RetrievalPlan, RetrievalRequest, validate_metric, vector_literal
-
-
-MODE_APPROX = "approx"
-MODE_APPROX_RERANK = "approx_rerank"
+from .adapter import (
+    MODE_APPROX,
+    MODE_APPROX_RERANK,
+    PassageTable,
+    RetrievalPlan,
+    RetrievalRequest,
+    validate_ann_backend_request,
+    vector_literal,
+)
 METRIC_OPERATORS = {
     "cosine": "<=>",
     "inner_product": "<#>",
@@ -37,17 +41,16 @@ class PgTurboquantBackend:
         return "pg_turboquant"
 
     def build_plan(self, table: PassageTable, request: RetrievalRequest) -> RetrievalPlan:
-        request_metric = validate_metric(request.metric)
-        if request_metric != self.metric:
-            raise ValueError(
-                f"backend metric mismatch: configured {self.metric}, requested {request_metric}"
-            )
+        request_metric = validate_ann_backend_request(
+            backend_name="pg_turboquant",
+            configured_metric=self.metric,
+            requested_metric=request.metric,
+            mode=self.mode,
+            rerank_k=self.rerank_k,
+            top_k=request.top_k,
+        )
         if request_metric == "inner_product" and not self.normalized:
             raise ValueError("pg_turboquant inner_product backend requires normalized vectors")
-        if self.mode == MODE_APPROX_RERANK and (self.rerank_k is None or self.rerank_k < request.top_k):
-            raise ValueError("approx_rerank mode requires rerank_k >= top_k")
-        if self.mode not in {MODE_APPROX, MODE_APPROX_RERANK}:
-            raise ValueError(f"unsupported pg_turboquant mode: {self.mode}")
 
         session_statements = []
         probes = request.ann.get("probes")

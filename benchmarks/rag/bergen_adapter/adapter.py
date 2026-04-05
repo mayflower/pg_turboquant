@@ -6,6 +6,9 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 
 
 VALID_METRICS = frozenset({"cosine", "inner_product", "l2"})
+MODE_APPROX = "approx"
+MODE_APPROX_RERANK = "approx_rerank"
+VALID_APPROX_MODES = frozenset({MODE_APPROX, MODE_APPROX_RERANK})
 
 
 @dataclass(frozen=True)
@@ -204,4 +207,25 @@ class PostgresRetrieverAdapter:
 def validate_metric(metric: str) -> str:
     if metric not in VALID_METRICS:
         raise ValueError(f"unsupported metric: {metric}")
+    return metric
+
+
+def validate_ann_backend_request(
+    *,
+    backend_name: str,
+    configured_metric: str,
+    requested_metric: str,
+    mode: str,
+    top_k: int,
+    rerank_k: int | None = None,
+) -> str:
+    metric = validate_metric(requested_metric)
+    if metric != configured_metric:
+        raise ValueError(
+            f"backend metric mismatch: configured {configured_metric}, requested {metric}"
+        )
+    if mode not in VALID_APPROX_MODES:
+        raise ValueError(f"unsupported {backend_name} mode: {mode}")
+    if mode == MODE_APPROX_RERANK and (rerank_k is None or rerank_k < top_k):
+        raise ValueError("approx_rerank mode requires rerank_k >= top_k")
     return metric

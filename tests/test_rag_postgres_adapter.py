@@ -8,6 +8,7 @@ from benchmarks.rag.bergen_adapter import (
     RetrievalRequest,
     StaticAnnBackend,
 )
+from benchmarks.rag.bergen_adapter.adapter import validate_ann_backend_request
 
 
 class FakeCursor:
@@ -78,6 +79,54 @@ class PostgresRetrieverAdapterContractTest(unittest.TestCase):
                     top_k=3,
                     metric="manhattan",
                 )
+            )
+
+    def test_validate_ann_backend_request_consolidates_shared_mode_checks(self):
+        metric = validate_ann_backend_request(
+            backend_name="pgvector",
+            configured_metric="cosine",
+            requested_metric="cosine",
+            mode="approx",
+            top_k=4,
+        )
+        self.assertEqual(metric, "cosine")
+
+        metric = validate_ann_backend_request(
+            backend_name="pg_turboquant",
+            configured_metric="l2",
+            requested_metric="l2",
+            mode="approx_rerank",
+            rerank_k=12,
+            top_k=8,
+        )
+        self.assertEqual(metric, "l2")
+
+        with self.assertRaisesRegex(ValueError, "metric mismatch"):
+            validate_ann_backend_request(
+                backend_name="pgvector",
+                configured_metric="cosine",
+                requested_metric="l2",
+                mode="approx",
+                top_k=3,
+            )
+
+        with self.assertRaisesRegex(ValueError, "unsupported pg_turboquant mode"):
+            validate_ann_backend_request(
+                backend_name="pg_turboquant",
+                configured_metric="cosine",
+                requested_metric="cosine",
+                mode="exact",
+                top_k=3,
+            )
+
+        with self.assertRaisesRegex(ValueError, "rerank_k >= top_k"):
+            validate_ann_backend_request(
+                backend_name="pgvector",
+                configured_metric="cosine",
+                requested_metric="cosine",
+                mode="approx_rerank",
+                rerank_k=2,
+                top_k=3,
             )
 
     def test_sql_generation_uses_explicit_metric_mapping_and_ann_settings(self):

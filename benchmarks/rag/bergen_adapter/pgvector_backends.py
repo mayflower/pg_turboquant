@@ -4,11 +4,15 @@ import hashlib
 from dataclasses import dataclass
 from typing import Any
 
-from .adapter import PassageTable, RetrievalPlan, RetrievalRequest, validate_metric, vector_literal
-
-
-MODE_APPROX = "approx"
-MODE_APPROX_RERANK = "approx_rerank"
+from .adapter import (
+    MODE_APPROX,
+    MODE_APPROX_RERANK,
+    PassageTable,
+    RetrievalPlan,
+    RetrievalRequest,
+    validate_ann_backend_request,
+    vector_literal,
+)
 METRIC_OPERATORS = {
     "cosine": "<=>",
     "inner_product": "<#>",
@@ -32,15 +36,14 @@ class PgvectorBackendBase:
         return self.index_kind
 
     def build_plan(self, table: PassageTable, request: RetrievalRequest) -> RetrievalPlan:
-        request_metric = validate_metric(request.metric)
-        if request_metric != self.metric:
-            raise ValueError(
-                f"backend metric mismatch: configured {self.metric}, requested {request_metric}"
-            )
-        if self.mode not in {MODE_APPROX, MODE_APPROX_RERANK}:
-            raise ValueError(f"unsupported pgvector mode: {self.mode}")
-        if self.mode == MODE_APPROX_RERANK and (self.rerank_k is None or self.rerank_k < request.top_k):
-            raise ValueError("approx_rerank mode requires rerank_k >= top_k")
+        request_metric = validate_ann_backend_request(
+            backend_name="pgvector",
+            configured_metric=self.metric,
+            requested_metric=request.metric,
+            mode=self.mode,
+            rerank_k=self.rerank_k,
+            top_k=request.top_k,
+        )
 
         operator = METRIC_OPERATORS[request_metric]
         session_statements = []
